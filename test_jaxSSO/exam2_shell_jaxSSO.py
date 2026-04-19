@@ -142,7 +142,7 @@ def run_pipeline(cfg: PipelineConfig):
         results = solve_modal(model, cfg)
         print_results(results, cfg)
         wht_data = export_results(model, results, cfg)
-        visualize(wht_data, cfg)
+        #visualize(wht_data, cfg)
         return results
     except BaseException:
         print(f"\n[ERROR] {cfg.mesh_type.upper()} pipeline failed:")

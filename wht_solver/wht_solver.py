@@ -441,64 +441,8 @@ class WHTSolver:
     ) -> np.ndarray:
         """
         Build lumped mass diagonal vector for modal analysis.
-
-        Uses element area × thickness × density.
-        Rotational inertia: m × mesh_size² / 12 (estimated).
+        Delegates to element-level implementations for QUAD4 and TRIA3.
         """
-        M_diag = np.zeros(ndof)
-
-        for eid in sorted(self.model.elements.keys()):
-            elem = self.model.elements[eid]
-            if elem.type != "QUAD4" or len(elem.node_ids) != 4:
-                continue
-
-            pid  = elem.pid
-            prop = self.model.properties.get(pid)
-            mat  = (self.model.materials.get(prop.mid)
-                    if prop and prop.mid in self.model.materials else None)
-
-            t   = prop.t  if prop else 1.0
-            rho = mat.rho if mat  else 7.85e-9
-
-            coords = [self.model.nodes[n] for n in elem.node_ids]
-            v1 = np.array([coords[1].x - coords[0].x,
-                           coords[1].y - coords[0].y,
-                           coords[1].z - coords[0].z])
-            v2 = np.array([coords[2].x - coords[0].x,
-                           coords[2].y - coords[0].y,
-                           coords[2].z - coords[0].z])
-            
-            if elem.type in ("TRIA3", "TRIA") and len(elem.node_ids) == 3:
-                area = 0.5 * np.linalg.norm(np.cross(v1, v2))
-                num_n = 3
-            elif elem.type in ("QUAD4", "QUAD") and len(elem.node_ids) == 4:
-                # Quad area is sum of two triangles (0-1-2 and 0-2-3)
-                area = 0.5 * np.linalg.norm(np.cross(v1, v2))
-                v3 = np.array([coords[3].x - coords[0].x,
-                               coords[3].y - coords[0].y,
-                               coords[3].z - coords[0].z])
-                # Cross v2 and v3 for the 2nd triangle (0-2-3)
-                # Actually v2 - v0 and v3 - v0 works if it's convex
-                area += 0.5 * np.linalg.norm(np.cross(v2, v3))
-                num_n = 4
-            else:
-                continue
-
-            elem_mass = area * t * rho
-            m_node    = elem_mass / num_n
-
-            # Estimate mesh size for rotational inertia
-            mesh_size = np.linalg.norm(v1)
-            # [WHT] More physical rotational inertia to prevent eigenvalues from blowing up.
-            # m * L^2 / 12 is the inertia of a point mass about its center in simplified terms.
-            rot_inert = m_node * (mesh_size**2) / 12.0
-            # Ensure it's not too small to avoid numerical issues
-            rot_inert = max(rot_inert, 1e-8)
-
-            for nid in elem.node_ids:
-                idx = nid_to_idx[nid]
-                dof = idx * 6
-                M_diag[dof:dof+3] += m_node
-                M_diag[dof+3:dof+6] += rot_inert
-
+        M_diag = M_quad4_lumped(self.model, ndof, sorted_nids, nid_to_idx)
+        M_diag += M_tria3_lumped(self.model, ndof, sorted_nids, nid_to_idx)
         return M_diag
