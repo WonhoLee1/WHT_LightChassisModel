@@ -1,0 +1,27 @@
+#RADIOSS STARTER
+/BEGIN
+minimal                                                               
+      2025         0
+Mg                  mm                  s                   
+Mg                  mm                  s                   
+/MAT/LAW1/1
+Steel
+ 7.800E-09 2.100E+05     0.300
+         0
+/PROP/SHELL/1
+TrayProp
+       2.0
+       0.0         0         5
+/PART/1
+TrayPart
+         1         1
+/NODE
+         1                 0.0                 0.0                 0.0
+         2               100.0                 0.0                 0.0
+         3               100.0               100.0                 0.0
+         4                 0.0               100.0                 0.0
+/SHELL/1
+         1         1         2         3         4
+/RUN/minimal/1
+0.01
+/END

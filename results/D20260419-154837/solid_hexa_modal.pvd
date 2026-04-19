@@ -1,0 +1,21 @@
+<?xml version='1.0' encoding='utf-8'?>
+<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">
+  <Collection>
+    <DataSet timestep="8.873805593531845" group="" part="0" file="solid_hexa_modal_t0000.vtu" />
+    <DataSet timestep="11.424322895442955" group="" part="0" file="solid_hexa_modal_t0001.vtu" />
+    <DataSet timestep="14.05848302211307" group="" part="0" file="solid_hexa_modal_t0002.vtu" />
+    <DataSet timestep="18.99400773880972" group="" part="0" file="solid_hexa_modal_t0003.vtu" />
+    <DataSet timestep="19.40990131121763" group="" part="0" file="solid_hexa_modal_t0004.vtu" />
+    <DataSet timestep="21.571637493122427" group="" part="0" file="solid_hexa_modal_t0005.vtu" />
+    <DataSet timestep="21.905998248701632" group="" part="0" file="solid_hexa_modal_t0006.vtu" />
+    <DataSet timestep="25.404765050992218" group="" part="0" file="solid_hexa_modal_t0007.vtu" />
+    <DataSet timestep="28.841916020354027" group="" part="0" file="solid_hexa_modal_t0008.vtu" />
+    <DataSet timestep="32.99110535266779" group="" part="0" file="solid_hexa_modal_t0009.vtu" />
+    <DataSet timestep="33.22913782500132" group="" part="0" file="solid_hexa_modal_t0010.vtu" />
+    <DataSet timestep="39.92493698867581" group="" part="0" file="solid_hexa_modal_t0011.vtu" />
+    <DataSet timestep="42.39745586960462" group="" part="0" file="solid_hexa_modal_t0012.vtu" />
+    <DataSet timestep="45.421427730499126" group="" part="0" file="solid_hexa_modal_t0013.vtu" />
+    <DataSet timestep="60.412283924988614" group="" part="0" file="solid_hexa_modal_t0014.vtu" />
+    <DataSet timestep="69.69690754935284" group="" part="0" file="solid_hexa_modal_t0015.vtu" />
+  </Collection>
+</VTKFile>

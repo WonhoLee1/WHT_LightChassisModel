@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/GOODMAN/miniconda3/envs/vdmc/Lib/site-packages/JaxSSO/**)"
+    ]
+  }
+}

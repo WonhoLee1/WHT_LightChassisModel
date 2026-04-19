@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run -n vdmc python -c ' *)",
+      "Bash(conda run *)",
+      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" smoke_test_phase3.py)",
+      "Bash(echo \"exit: $?\")",
+      "Read(//tmp/**)",
+      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -c \"import graphify; print\\('graphify ok:', graphify.__version__\\)\")",
+      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -m pip install graphifyy -q)",
+      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -c \"import graphify; print\\('graphify installed'\\)\")",
+      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -c \"import sys; open\\('.graphify_python', 'w'\\).write\\(sys.executable\\)\")",
+      "Bash(C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe -c ' *)",
+      "Bash(mkdir -p graphify-out)",
+      "Bash(rm -f .graphify_detect.json .graphify_extract.json .graphify_ast.json .graphify_semantic.json .graphify_analysis.json .graphify_labels.json .graphify_uncached.txt .graphify_python graphify-out/.graphify_chunk_*.json)"
+    ]
+  }
+}

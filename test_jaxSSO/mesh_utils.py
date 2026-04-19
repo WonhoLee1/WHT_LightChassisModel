@@ -1,0 +1,562 @@
+# -*- coding: utf-8 -*-
+import gmsh
+import numpy as np
+import math
+
+def generate_shell_tray(width=100.0, length=100.0, height=10.0, mesh_size_xy=50.0, mesh_size_z=5.0, draft_angle=0.0, flange_width=0.0, origin='corner', mesh_type='quad4'):
+    """
+    Generates a Shell Tray mesh using Gmsh (OpenCASCADE).
+    draft_angle: Outward inclination angle in degrees (0.0 = vertical walls).
+    flange_width: Width of the flat top rim (0.0 = no rim).
+    origin: 'corner' (0,0) or 'center' (-W/2, -L/2).
+    mesh_type: 'quad4'     - structured all-quad
+               'tria3'     - structured all-tria (transfinite grid)
+               'tria3_free'- unstructured free-tria (Frontal-Delaunay)
+               'mixed'     - base=QUAD4, walls=TRIA3 (unstructured)
+    Returns: nodes (Dict: id -> [x,y,z]), elements (Dict: id -> [n1,..])
+    """
+    gmsh.initialize()
+    gmsh.model.add("ShellTray")
+    
+    # Calculate horizontal offset 'd' for the draft angle
+    d = height * math.tan(math.radians(draft_angle))
+    
+    x0, y0 = 0.0, 0.0
+    if origin == 'center':
+        x0, y0 = -width/2.0, -length/2.0
+    
+    # Bottom Surface
+    p1 = gmsh.model.occ.addPoint(x0, y0, 0, mesh_size_xy)
+    p2 = gmsh.model.occ.addPoint(x0+width, y0, 0, mesh_size_xy)
+    p3 = gmsh.model.occ.addPoint(x0+width, y0+length, 0, mesh_size_xy)
+    p4 = gmsh.model.occ.addPoint(x0, y0+length, 0, mesh_size_xy)
+    
+    # Top Surface points (expanded by draft offset 'd')
+    p5 = gmsh.model.occ.addPoint(x0-d, y0-d, height, mesh_size_xy)
+    p6 = gmsh.model.occ.addPoint(x0+width+d, y0-d, height, mesh_size_xy)
+    p7 = gmsh.model.occ.addPoint(x0+width+d, y0+length+d, height, mesh_size_xy)
+    p8 = gmsh.model.occ.addPoint(x0-d, y0+length+d, height, mesh_size_xy)
+    
+    # Bottom lines
+    l1 = gmsh.model.occ.addLine(p1, p2)
+    l2 = gmsh.model.occ.addLine(p2, p3)
+    l3 = gmsh.model.occ.addLine(p3, p4)
+    l4 = gmsh.model.occ.addLine(p4, p1)
+    
+    # Top lines
+    t1 = gmsh.model.occ.addLine(p5, p6)
+    t2 = gmsh.model.occ.addLine(p6, p7)
+    t3 = gmsh.model.occ.addLine(p7, p8)
+    t4 = gmsh.model.occ.addLine(p8, p5)
+    
+    # Vertical/Inclined edges
+    v1 = gmsh.model.occ.addLine(p1, p5)
+    v2 = gmsh.model.occ.addLine(p2, p6)
+    v3 = gmsh.model.occ.addLine(p3, p7)
+    v4 = gmsh.model.occ.addLine(p4, p8)
+    
+    cl = gmsh.model.occ.addCurveLoop([l1, l2, l3, l4])
+    s1 = gmsh.model.occ.addPlaneSurface([cl])
+    
+    cl_s1 = gmsh.model.occ.addCurveLoop([l1, v2, -t1, -v1])
+    s_s1 = gmsh.model.occ.addPlaneSurface([cl_s1])
+    
+    cl_s2 = gmsh.model.occ.addCurveLoop([l2, v3, -t2, -v2])
+    s_s2 = gmsh.model.occ.addPlaneSurface([cl_s2])
+    
+    cl_s3 = gmsh.model.occ.addCurveLoop([l3, v4, -t3, -v3])
+    s_s3 = gmsh.model.occ.addPlaneSurface([cl_s3])
+    
+    cl_s4 = gmsh.model.occ.addCurveLoop([l4, v1, -t4, -v4])
+    s_s4 = gmsh.model.occ.addPlaneSurface([cl_s4])
+    
+    # --- Flange (Top Rim) Generation ---
+    if flange_width > 0.0:
+        fw = flange_width
+        p9 = gmsh.model.occ.addPoint(x0-d+fw, y0-d+fw, height, mesh_size_xy)
+        p10 = gmsh.model.occ.addPoint(x0+width+d-fw, y0-d+fw, height, mesh_size_xy)
+        p11 = gmsh.model.occ.addPoint(x0+width+d-fw, y0+length+d-fw, height, mesh_size_xy)
+        p12 = gmsh.model.occ.addPoint(x0-d+fw, y0+length+d-fw, height, mesh_size_xy)
+        
+        f1 = gmsh.model.occ.addLine(p9, p10)
+        f2 = gmsh.model.occ.addLine(p10, p11)
+        f3 = gmsh.model.occ.addLine(p11, p12)
+        f4 = gmsh.model.occ.addLine(p12, p9)
+        
+        h1 = gmsh.model.occ.addLine(p5, p9)
+        h2 = gmsh.model.occ.addLine(p6, p10)
+        h3 = gmsh.model.occ.addLine(p7, p11)
+        h4 = gmsh.model.occ.addLine(p8, p12)
+        
+        cl_f1 = gmsh.model.occ.addCurveLoop([t1, h2, -f1, -h1])
+        s_f1 = gmsh.model.occ.addPlaneSurface([cl_f1])
+        
+        cl_f2 = gmsh.model.occ.addCurveLoop([t2, h3, -f2, -h2])
+        s_f2 = gmsh.model.occ.addPlaneSurface([cl_f2])
+        
+        cl_f3 = gmsh.model.occ.addCurveLoop([t3, h4, -f3, -h3])
+        s_f3 = gmsh.model.occ.addPlaneSurface([cl_f3])
+        
+        cl_f4 = gmsh.model.occ.addCurveLoop([t4, h1, -f4, -h4])
+        s_f4 = gmsh.model.occ.addPlaneSurface([cl_f4])
+
+    gmsh.model.occ.synchronize()
+
+    # --- [WHT] Mapped Mesh (Transfinite) Settings ---
+    # quad4 / tria3 : structured transfinite grid
+    # mixed / tria3_free : unstructured free mesh (skip transfinite)
+    if mesh_type in ('quad4', 'tria3', 'mixed'):
+        nx = max(2, int(round(width / mesh_size_xy)) + 1)
+        ny = max(2, int(round(length / mesh_size_xy)) + 1)
+        nz = max(1, int(round(height / mesh_size_z)))
+
+        # Force node counts on base and top edges
+        gmsh.model.mesh.setTransfiniteCurve(l1, nx)
+        gmsh.model.mesh.setTransfiniteCurve(l2, ny)
+        gmsh.model.mesh.setTransfiniteCurve(l3, nx)
+        gmsh.model.mesh.setTransfiniteCurve(l4, ny)
+
+        gmsh.model.mesh.setTransfiniteCurve(t1, nx)
+        gmsh.model.mesh.setTransfiniteCurve(t2, ny)
+        gmsh.model.mesh.setTransfiniteCurve(t3, nx)
+        gmsh.model.mesh.setTransfiniteCurve(t4, ny)
+
+        # Force node counts on vertical/inclined edges
+        gmsh.model.mesh.setTransfiniteCurve(v1, nz + 1)
+        gmsh.model.mesh.setTransfiniteCurve(v2, nz + 1)
+        gmsh.model.mesh.setTransfiniteCurve(v3, nz + 1)
+        gmsh.model.mesh.setTransfiniteCurve(v4, nz + 1)
+
+        # Force mapped mesh on surfaces
+        gmsh.model.mesh.setTransfiniteSurface(s1)
+        if mesh_type in ('quad4', 'mixed'):   # base = QUAD4 for both quad4 and mixed
+            gmsh.model.mesh.setRecombine(2, s1)
+
+        for s in [s_s1, s_s2, s_s3, s_s4]:
+            gmsh.model.mesh.setTransfiniteSurface(s)
+            if mesh_type == 'quad4':           # walls = QUAD4 only for quad4
+                gmsh.model.mesh.setRecombine(2, s)
+
+        if flange_width > 0.0:
+            nw = max(1, int(round(flange_width / mesh_size_xy)))
+
+            gmsh.model.mesh.setTransfiniteCurve(f1, nx)
+            gmsh.model.mesh.setTransfiniteCurve(f2, ny)
+            gmsh.model.mesh.setTransfiniteCurve(f3, nx)
+            gmsh.model.mesh.setTransfiniteCurve(f4, ny)
+
+            gmsh.model.mesh.setTransfiniteCurve(h1, nw + 1)
+            gmsh.model.mesh.setTransfiniteCurve(h2, nw + 1)
+            gmsh.model.mesh.setTransfiniteCurve(h3, nw + 1)
+            gmsh.model.mesh.setTransfiniteCurve(h4, nw + 1)
+
+            for s in [s_f1, s_f2, s_f3, s_f4]:
+                gmsh.model.mesh.setTransfiniteSurface(s)
+                if mesh_type == 'quad4':       # flanges = QUAD4 only for quad4
+                    gmsh.model.mesh.setRecombine(2, s)
+
+    # [WHT] Mesh global options
+    # quad4     : structured all-quad       (RecombineAll=1, Frontal-Delaunay)
+    # tria3     : structured all-tria       (RecombineAll=0, Delaunay)
+    # mixed     : base=QUAD4 walls=TRIA3    (RecombineAll=0, Frontal-Delaunay)
+    # tria3_free: unstructured free-tria    (RecombineAll=0, Frontal-Delaunay)
+    if mesh_type == 'quad4':
+        gmsh.option.setNumber("Mesh.RecombineAll", 1)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)
+    elif mesh_type == 'tria3':
+        gmsh.option.setNumber("Mesh.RecombineAll", 0)
+        gmsh.option.setNumber("Mesh.Algorithm", 5)
+    elif mesh_type == 'tria3_free':
+        gmsh.option.setNumber("Mesh.RecombineAll", 0)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)   # Frontal-Delaunay for quality
+    else:  # mixed: base QUAD4, walls TRIA3
+        gmsh.option.setNumber("Mesh.RecombineAll", 0)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)
+    gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 0)  # Disable subdivision to prevent indexing issues
+    gmsh.option.setNumber("Mesh.Smoothing", 5)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 1)
+    
+    gmsh.model.occ.synchronize()
+    
+    # Set mesh size globally
+    gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_size_xy)
+    gmsh.option.setNumber("Mesh.MeshSizeMax", mesh_size_xy)
+    
+    # Generate 2D Mesh
+    gmsh.model.mesh.generate(2)
+    
+    # Extract Nodes
+    node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+    nodes = node_coords.reshape(-1, 3)
+    # [WHT] JaxSSO expects 0-based contiguous IDs for index-based DOF mapping
+    tag_to_idx = {int(tag): i for i, tag in enumerate(node_tags)}
+    node_id_to_coords = {i: nodes[i] for i in range(len(node_tags))}
+    
+    # Extract Elements (Quads and Triangles)
+    elem_dict = {}
+    elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(2)
+    for etype, etags, enodes in zip(elem_types, elem_tags, elem_node_tags):
+        num_v = 3 if etype == 2 else 4
+        enodes_reshaped = enodes.reshape(-1, num_v)
+        for i, tag in enumerate(etags):
+            # Map connectivity to new 0-based IDs
+            elem_dict[int(tag)] = [tag_to_idx[int(n)] for n in enodes_reshaped[i]]
+            
+    gmsh.finalize()
+    return node_id_to_coords, elem_dict
+
+def generate_solid_hexa_tray(width=1000.0, length=1000.0, height=50.0, thickness=2.0, mesh_size_xy=50.0, mesh_size_z=10.0, draft_angle=0.0, wall_layers=1, flange_width=0.0, origin='corner', order=1):
+    """
+    Generates a 3D Solid Tray mesh (Hexahedral elements) using Gmsh (OpenCASCADE).
+    Uses a 3x3 grid multi-block extrusion approach to enforce a 100% structured Hexa mesh.
+    draft_angle: Outward inclination angle in degrees (shifts nodes at Z > 0).
+    wall_layers: Explicitly define the number of elements across the wall thickness.
+    flange_width: Inward horizontal rim at the top of the walls.
+    origin: 'corner' or 'center'.
+    order: 1 for HEX8, 2 for HEX27 (2nd order).
+    """
+    gmsh.initialize()
+    gmsh.model.add("HexaTray")
+    
+    # [WHT] Force HEX27 (Full Lagrange) instead of HEX20 (Serendipity)
+    if order > 1:
+        gmsh.option.setNumber("Mesh.ElementOrder", 2)
+        # Try all known serendipity/incomplete names
+        for opt in ["Mesh.SecondOrderIncomplete", "Mesh.SecondOrderSerendipity"]:
+            try:
+                gmsh.option.setNumber(opt, 0)
+            except: pass
+        
+        # Verify the setting
+        actual_order = gmsh.option.getNumber("Mesh.ElementOrder")
+        actual_incomplete = -1
+        try: actual_incomplete = gmsh.option.getNumber("Mesh.SecondOrderIncomplete")
+        except: pass
+        print(f"    [GMsh Setup] Requested Order: {order}, Actual Order: {actual_order}, Incomplete: {actual_incomplete}")
+
+    eps = 1e-3
+    
+    x0, y0 = 0.0, 0.0
+    if origin == 'center':
+        x0, y0 = -width/2.0, -length/2.0
+    
+    # X and Y coordinates for the 3x3 grid
+    xs = [x0-thickness, x0, x0+width, x0+width+thickness]
+    ys = [y0-thickness, y0, y0+length, y0+length+thickness]
+    
+    pts = {}
+    for i, x in enumerate(xs):
+        for j, y in enumerate(ys):
+            pts[i,j] = gmsh.model.occ.addPoint(x, y, -thickness, mesh_size_xy)
+            
+    lx = {}
+    for i in range(3):
+        for j in range(4):
+            lx[i,j] = gmsh.model.occ.addLine(pts[i,j], pts[i+1,j])
+            
+    ly = {}
+    for i in range(4):
+        for j in range(3):
+            ly[i,j] = gmsh.model.occ.addLine(pts[i,j], pts[i,j+1])
+            
+    surfs = {}
+    for i in range(3):
+        for j in range(3):
+            cl = gmsh.model.occ.addCurveLoop([lx[i,j], ly[i+1,j], -lx[i,j+1], -ly[i,j]])
+            surfs[i,j] = gmsh.model.occ.addPlaneSurface([cl])
+            
+    # 1. Extrude the base grid (Floor thickness)
+    nt_z = max(1, int(round(thickness / mesh_size_z)))
+    base_surfs = [(2, surfs[i,j]) for i in range(3) for j in range(3)]
+    res1 = gmsh.model.occ.extrude(base_surfs, 0, 0, thickness, numElements=[nt_z], recombine=True)
+    
+    # 2. Find the top surfaces at Z=0 (excluding the center floor) to extrude walls
+    wall_surfs = []
+    # res1 contains (layer, surface) for each entity
+    # We need to filter those at Z=0
+    for dim, tag in res1:
+        if dim == 2:
+            bb = gmsh.model.occ.getBoundingBox(dim, tag)
+            xmin, ymin, zmin, xmax, ymax, zmax = bb
+            if abs(zmin - 0.0) < eps and abs(zmax - 0.0) < eps:
+                is_center = (xmin >= x0-eps and xmax <= x0+width + eps and
+                             ymin >= y0-eps and ymax <= y0+length + eps)
+                if not is_center:
+                    wall_surfs.append((dim, tag))
+                
+    # 3. Extrude the wall surfaces
+    nh_z = max(1, int(round(height / mesh_size_z)))
+    if wall_surfs:
+        # If we have a flange, we split the wall extrusion to get a "top ring" to extrude from
+        if flange_width > 0.0:
+            h_main = max(0.0, height - thickness)
+            nh_main = max(1, int(round(h_main / mesh_size_z))) if h_main > 0 else 0
+            
+            res_main = []
+            if h_main > 0:
+                res_main = gmsh.model.occ.extrude(wall_surfs, 0, 0, h_main, numElements=[nh_main], recombine=True)
+                # Find top surfaces of the main wall
+                top_mid_surfs = []
+                for dim, tag in res_main:
+                    if dim == 2:
+                        bb = gmsh.model.occ.getBoundingBox(dim, tag)
+                        zmin, zmax = bb[2], bb[5]
+                        if abs(zmin - h_main) < eps and abs(zmax - h_main) < eps:
+                            top_mid_surfs.append((dim, tag))
+                current_wall_tops = top_mid_surfs
+            else:
+                current_wall_tops = wall_surfs
+                
+            # Extrude the "top ring" (thickness high)
+            nh_ring = max(1, int(round(thickness / mesh_size_z)))
+            res_ring = gmsh.model.occ.extrude(current_wall_tops, 0, 0, thickness, numElements=[nh_ring], recombine=True)
+            
+            # 4. Extrude Flange (Inward) from the SIDE faces of the top ring
+            nf_w = max(1, int(round(flange_width / mesh_size_xy)))
+            for dim, tag in res_ring:
+                if dim == 2:
+                    bb = gmsh.model.occ.getBoundingBox(dim, tag)
+                    xmin, ymin, zmin, xmax, ymax, zmax = bb
+                    # We look for vertical faces of the top ring that are facing the interior
+                    # These faces will have z spanning [height-thickness, height]
+                    if zmax > height - eps:
+                        dx, dy = 0.0, 0.0
+                        # Left wall inner face is at x=x0
+                        if abs(xmin - x0) < eps and abs(xmax - x0) < eps and (ymin >= y0-thickness - eps and ymax <= y0+length + thickness + eps):
+                            dx = flange_width
+                        # Right wall inner face is at x=x0+width
+                        elif abs(xmin - (x0+width)) < eps and abs(xmax - (x0+width)) < eps and (ymin >= y0-thickness - eps and ymax <= y0+length + thickness + eps):
+                            dx = -flange_width
+                        # Back wall inner face is at y=y0
+                        elif abs(ymin - y0) < eps and abs(ymax - y0) < eps and (xmin >= x0-thickness - eps and xmax <= x0+width + thickness + eps):
+                            dy = flange_width
+                        # Front wall inner face is at y=y0+length
+                        elif abs(ymin - (y0+length)) < eps and abs(ymax - (y0+length)) < eps and (xmin >= x0-thickness - eps and xmax <= x0+width + thickness + eps):
+                            dy = -flange_width
+                        
+                        if abs(dx) > eps or abs(dy) > eps:
+                            # Only extrude if it's a vertical face (xmin == xmax or ymin == ymax)
+                            is_vertical = abs(xmax - xmin) < eps or abs(ymax - ymin) < eps
+                            if is_vertical:
+                                gmsh.model.occ.extrude([(dim, tag)], dx, dy, 0, numElements=[nf_w], recombine=True)
+        else:
+            gmsh.model.occ.extrude(wall_surfs, 0, 0, height, numElements=[nh_z], recombine=True)
+        
+    gmsh.model.occ.synchronize()
+    
+    # 4. Set Transfinite on original base lines to force structured quad/hexa mesh
+    nw = max(2, wall_layers + 1)
+    nx = max(2, int(round(width / mesh_size_xy)) + 1)
+    ny = max(2, int(round(length / mesh_size_xy)) + 1)
+    
+    for i in range(3):
+        for j in range(4):
+            gmsh.model.mesh.setTransfiniteCurve(lx[i,j], nx if i == 1 else nw)
+    for i in range(4):
+        for j in range(3):
+            gmsh.model.mesh.setTransfiniteCurve(ly[i,j], ny if j == 1 else nw)
+            
+    for i in range(3):
+        for j in range(3):
+            gmsh.model.mesh.setTransfiniteSurface(surfs[i,j])
+            gmsh.model.mesh.setRecombine(2, surfs[i,j])
+            
+    # 5. Global Mesh Options
+    gmsh.option.setNumber("Mesh.RecombineAll", 1)
+    gmsh.option.setNumber("Mesh.Algorithm", 8)        # Frontal-Delaunay for quads
+    
+    # Support for 2nd order elements (Must be called BEFORE generate(3) to affect the process)
+    if order > 1:
+        # Try both common names for serendipity control
+        for opt in ["Mesh.SecondOrderIncomplete", "Mesh.SecondOrderSerendipity"]:
+            try:
+                gmsh.option.setNumber(opt, 0) # Force HEX27 (Full Lagrange) instead of HEX20
+            except:
+                pass
+        gmsh.model.mesh.setOrder(order)
+    
+    gmsh.model.mesh.generate(3)
+    
+    # 6. Extract Nodes
+    node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+    nodes = node_coords.reshape(-1, 3)
+    tag_to_idx = {int(tag): i for i, tag in enumerate(node_tags)}
+    node_id_to_coords = {i: nodes[i] for i in range(len(node_tags))}
+    
+    # 6.5 Apply Draft Angle explicitly by shifting nodes at Z > 0
+    if draft_angle > 0.0:
+        d_rad = math.radians(draft_angle)
+        eps = 1e-3
+        for i, coords in node_id_to_coords.items():
+            x, y, z = coords
+            if z > 0:
+                shift = z * math.tan(d_rad)
+                if x <= eps: x -= shift
+                elif x >= width - eps: x += shift
+                
+                if y <= eps: y -= shift
+                elif y >= length - eps: y += shift
+                node_id_to_coords[i] = np.array([x, y, z])
+
+    # 7. Extract Elements (Standard HEX8)
+    elem_dict = {}
+    elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(3)
+    
+    for etype, etags, enodes in zip(elem_types, elem_tags, elem_node_tags):
+        n_elems = len(etags)
+        if n_elems == 0: continue
+        
+        n_nodes_per_elem = len(enodes) // n_elems
+        enodes_reshaped = enodes.reshape(-1, n_nodes_per_elem)
+        
+        for i, tag in enumerate(etags):
+            # Standard HEX8 connectivity mapping
+            elem_dict[int(tag)] = [tag_to_idx[int(n)] for n in enodes_reshaped[i]]
+            
+    gmsh.finalize()
+    return node_id_to_coords, elem_dict
+
+def get_nodes_in_box(nodes_dict, x_range=None, y_range=None, z_range=None):
+    """
+    Returns a list of node IDs within a specified bounding box.
+    """
+    selected_ids = []
+    for nid, coords in nodes_dict.items():
+        x, y, z = coords
+        in_x = (x_range[0] <= x <= x_range[1]) if x_range else True
+        in_y = (y_range[0] <= y <= y_range[1]) if y_range else True
+        in_z = (z_range[0] <= z <= z_range[1]) if z_range else True
+        if in_x and in_y and in_z:
+            selected_ids.append(nid)
+    return selected_ids
+
+def apply_fixed_bc(model, node_ids, dofs=(0, 1, 2, 3, 4, 5)):
+    """
+    Utility to apply fixed BCs to a list of node IDs in a JaxSSO model.
+    JaxSSO uses add_support(nodeTag, active_supports=[1,1,1,1,1,1])
+    """
+    for nid in node_ids:
+        # Create support vector (1=fixed, 0=free)
+        support_vec = [0, 0, 0, 0, 0, 0]
+        for d in dofs:
+            support_vec[d] = 1
+        model.add_support(nid, support_vec)
+
+def apply_auto_beads(node_id_to_coords, width, length, margin=30.0, 
+                     target_ratio=0.4, max_depth=15.0, 
+                     min_len=20.0, max_len=400.0,
+                     min_width=20.0, max_width=100.0,
+                     smoothing_sigma=3.0, origin='corner'):
+    """
+    Applies random symmetric rectangular beads to the flat tray floor via Z-displacement.
+    Uses a 2D Gaussian smoothed height map for robust element transitions.
+    """
+    import random
+    import scipy.ndimage as ndimage
+    from scipy.interpolate import RegularGridInterpolator
+    from scipy.stats import qmc
+    
+    # Set the floor origin explicitly to avoid shifts from flanges
+    if origin == 'center':
+        x_min_floor, y_min_floor = -width/2.0, -length/2.0
+    else:
+        x_min_floor, y_min_floor = 0.0, 0.0
+    
+    res = 5.0
+    grid_w = int(width / res) + 1
+    # ... (rest of configuration)
+    grid_l = int(length / res) + 1
+    coverage_mask = np.zeros((grid_w, grid_l), dtype=bool)
+    height_map = np.zeros((grid_w, grid_l), dtype=float)
+    
+    # Calculate available area for the coverage ratio (within margins)
+    margin_cells_w = int(margin / res)
+    margin_cells_l = int(margin / res)
+    active_w = grid_w - 2 * margin_cells_w
+    active_l = grid_l - 2 * margin_cells_l
+    
+    if active_w <= 0 or active_l <= 0:
+        print(" -> [Bead Error] Margin is too large for the given width/length.")
+        return node_id_to_coords
+        
+    total_active_cells = active_w * active_l
+    
+    # LHS Sampler for even spatial distribution of beads
+    n_lhs_samples = 200
+    try:
+        sampler = qmc.LatinHypercube(d=2)
+        lhs_samples = sampler.random(n=n_lhs_samples)
+    except Exception:
+        lhs_samples = np.random.rand(n_lhs_samples, 2)
+        
+    sample_idx = 0
+    
+    print(f" -> Generating bead footprints (origin={origin}) until {target_ratio*100}% coverage...")
+    while True:
+        current_ratio = np.sum(coverage_mask[margin_cells_w:-margin_cells_w, margin_cells_l:-margin_cells_l]) / total_active_cells
+        if current_ratio >= target_ratio:
+            break
+            
+        bw = random.uniform(min_width, max_width)
+        bl = random.uniform(min_len, max_len)
+        depth = random.uniform(5.0, max_depth)
+        
+        # Determine valid bounds for centers (Relative to floor 0..width/length)
+        valid_min_cx = margin + bw/2.0
+        valid_max_cx = max(valid_min_cx, (width/2.0) - 1.0)
+        valid_min_cy = margin + bl/2.0
+        valid_max_cy = max(valid_min_cy, length - margin - bl/2.0)
+        
+        if sample_idx < n_lhs_samples:
+            u_x, u_y = lhs_samples[sample_idx]
+            sample_idx += 1
+        else:
+            u_x, u_y = random.random(), random.random()
+            
+        cx = valid_min_cx + u_x * (valid_max_cx - valid_min_cx)
+        cy = valid_min_cy + u_y * (valid_max_cy - valid_min_cy)
+        
+        def add_bead(cx_rel, cy_rel, bw, bl, d):
+            xmin, xmax = cx_rel - bw/2.0, cx_rel + bw/2.0
+            ymin, ymax = cy_rel - bl/2.0, cy_rel + bl/2.0
+            
+            ix_min = max(0, int(xmin / res))
+            ix_max = min(grid_w, int(xmax / res))
+            iy_min = max(0, int(ymin / res))
+            iy_max = min(grid_l, int(ymax / res))
+            
+            for i in range(ix_min, ix_max):
+                for j in range(iy_min, iy_max):
+                    coverage_mask[i, j] = True
+                    height_map[i, j] = max(height_map[i, j], d)
+        
+        add_bead(cx, cy, bw, bl, depth)
+        add_bead(width - cx, cy, bw, bl, depth)
+        
+    print(f" -> Applying Gaussian Smoothing (Sigma={smoothing_sigma})...")
+    smoothed_map = ndimage.gaussian_filter(height_map, sigma=smoothing_sigma)
+    
+    # Grid for interpolation is in local/relative coordinates [0, width]
+    x_rel_grid = np.linspace(0, width, grid_w)
+    y_rel_grid = np.linspace(0, length, grid_l)
+    interp = RegularGridInterpolator((x_rel_grid, y_rel_grid), smoothed_map, bounds_error=False, fill_value=0.0)
+    
+    print(" -> Morphing mesh nodes...")
+    eps = 1e-3
+    n_modified = 0
+    for nid, coords in node_id_to_coords.items():
+        x, y, z = coords
+        # Convert absolute x,y to relative x,y for height map lookup
+        xr, yr = x - x_min_floor, y - y_min_floor
+        
+        # Apply only to Flat Floor area
+        if (margin <= xr <= width - margin) and (margin <= yr <= length - margin):
+            if z <= eps: # Floor layers
+                z_shift = float(interp(np.array([xr, yr]))[0])
+                if z_shift > 0.1:
+                    # Update coordinate array directly (Beads typically protrude outwards/downwards from floor)
+                    node_id_to_coords[nid] = np.array([x, y, z - z_shift])
+                    n_modified += 1
+                    
+    print(f" -> Morphed {n_modified} nodes successfully.")
+    return node_id_to_coords

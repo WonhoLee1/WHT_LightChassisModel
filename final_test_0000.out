@@ -1,0 +1,1003 @@
+ final_test_0000.out
+************************************************************************
+**                                                                    **
+**                                                                    **
+**                        OpenRadioss Starter                         **
+**                                                                    **
+**            Non-linear Finite Element Analysis Software             **
+**                                                                    **
+**                                                                    **
+**                                                                    **
+**                  Windows 64 bits, Intel compiler                   **
+**                      Double Precision Version                      **
+**                                                                    **
+**                                                                    **
+**                                                                    **
+************************************************************************
+** OpenRadioss Software                                               **
+** COPYRIGHT (C) 1986-2026 Altair Engineering, Inc.                   **
+** Licensed under GNU Affero General Public License.                  **
+** See License file.                                                  **
+************************************************************************
+ 
+  
+ COMPUTATION HARDWARE DESCRIPTION
+  
+ HOSTNAME     CPU TYPE, FREQUENCY AND MEMORY
+ DESKTOP-WHL   11th Gen Intel(R) Core(TM) i7-11700 @ 2.50GHz (x86_64), 2500 MHz,  15553 MB RAM,  59279 MB swap
+  
+ STACKSIZE  . . . . . . . . . . . . . . . . . . . . 1430 MB
+ THREAD STACKSIZE . . . . . . . . . . . . . . . . . 250 MB
+ 
+************************************************************************
+
+
+************************************************************************
+* INPUT READING PROCESS
+************************************************************************
+
+WARNING ID : 100213
+** WARNING IN INPUT OPTIONS
+DESCRIPTION :  
+-- BLOCK: /MAT/LAW1/1
+-- LINE: 7.800000000000e-09  2.100000000000e+05  3.000000000000e-01
+unsupported field exists at the end of line
+SOLUTION :     
+    Please check input format and fields description defined in the Reference Guide.
+
+WARNING ID : 100217
+** WARNING IN INPUT OPTIONS
+DESCRIPTION :  
+-- BLOCK: /IMPACC/1
+-- LINE: /END
+card is missing
+SOLUTION :     
+Please check input format and fields description defined in the Reference Guide.
+
+ -NO SYNTAX ERROR DETECTED DURING INPUT READING PROCESS
+
+
+
+
+************************************************************************
+
+
+
+    UNIT SYSTEMS DEFINITION     
+    -----------------------     
+
+                                                          MASS                LENGTH              TIME
+    WORK UNIT SYSTEM . . . . . . ( Mg , mm , s   ) 1.0000000000000E+03 1.0000000000000E-03 1.0000000000000E+00
+    INPUT UNIT SYSTEM  . . . . . ( Mg , mm , s   ) 1.0000000000000E+03 1.0000000000000E-03 1.0000000000000E+00
+
+
+
+    CONTROL  PARAMETERS                                                                  
+    -------------------                                                                  
+
+    IPRI  : PRINTOUT FLAG . . . . . . . . . . . . . . . .         0
+    INVERS: MANUAL VERSION OF THIS INPUT DECK . . . . . .      2025
+    NSUBS:   NUMBER OF SUBSETS. . . . . . . . . . . . . .         1
+    NPART:   NUMBER OF PARTS. . . . . . . . . . . . . . .         1
+    NUMMAT: NUMBER OF MATERIALS . . . . . . . . . . . . .         1
+    NUMGEO: NUMBER OF PROPERTY SETS . . . . . . . . . . .         1
+    NUMNOD: NUMBER OF NODAL POINTS. . . . . . . . . . . .       105
+    NUMSKW: NUMBER OF SKEW REFERENCE FRAMES . . . . . . .         0
+    NUMBCS: NUMBER OF BOUNDARY CONDITIONS . . . . . . . .         0
+    NUMFRAM: NUMBER OF REFERENCE FRAMES . . . . . . . . .         0
+    NUMELQ: NUMBER OF 2D QUAD ELEMENTS. . . . . . . . . .         0
+    NUMELT3 : NUMBER OF 2D TRIA ELEMENTS. . . . . . . . .         0
+    NUMELS: NUMBER OF 3D SOLID ELEMENTS . . . . . . . . .         0
+    NUMELC: NUMBER OF 3D SHELL ELEMENTS (4-NODES) . . . .        84
+    NUMELT: NUMBER OF 3D TRUSS ELEMENTS . . . . . . . . .         0
+    NUMELP: NUMBER OF 3D BEAM  ELEMENTS . . . . . . . . .         0
+    NUMELR: NUMBER OF 3D SPRING ELEMENTS. . . . . . . . .         0
+    NUMELTG: NUMBER OF 3D SHELL ELEMENTS (3-NODES). . . .         0
+    NUMELX: NUMBER OF MULTIPURPOSE ELEMENTS . . . . . . .         0
+    NUMELIG3D: NUMBER OF ISO-GEOMETRIC ELEMENTS . . . . .         0
+    NUMSPH : NUMBER OF SMOOTH PARTICLES (SPH CELLS) . . .         0
+    NSPHBCS: NUMBER OF SPH SYMMETRY CONDITIONS. . . . . .         0
+    NSPHIO : NUMBER OF SPH INLET/OUTLET CONDITIONS. . . .         0
+
+    NFUNCT: NUMBER OF USER'S FUNCTIONS . . . . . . . . .          1
+    NGRAV:  NUMBER OF GRAVITY LOADS . . . . . . . . . . .         0
+    NFUNC2D:  NUMBER OF USER 2D FUNCTIONS . . . . . . . .         0
+    NINIGRV:NUMBER OF INITIAL GRAVITY LOADS . . . . . . .         0
+    NCONLD: NUMBER OF CONCENTRATED LOADS. . . . . . . . .         0
+    NINVEL: NUMBER OF INITIAL VELOCITIES. . . . . . . . .         0
+    NPRELD: NUMBER OF PRESSURE LOADS. . . . . . . . . . .         0
+    NINIMAP1D: NUMBER OF INITIAL 1D MAPPING.. . . . . . .         0
+    NINIMAP2D: NUMBER OF INITIAL 2D MAPPING.. . . . . . .         0
+    NUMBER OF ACCELEROMETERS. . . . . . . . . . . . . . .         0
+    NUMBER OF SENSORS . . . . . . . . . . . . . . . . . .         0
+    NUMBER OF GAUGES. . . . . . . . . . . . . . . . . . .         0
+    NINTER: NUMBER OF INTERFACES. . . . . . . . . . . . .         0
+    NRWALL: NUMBER OF RIGID WALLS . . . . . . . . . . . .         0
+    NRBODY: NUMBER OF RIGID BODIES. . . . . . . . . . . .         0
+    NFXBODY: NUMBER OF FLEXIBLE BODIES. . . . . . . . . .         0
+    NCONX : NUMBER OF RIGID LINKS TO MADYMO BODIES. . . .         0
+    NODMAS: NUMBER OF ADDED NODAL MASSES. . . . . . . . .         0
+    NIMPDISP: NUMBER OF IMPOSED DISPLACEMENTS . . . . . .         0
+    NIMPVEL: NUMBER OF IMPOSED VELOCITIES . . . . . . . .         0
+    NIMPACC: NUMBER OF IMPOSED ACCELERATIONS . . . . . .          1
+    NRIVET: NUMBER OF RIVETS OR SPOT WELDS. . . . . . . .         0
+    NSECT : NUMBER OF SECTIONS SAVED (TIME HISTORY PLOTS)         0
+    NJOINT: NUMBER OF JOINTS. . . . . . . . . . . . . . .         0
+    NACTIV: NUMBER OF ELEMENT DEACTIVATION GROUPS . . . .         0
+    NDAMP:  NUMBER OF RAYLEIGH DAMPING GROUPS . . . . . .         0
+    NGJOINT: NUMBER OF GEAR TYPE JOINTS . . . . . . . . .         0
+    NUMMPC: NUMBER OF MULTI-POINT CONSTRAINTS . . . . . .         0
+    NR2RLNK: NUMBER OF EXTERNAL COUPLING LINKS . . . . .          0
+    NSUBDOM: NUMBER OF SUBDOMAINS . . . . . .. . . . . .          0
+    NVOLU:  NUMBER OF MONITORED VOLUMES . . . . . . . . .         0
+    NEIG:   NUMBER OF EIGEN AND STATIC MODES PROBLEMS . .         0
+    NBEM:   NUMBER OF BEM SOLVED PROBLEMS . . . . . . . .         0
+    NRBE2:  NUMBER OF RBE2 RIGID ELEMENTS . . . . . . . .         0
+    NRBE3:  NUMBER OF RBE3 CONSTRAINT ELEMENTS  . . . . .         0
+    INITIAL STRESS FILE =
+                                          FLAG ISIGI. . .         0
+
+
+    N2D3D : ANALYSIS TYPE: 0=3D,1=AXISYM,2=PLANE STRAIN .         0
+
+
+    ANALYSIS OPTIONS
+    ----------------
+
+    INTEG8 : 8 GAUSS POINT CONDENSED INTEGRATION . . . . .         0
+    IPARITH: PARALLEL ARITHMETIC FLAG (2 OFF, 1 0N). . . .         1
+    IUSERW : GENERAL USER WINDOW FLAG. . . . . . . . . . .         0
+    ISOLID : DEFAULT BRICK FORMULATION FLAG. . . . . . . .         1
+    ITET4  : DEFAULT TETRA4 FORMULATION FLAG . . . . . . .      1000
+    ITET10 : DEFAULT TETRA10 FORMULATION FLAG. . . . . . .      1000
+    ISMSTR : DEFAULT BRICK SMALL STRAIN FLAG . . . . . . .         0
+    ICPRE  : DEFAULT SOLID CONSTANT PRESSURE FLAG. . . . .         0
+    ISHELL : DEFAULT SHELL FORMULATION FLAG. . . . . . . .         1
+    ISST   : DEFAULT SHELL SMALL STRAIN FLAG . . . . . . .         0
+    ITHK   : DEFAULT SHELL THICKNESS VARIATION FLAG. . . .         0
+    IPLA   : DEFAULT PLANE STRESS PLASTICITY FLAG. . . . .         0
+    ISTR   : DEFAULT SHELL STRAIN COMPUTATION FLAG . . . .         1
+    ISHEA  : DEFAULT SHELL SHEAR COMPUTATION FLAG. . . . .         0
+    INSH   : SHELL INERTIA FLAG. . . . . . . . . . . . . .         0
+    ISH3N  : DEFAULT 3 NODE SHELL FORMULATION FLAG . . . .         2
+    NPTS   : SHELL PROPERTIES DEFAULT NUMBER OF           
+             INTEGRATION POINTS OR LAYERS. . . . . . . . .        -1
+    IFRAME : DEFAULT SOLID FRAME FORMULATION FLAG . . . .          1
+    IOFFSET: DEFAULT SHELL OFFSET FLAG. . . . . . . . . .          0
+    ICONTROL:DEFAULT SOLID DISTORTION CONTROL FLAG. . . .          0
+    ISHFRAM: LOCAL SHELL FRAME DEFINITION. . . . . . . . .         0
+
+
+    LAGRANGE MULTIPLIER OPTIONS
+    ---------------------------
+    LAGM_TOL:CONVERGENCE CRITERION. . . . . . . . . . . . 1.0000000000000E-11
+
+
+    NODAL MASS DISTRIBUTION FLAG . . . . . . . . .         0
+
+
+    SPEED PARAMETERS  
+    ----------------  
+
+    STARTER RUNNING ON. . . . . . . . . . . . . . . . . .         1 THREAD              
+    NUMBER OF SPMD DOMAINS. . . . . . . . . . . . . . . .         1
+    NUMBER OF THREADS PER DOMAIN. . . . . . . . . . . . .         1
+    ARCHITECTURE OPTIMIZATION . . . . . . . . . . . . . .        22, win64               
+    SIZE OF ELEMENT BUFFER. . . . . . . . . . . . . . . .       128
+
+
+    LOAD CURVES
+    -----------
+    NUMBER OF LOAD CURVES. . . . . . . . =         1
+
+
+    LOAD CURVE ID . . . . . . . . . . . =         1
+
+    X                     Y               
+     0.000000000000        0.000000000000    
+    2.5000000000000E-03    1.000000000000    
+    5.0000000000000E-03    0.000000000000    
+    7.5000000000000E-03   -1.000000000000    
+    1.0000000000000E-02    0.000000000000    
+
+
+    TABLES
+    ------
+    NUMBER OF TABLES . . . . . . . . . . =         0
+
+
+
+    MATERIAL LAWS
+    -------------
+    NUMBER OF MATERIALS. . . . . . . . . =         1
+
+
+
+ERROR ID :    683
+** INPUT ERROR IN MATERIAL LAW
+DESCRIPTION :  
+   -- MATERIAL ID: 1
+   -- MATERIAL TITLE: Steel
+   YOUNG'S MODULUS IS LESS THAN OR EQUAL TO ZERO
+     Steel
+     MATERIAL NUMBER . . . . . . . . . . . .=         1
+     MATERIAL LAW. . . . . . . . . . . . . .=         1
+
+       ELASTIC MATERIAL (/MAT/LAW01)
+       -----------------------------
+     INITIAL DENSITY . . . . . . . . . . . .= 7.8000000000000E-09
+
+     YOUNG'S MODULUS . . . . . . . . . . . .=  0.0000E+00
+     POISSON'S RATIO . . . . . . . . . . . .=  0.0000E+00
+     SHEAR MODULUS . . . . . . . . . . . . .=  0.0000E+00
+
+
+
+
+         PROPERTY SETS
+         -------------
+
+
+TrayProp                                
+
+ERROR ID :   1700
+** ERROR: WRONG IPINCH VALUE IN SHELL PROPERTY
+DESCRIPTION :  
+   -- PROPERTY ID: 1
+   -- PROPERTY TITLE: TrayProp
+   WRONG PINCHING DOF VALUE: -256601259
+   IPINCH SHOULD BE SET TO 0 OR 1
+     ISOTROPIC SHELL PROPERTY SET
+     PROPERTY SET NUMBER . . . . . . . . . .=         1
+     NUMBER OF INTEGRATION POINTS. . . . . .=         0
+     POST PROCESSING STRAIN FLAG . . . . . .=         1
+     SHELL THICKNESS . . . . . . . . . . . .=  0.000000000000    
+     SMALL STRAIN FLAG . . . . . . . . . . .=         2
+     SHELL FORMULATION FLAG. . . . . . . . .=         5
+     3NODE SHELL FORMULATION FLAG. . . . . .=         2
+     SHELL HOURGLASS MEMBRANE DAMPING. . . .=  1.000000000000    
+     SHELL HOURGLASS FLEXURAL DAMPING. . . .= 1.0000000000000E-02
+     SHELL HOURGLASS ROTATIONAL DAMPING. . .= 1.0000000000000E-02
+     SHELL MEMBRANE DAMPING. . . . . . . . .=  0.000000000000    
+     SHEAR AREA REDUCTION FACTOR . . . . . .= 0.8333333333333    
+     ELEMENT DELETION PARAMETER. . . . . . .= 0.9999990000000    
+      > 0.0 : FRACTION OF FAILED THICKNESS   
+      < 0.0 : FRACTION OF FAILED INTG. POINTS
+     SHEAR FORMULATION FLAG. . . . . . . . .=         0
+     THICKNESS VARIATION FLAG. . . . . . . .=         0
+     PLASTICITY FORMULATION FLAG . . . . . .=         0
+     SHELL OFFSET POSITION FLAG . . . . . . =         0
+
+
+
+
+       PARTS
+       -----
+
+
+
+PART:         1,TrayPart
+----
+     PROPERTY    :         1 (TYPE 01),TrayProp
+     MATERIAL    :         1 (LAW  01),Steel
+     SUBSET      :         0
+     FRAMEWORK   :         LAGRANGE
+     VIRT. THICKN:         0.000000000000    
+
+
+       HIERARCHICAL SUBSET ORGANIZATION
+       --------------------------------
+
+
+  
+  
+ SUBSET:         0,GLOBAL MODEL                                                                                                     
+ ~~~~~~
+  |
+  |________Part(s):         1,TrayPart                                
+  
+ SPMD IS CHECKING FOR ELEMENT DELETION IN : 
+ final_test_0001.rad                                                                                          
+ 
+ DOMAIN DECOMPOSITION USING MULTILEVEL KWAY
+ ------------------------------------------
+ DOMAIN DECOMPOSITION OPTIMIZED FOR PARALLEL ARITHMETIC ON
+ DOMAIN DECOMPOSITION : OPTIMIZED FOR BROADWELL PROCESSOR
+
+
+
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=78 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=79 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=80 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=81 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=82 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=83 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=84 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=85 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=86 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=87 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=88 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=89 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=90 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=91 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=92 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=93 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=94 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=95 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=96 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=97 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=98 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=99 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=100 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=101 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=102 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=103 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=104 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=105 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=106 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=107 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=108 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=109 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=110 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=111 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=112 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=113 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=114 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=115 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=116 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=117 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=118 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=119 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=120 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=121 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=122 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=123 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=124 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=125 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=126 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=127 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=128 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=129 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=130 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=131 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=132 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=133 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=134 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=135 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=136 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=137 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=138 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=139 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=140 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=141 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=142 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=143 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=144 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=145 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=146 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=147 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=148 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=149 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=150 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=151 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=152 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=153 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=154 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=155 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=156 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=157 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=158 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=159 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=160 HAS A NULL THICKNESS
+
+ERROR ID :    495
+** ERROR IN SHELL DEFINITION
+DESCRIPTION :  
+   SHELL ID=161 HAS A NULL THICKNESS
+ SHELL GROUP         1 VECTORIZATION CODE =    9
+
+
+PART MASS & INERTIA
+-------------------
+
+
+PART :          1, TrayPart
+            Mass             Ixx             Iyy             Izz             Ixy             Iyz             Izx
+  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+               X               Y               Z     Kin. Energy              Vx              Vy              Vz
+  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+
+
+PART ELEMENT/MATERIAL PARAMETER REVIEW:
+-----------------------
+
+Part id,name:         1 TrayPart               Mat type:   1 Elm type: SHELL-4nodes           
+----
+  Ishell  Ismstr   Idril     NPT    ITHK   IPLAS    IPOS
+       4       2       2       0       0       0       0
+--      hm        hf        hr        dm        dn
+    0.0100    1.0000    0.0100    0.0000    0.0000
+
+
+
+     TOTAL MASS AND MASS CENTER
+     --------------------------
+                     MASS                    X                    Y                    Z
+
+       0.000000000000       0.000000000000       0.000000000000       0.000000000000    
+
+
+     TOTAL INERTIA
+     -------------
+                      IXX                  IYY                  IZZ                  IXY                  IYZ                  IZX
+       0.000000000000       0.000000000000       0.000000000000       0.000000000000       0.000000000000       0.000000000000    
+
+
+
+      ADDED NODAL NON-STRUCTURAL MASSES 
+     -----------------------------------
+
+      TOTAL ADDED MASS =   0.000000000000    
+
+
+
+         SHELL ELEMENTS TIME STEP
+         ------------------------
+
+      TIME STEP       ELEMENT NUMBER
+             Infinity            132
+             Infinity             79
+             Infinity            139
+             Infinity            138
+             Infinity            137
+             Infinity            136
+             Infinity            135
+             Infinity            134
+             Infinity            133
+             Infinity            130
+             Infinity            131
+             Infinity            141
+             Infinity            129
+             Infinity            128
+             Infinity            127
+             Infinity            126
+             Infinity            125
+             Infinity            124
+             Infinity            123
+             Infinity            140
+
+
+         NODAL TIME STEP (estimation)
+         ---------------
+
+      TIME STEP       NODE NUMBER
+  1.0000000000000E+30             72
+  1.0000000000000E+30              2
+  1.0000000000000E+30             69
+  1.0000000000000E+30             70
+  1.0000000000000E+30             71
+  1.0000000000000E+30             74
+  1.0000000000000E+30             73
+  1.0000000000000E+30             67
+  1.0000000000000E+30             75
+  1.0000000000000E+30             76
+  1.0000000000000E+30             77
+  1.0000000000000E+30             68
+  1.0000000000000E+30             66
+  1.0000000000000E+30             59
+  1.0000000000000E+30             65
+  1.0000000000000E+30             56
+  1.0000000000000E+30             57
+  1.0000000000000E+30             58
+  1.0000000000000E+30             61
+  1.0000000000000E+30             60
+  1.0000000000000E+30             79
+  1.0000000000000E+30             62
+  1.0000000000000E+30             63
+  1.0000000000000E+30             64
+  1.0000000000000E+30             78
+  1.0000000000000E+30             81
+  1.0000000000000E+30             80
+  1.0000000000000E+30             99
+  1.0000000000000E+30             82
+  1.0000000000000E+30             96
+  1.0000000000000E+30             97
+  1.0000000000000E+30             98
+  1.0000000000000E+30            101
+  1.0000000000000E+30            100
+  1.0000000000000E+30             94
+  1.0000000000000E+30            102
+  1.0000000000000E+30            103
+  1.0000000000000E+30            104
+  1.0000000000000E+30             95
+  1.0000000000000E+30             93
+  1.0000000000000E+30             86
+  1.0000000000000E+30             92
+  1.0000000000000E+30             83
+  1.0000000000000E+30             84
+  1.0000000000000E+30             85
+  1.0000000000000E+30             88
+  1.0000000000000E+30             87
+  1.0000000000000E+30             54
+  1.0000000000000E+30             89
+  1.0000000000000E+30             90
+  1.0000000000000E+30             91
+  1.0000000000000E+30             55
+  1.0000000000000E+30             53
+  1.0000000000000E+30             19
+  1.0000000000000E+30             52
+  1.0000000000000E+30             16
+  1.0000000000000E+30             17
+  1.0000000000000E+30             18
+  1.0000000000000E+30             21
+  1.0000000000000E+30             20
+  1.0000000000000E+30             14
+  1.0000000000000E+30             22
+  1.0000000000000E+30             23
+  1.0000000000000E+30             24
+  1.0000000000000E+30             15
+  1.0000000000000E+30             13
+  1.0000000000000E+30              6
+  1.0000000000000E+30             12
+  1.0000000000000E+30              3
+  1.0000000000000E+30              4
+  1.0000000000000E+30              5
+  1.0000000000000E+30              8
+  1.0000000000000E+30              7
+  1.0000000000000E+30             26
+  1.0000000000000E+30              9
+  1.0000000000000E+30             10
+  1.0000000000000E+30             11
+  1.0000000000000E+30             25
+  1.0000000000000E+30             28
+  1.0000000000000E+30             27
+  1.0000000000000E+30             46
+  1.0000000000000E+30             29
+  1.0000000000000E+30             43
+  1.0000000000000E+30             44
+  1.0000000000000E+30             45
+  1.0000000000000E+30             48
+  1.0000000000000E+30             47
+  1.0000000000000E+30             41
+  1.0000000000000E+30             49
+  1.0000000000000E+30             50
+  1.0000000000000E+30             51
+  1.0000000000000E+30             42
+  1.0000000000000E+30             40
+  1.0000000000000E+30             33
+  1.0000000000000E+30             39
+  1.0000000000000E+30             30
+  1.0000000000000E+30             31
+  1.0000000000000E+30             32
+  1.0000000000000E+30             35
+  1.0000000000000E+30             34
+
+
+         NODAL TIME STEP DISTRIBUTION 
+         ----------------------------
+
+
+            % OF NODES
+                   ^
+                   |                                                            
+         100.000 --|                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+                   |                                                         #  
+           0.000 --|                                                         ## 
+                    -------------------------------------------------------------> NODAL TIME STEP
+                    |                                                          |
+                1.000E+20                                                  1.000E+30
+  
+  
+ SUMMARY OF POSSIBLE INCOMPATIBLE KINEMATIC CONDITIONS :
+ -----------------------------------------------------
+                                  
+ NO TRUE INCOMPATIBLE KINEMATIC CONDITION
+ .. RESTART FILE                                                                         
+  
+------------------------------------------------------------------------
+  
+                   ** COMPUTE TIME INFORMATION **
+  
+ EXECUTION STARTED      :      2026/04/18  19:57:33
+ EXECUTION COMPLETED    :      2026/04/18  19:57:33
+  
+ ELAPSED TIME...........=          0.77 s
+                               00:00:00
+  
+------------------------------------------------------------------------
+
+
+
+     ERROR TERMINATION                  
+     ------------------                                                                  
+
+
+------------------------------------------------------------------------------------------------------------------------
+|            ERROR(S) SUMMARY                               |             WARNING(S) SUMMARY                           |
+------------------------------------------------------------------------------------------------------------------------
+|                                                           |                                                          |
+|  --- MATERIALS                              1   ERROR(S)  |  --- GLOBAL UNITS                           2 WARNING(S) |
+|       |                                                   |       |                                                  |
+|       |                                                   |       |                                                  |
+|       |---     1   ERROR ID :          683                |       |---     1 WARNING ID :       100213               |
+|       | ** INPUT ERROR IN MATERIAL LAW                    |       | ** WARNING IN INPUT OPTIONS                      |
+|       |                                                   |       |                                                  |
+|                                                           |       |---     1 WARNING ID :       100217               |
+|                                                           |       | ** WARNING IN INPUT OPTIONS                      |
+|  --- PROPERTIES                             1   ERROR(S)  |       |                                                  |
+|       |                                                   |                                                          |
+|       |                                                   |                                                          |
+|       |---     1   ERROR ID :         1700                |                                                          |
+|       | ** ERROR: WRONG IPINCH VALUE IN SHELL PROPERTY    |                                                          |
+|       |                                                   |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+|  --- ELEMENT INITIALIZATION                84   ERROR(S)  |                                                          |
+|       |                                                   |                                                          |
+|       |                                                   |                                                          |
+|       |---    84   ERROR ID :          495                |                                                          |
+|       | ** ERROR IN SHELL DEFINITION                      |                                                          |
+|       |                                                   |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+             86 ERROR(S)            
+              2 WARNING(S)          
+
+

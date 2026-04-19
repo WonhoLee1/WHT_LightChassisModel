@@ -1,0 +1,95 @@
+ minimal_0000.out
+************************************************************************
+**                                                                    **
+**                                                                    **
+**                        OpenRadioss Starter                         **
+**                                                                    **
+**            Non-linear Finite Element Analysis Software             **
+**                                                                    **
+**                                                                    **
+**                                                                    **
+**                  Windows 64 bits, Intel compiler                   **
+**                      Double Precision Version                      **
+**                                                                    **
+**                                                                    **
+**                                                                    **
+************************************************************************
+** OpenRadioss Software                                               **
+** COPYRIGHT (C) 1986-2026 Altair Engineering, Inc.                   **
+** Licensed under GNU Affero General Public License.                  **
+** See License file.                                                  **
+************************************************************************
+ 
+  
+ COMPUTATION HARDWARE DESCRIPTION
+  
+ HOSTNAME     CPU TYPE, FREQUENCY AND MEMORY
+ DESKTOP-WHL   11th Gen Intel(R) Core(TM) i7-11700 @ 2.50GHz (x86_64), 2500 MHz,  18661 MB RAM,  59838 MB swap
+  
+ STACKSIZE  . . . . . . . . . . . . . . . . . . . . 1430 MB
+ THREAD STACKSIZE . . . . . . . . . . . . . . . . . 250 MB
+ 
+************************************************************************
+
+
+************************************************************************
+* INPUT READING PROCESS
+************************************************************************
+
+WARNING ID : 100217
+** WARNING IN INPUT OPTIONS
+DESCRIPTION :  
+-- BLOCK: /PROP/SHELL/1
+-- LINE: /PART/1
+card is missing
+SOLUTION :     
+Please check input format and fields description defined in the Reference Guide.
+
+ERROR ID : 100210
+** ERROR IN INPUT OPTIONS
+DESCRIPTION :  
+-- BLOCK: /RUN/minimal/1
+-- LINE: /RUN/minimal/1
+Unrecognized option: /RUN/minimal/1
+
+ERROR ID :   2000
+** ERROR WHILE READING INPUT FILE
+DESCRIPTION :  
+   1 ERRORS FOUND
+
+
+ RADIOSS STOP DUE TO INPUT ERROR
+
+
+------------------------------------------------------------------------------------------------------------------------
+|            ERROR(S) SUMMARY                               |             WARNING(S) SUMMARY                           |
+------------------------------------------------------------------------------------------------------------------------
+|                                                           |                                                          |
+|  --- GLOBAL UNITS                           2   ERROR(S)  |  --- GLOBAL UNITS                           1 WARNING(S) |
+|       |                                                   |       |                                                  |
+|       |                                                   |       |                                                  |
+|       |---     1   ERROR ID :         2000                |       |---     1 WARNING ID :       100217               |
+|       | ** ERROR WHILE READING INPUT FILE                 |       | ** WARNING IN INPUT OPTIONS                      |
+|       |                                                   |       |                                                  |
+|       |---     1   ERROR ID :       100210                |                                                          |
+|       | ** ERROR IN INPUT OPTIONS                         |                                                          |
+|       |                                                   |                                                          |
+|                                                           |                                                          |
+|                                                           |                                                          |
+------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+     ERROR TERMINATION                  
+     ------------------                                                                  
+              2ERROR(S)            
+
+
+
+     TERMINATION WITH WARNING           
+     ------------------                                                                  
+              1WARNING(S)          
