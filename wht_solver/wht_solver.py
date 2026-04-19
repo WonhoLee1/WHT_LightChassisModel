@@ -69,7 +69,6 @@ class WHTSolver:
 
         # Use unified K assembly with stabilization
         K_scipy = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
-        print(f"    [DBG] K assembled and stabilized, nnz={K_scipy.nnz}", flush=True)
 
         # [WHT] Filter Free DOFs & Mass Assembly
         unknown_id   = jm.unknown_id
@@ -83,7 +82,6 @@ class WHTSolver:
         # [WHT] Bandwidth Reduction (RCM Reordering)
         # Unstructured meshes (TRIA3_FREE) produce massive sparse bandwidth.
         from scipy.sparse.csgraph import reverse_cuthill_mckee
-        print("    [DBG] Reordering matrix via RCM to minimize bandwidth...", flush=True)
         perm = reverse_cuthill_mckee(K_free, symmetric_mode=True)
         rev_perm = np.argsort(perm)
 
@@ -91,8 +89,6 @@ class WHTSolver:
         M_free_rcm = M_free[perm]  # 1D array reordered
 
         # [WHT] Solve Generalized Eigenvalue Problem (Kx = lambda Mx)
-        print(f"    [DBG] calling eigsh k={actual_modes}... (Shift-Invert, sigma=-0.1)", flush=True)
-        
         vals, vecs_rcm = eigsh(
             K_free_rcm,
             k=actual_modes,
@@ -137,8 +133,8 @@ class WHTSolver:
         seds     = np.zeros((actual_modes, n_cells, 1))
         
         for m in range(actual_modes):
-            s_q, e_q = ElementStressRecovery.recover_quad4(self.model, mode_shapes[m], sorted_nids)
-            s_t, e_t = ElementStressRecovery.recover_tria3(self.model, mode_shapes[m], sorted_nids)
+            s_q, e_q, *_ = ElementStressRecovery.recover_quad4(self.model, mode_shapes[m], sorted_nids)
+            s_t, e_t, *_ = ElementStressRecovery.recover_tria3(self.model, mode_shapes[m], sorted_nids)
             stresses[m] = s_q + s_t
             strains[m]  = e_q + e_t
             seds[m, :, 0] = 0.5 * np.sum(stresses[m] * strains[m], axis=1)
