@@ -160,7 +160,7 @@ class WHTSolverResult:
             node_sets   = base_rd.node_sets,
             element_sets= base_rd.element_sets,
             point_data  = point_data,
-            cell_data   = {},
+            cell_data   = self.cell_data if self.cell_data is not None else {},
             field_data  = field_data,
             time_values = (self.frequencies if self.analysis_type == "modal"
                            else np.array([0.0])),

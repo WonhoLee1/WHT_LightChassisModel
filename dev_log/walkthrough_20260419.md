@@ -1,36 +1,38 @@
-# Walkthrough — Stabilizing Shell Modal Analysis
+# Walkthrough: Shell Analysis Stabilization & Static Pipeline
 
-We have successfully stabilized the modal analysis pipeline for shell elements. The "hanging" issue for unstructured meshes has been resolved, and the `QUAD4` baseline remains intact.
+쉘 요소의 수치적 불안정성을 해결하고, 정적 하중 해석을 통한 강성 검증 파이프라인을 구축했습니다.
 
-## Changes Made
+## 1. 해결된 주요 문제 (Hotfixes)
 
-### Solver & Stability
-- **Generalized Eigenvalue Solver**: Reverted `solve_modal` in `wht_solver.py` to use `eigsh(K, M=M, ...)` directly. This avoids the numerically unstable $M^{-1/2} K M^{-1/2}$ transformation that was causing ARPACK to hang when encountering small rotational inertia values.
-- **Improved Drilling Stabilization**: Increased the stabilization spring stiffness in `wht_tria3_element.py` by a factor of 10 to better handle unstructured nodal normals.
+### 쉘 요소 수치적 하드닝 (Numerical Hardening)
+- **드릴링 패널티(Drilling Penalty)** 강화: 비정형 메시에서의 조건수 개선을 위해 $0.01 \times G \times t$로 상향.
+- **회전 관성 하한치(Inertia Floor)** 설정: $1e^{-8}$을 적용하여 ARPACK(고유치 해석기)의 수치적 정지(Hang) 현상 해결.
 
-### Pipeline Fixes
-- **Encoding Correction**: Fixed a `UnicodeEncodeError` in `exam2_shell_jaxSSO.py` by replacing decorative characters with standard ASCII equivalents.
+### Solver 안정성 및 정합성 보강
+- **강성 조립 통합**: `solve_modal`과 `solve_static`에서 사용하는 강성 조립 로직을 `_assemble_K_scipy`로 일원화하여 `QUAD4` 강성 누락 버그 수정.
+- **AUTOSPC 적용**: 정적 해석 시에도 미세 강성 자유도를 자동으로 보강하여 비정형 메시에서의 특이행렬(`MatrixRankWarning`) 문제 해결.
+- **SciPy Solver 전환**: JAX 타입 호환성 이슈를 피하기 위해 정적 해석에 `scipy.sparse.linalg.spsolve` 직접 사용.
 
-## Verification Results
+## 2. 정적 하중 해석 검증 결과
 
-### Frequency Comparison (Hz)
+`exam2_shell_jaxSSO_load.py`를 통해 1000N 중앙 집중 하중 조건에서의 쉘 트레이 변위를 분석했습니다.
 
-| Mode | QUAD4 (Baseline) | TRIA3 (Transfinite) | MIXED (Delaunay) | TRIA3_FREE (Delaunay) |
+| Mesh Type | Nodes | Max Uz (mm) | Diff (%) | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **1** | **2.78** (Preserved) | 71.24 | 66.17 | 66.17 |
-| 2 | 4.29 | 118.57 | 108.64 | 108.64 |
-| 3 | 6.80 | 185.28 | 158.55 | 158.55 |
+| **QUAD4** | 1876 | 2451.68 | 0.00% | **Success** |
+| **TRIA3** | 1876 | 1544.32 | -37.01% | **Success** |
+| **MIXED** | 1876 | 2456.45 | +0.19% | **Success** |
+| **TRIA3_FREE**| 1971 | 2058.24 | -16.05% | **Success** |
 
 > [!NOTE]
-> The `QUAD4` result of **2.78 Hz** is identical to the original benchmark, confirming that the solver refactoring did not affect the baseline accuracy.
+> `TRIA3` 요소가 `QUAD4` 대비 약 37% 단단하게 계산되는 전형적인 Locking 현상이 관찰되나, 비정형 메시(`TRIA3_FREE`)에서도 안정적으로 수렴함을 확인했습니다.
 
-> [!TIP]
-> TRIA3-based meshes (including Mixed) exhibit higher stiffness compared to QUAD4. This is a known characteristic of the current TRIA3 formulation (CST + Mindlin) which tends to be stiffer in thin-shell bending compared to the high-performance QUAD4 element from JaxSSO.
+## 3. 관련 파일 및 경로
 
-## Status Summary
+- **Solver**: [wht_solver.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/wht_solver/wht_solver.py) (리팩토링 완료)
+- **Visualizer API**: [wht_visualizer.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/wht_visualizer/wht_visualizer.py) (호환성 함수 추가)
+- **검증 스크립트**: [exam2_shell_jaxSSO_load.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/test_jaxSSO/exam2_shell_jaxSSO_load.py) (신규)
 
-- [x] Fix encoding in `exam2_shell_jaxSSO.py`
-- [x] Strengthen drilling stiffness in `wht_tria3_element.py`
-- [x] Refactor `solve_modal` in `wht_solver.py`
-- [x] Verify `QUAD4` consistency (PASS)
-- [x] Verify `MIXED` completion (PASS)
+## 4. 수치적 제언
+- 현재 $0.6mm$ 박판에 $1000N$ 하중은 기하학적 비선형성(Large Deflection)이 지배적인 영역입니다. 선형 강성 비교를 위해서는 하중을 $10N$ 정도로 낮추어 재검증하는 것을 권장합니다.
+- 비정형 메시의 정확도를 높이기 위해 차기 단계에서 `TRIA6`(6절점 삼각 요소) 도입을 검토할 수 있습니다.

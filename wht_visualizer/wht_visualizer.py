@@ -28,6 +28,130 @@ HAS_QT_MATERIAL = False
 if TYPE_CHECKING:
     from wht_converter.wht_models import WHTResultData
 
+class WHTRangeDialog(QtWidgets.QDialog):
+    """
+    [WHT Premium UI] Interactive dialog for real-time scalar range adjustment.
+    Features linked sliders, spinboxes, and statistical robust auto-range suggestions.
+    """
+    def __init__(self, parent_vis, field_name: str):
+        super().__init__(parent_vis.plotter.app_window)
+        self.vis = parent_vis
+        self.field = field_name
+        self.setWindowTitle(f"Adjust Range: {field_name}")
+        self.setMinimumWidth(450)
+        
+        # Calculate Global limits from current part data for slider range
+        self.g_min, self.g_max = self._get_global_limits()
+        if self.g_min == self.g_max:
+            self.g_max = self.g_min + 1e-6
+            
+        self._setup_ui()
+        
+    def _get_global_limits(self):
+        rng = [float('inf'), float('-inf')]
+        for part in self.vis.parts.values():
+            m = part["mesh"]
+            if self.field in m.point_data or self.field in m.cell_data:
+                r = m.get_data_range(self.field)
+                rng[0] = min(rng[0], r[0])
+                rng[1] = max(rng[1], r[1])
+        if rng[0] == float('inf'): return 0.0, 1.0
+        return float(rng[0]), float(rng[1])
+
+    def _setup_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(10)
+        
+        # Helper: Create Slider-Spinbox Pair with bidirectional sync
+        def create_entry(label, val):
+            group = QtWidgets.QGroupBox(label)
+            h = QtWidgets.QHBoxLayout(group)
+            
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-1e15, 1e15)
+            spin.setValue(val)
+            spin.setDecimals(4)
+            spin.setMinimumWidth(120)
+            
+            slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            slider.setRange(0, 1000)
+            
+            # Sync logic
+            def update_slider_from_spin(v):
+                if not hasattr(self, 'spin_max'): return # Guard during init
+                pct = (v - self.g_min) / (self.g_max - self.g_min)
+                slider.blockSignals(True)
+                slider.setValue(int(np.clip(pct, 0, 1) * 1000))
+                slider.blockSignals(False)
+                self._trigger_update()
+
+            def update_spin_from_slider(v):
+                if not hasattr(self, 'spin_max'): return # Guard during init
+                val = self.g_min + (v / 1000.0) * (self.g_max - self.g_min)
+                spin.blockSignals(True)
+                spin.setValue(val)
+                spin.blockSignals(False)
+                self._trigger_update()
+
+            spin.valueChanged.connect(update_slider_from_spin)
+            slider.valueChanged.connect(update_spin_from_slider)
+            
+            # Initial Slider position
+            pct_init = (val - self.g_min) / (self.g_max - self.g_min)
+            slider.setValue(int(np.clip(pct_init, 0, 1) * 1000))
+            
+            h.addWidget(slider, 3)
+            h.addWidget(spin, 1)
+            return group, spin, slider
+
+        self.grp_min, self.spin_min, self.slider_min = create_entry("Minimum Threshold", self.vis.range_min)
+        self.grp_max, self.spin_max, self.slider_max = create_entry("Maximum Threshold", self.vis.range_max)
+        
+        layout.addWidget(self.grp_min)
+        layout.addWidget(self.grp_max)
+        
+        # Statistical Recommendations (User Request: Statistical robustness)
+        h_tools = QtWidgets.QHBoxLayout()
+        btn_robust = QtWidgets.QPushButton("Robust Auto (2-98%)")
+        btn_robust.setToolTip("Sets range to 2nd and 98th percentile to ignore extreme outliers.")
+        btn_robust.clicked.connect(self._apply_robust)
+        
+        btn_global = QtWidgets.QPushButton("Global Auto (Full)")
+        btn_global.setToolTip("Resets range to absolute min and max of current field.")
+        btn_global.clicked.connect(self._apply_global)
+        
+        h_tools.addWidget(btn_robust)
+        h_tools.addWidget(btn_global)
+        layout.addLayout(h_tools)
+        
+        # Footer
+        btn_close = QtWidgets.QPushButton("Done")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    def _trigger_update(self):
+        """Live-sync with the main visualizer state."""
+        if not hasattr(self, 'spin_min') or not hasattr(self, 'spin_max'):
+            return
+            
+        # Update internal state on parent
+        self.vis.range_min = self.spin_min.value()
+        self.vis.range_max = self.spin_max.value()
+        
+        # Force switch to Static mode so the manual values persist
+        self.vis.combo_range_mode.setCurrentText("Static (Fixed)")
+        self.vis._apply_colorbar_range()
+
+    def _apply_robust(self):
+        rng = self.vis._calculate_robust_range(self.field)
+        self.spin_min.setValue(rng[0])
+        self.spin_max.setValue(rng[1])
+
+    def _apply_global(self):
+        self.spin_min.setValue(self.g_min)
+        self.spin_max.setValue(self.g_max)
+
+
 class WHTVisualizer:
     """
     Professional Visualization Hub using PyVistaQt.
@@ -276,24 +400,23 @@ class WHTVisualizer:
         self.combo_category.currentTextChanged.connect(self._on_category_changed)
         self.combo_component.currentTextChanged.connect(self._on_component_changed)
         
+        self.btn_adjust_range = QtWidgets.QPushButton("Adjust")
+        self.btn_adjust_range.setFixedWidth(55)
+        self.btn_adjust_range.clicked.connect(self._open_range_adjust_dialog)
+        self.btn_adjust_range.setEnabled(False)
+        
         hbox_result.addWidget(self.combo_category, 2)
         hbox_result.addWidget(self.combo_component, 1)
+        hbox_result.addWidget(self.btn_adjust_range)
+        
+        # Internal state for manual ranges (Replacing UI spinboxes)
+        self.range_min = 0.0
+        self.range_max = 1.0
         
         # Colorbar Range Logic (Flattened into Fields)
         self.combo_range_mode = QtWidgets.QComboBox()
-        self.combo_range_mode.addItems(["Dynamic (Auto)", "Static (Fixed)"])
+        self.combo_range_mode.addItems(["Dynamic (Auto)", "Robust (Auto)", "Static (Fixed)"])
         self.combo_range_mode.currentTextChanged.connect(self._on_range_mode_changed)
-        
-        hbox_spin = QtWidgets.QHBoxLayout()
-        hbox_spin.setSpacing(2)
-        self.spin_min = QtWidgets.QDoubleSpinBox()
-        self.spin_min.setRange(-1e15, 1e15)
-        self.spin_min.setEnabled(False)
-        self.spin_max = QtWidgets.QDoubleSpinBox()
-        self.spin_max.setRange(-1e15, 1e15)
-        self.spin_max.setEnabled(False)
-        hbox_spin.addWidget(self.spin_min)
-        hbox_spin.addWidget(self.spin_max)
         
         # --- Colorbar Display Mode Group ---
         hbox_cb_mode = QtWidgets.QHBoxLayout()
@@ -338,7 +461,6 @@ class WHTVisualizer:
         # Assemble into Fields Main Layout in logical order
         vbox_contour.addLayout(hbox_result)
         vbox_contour.addWidget(self.combo_range_mode)
-        vbox_contour.addLayout(hbox_spin)
         vbox_contour.addLayout(hbox_cb_mode)
         vbox_contour.addLayout(hbox_cmap)
         
@@ -1069,8 +1191,21 @@ class WHTVisualizer:
             
             if total_rng[0] == float('inf'): rng = [0, 1]
             else: rng = total_rng
+        elif mode == "Robust (Auto)":
+            rng = self._calculate_robust_range(field)
+            # Sync internal state for consistency
+            self.range_min = rng[0]
+            self.range_max = rng[1]
         else:
-            rng = [self.spin_min.value(), self.spin_max.value()]
+            # Static (Fixed) mode
+            r_min, r_max = self.range_min, self.range_max
+            if r_min > r_max: r_min, r_max = r_max, r_min
+            if r_min == r_max: r_max = r_min + 1e-6
+            rng = [r_min, r_max]
+            
+        # [Numerical Safety] Ensure range is always valid for VTK
+        if rng[0] > rng[1]: rng = [rng[1], rng[0]]
+        if rng[0] == rng[1]: rng[1] = rng[0] + 1e-6
             
         # Update all mappers to use this range
         for part in self.parts.values():
@@ -1106,6 +1241,35 @@ class WHTVisualizer:
                 n_labels=n_lbl
             )
             self.plotter.update_scalar_bar_range(rng)
+            
+    def _calculate_robust_range(self, field_name: str, p_low: float = 2.0, p_high: float = 98.0) -> List[float]:
+        """Calculates robust percentile-based range to handle FEA singularities/outliers."""
+        if not self.parts: return [0.0, 1.0]
+        
+        all_vals = []
+        for part in self.parts.values():
+            mesh = part["mesh"]
+            data = None
+            if field_name in mesh.point_data:
+                data = mesh.point_data[field_name]
+            elif field_name in mesh.cell_data:
+                data = mesh.cell_data[field_name]
+            
+            if data is not None:
+                # Merge current timestep data from all parts
+                all_vals.append(np.array(data).flatten())
+        
+        if not all_vals: return [0.0, 1.0]
+            
+        merged = np.concatenate(all_vals)
+        merged = merged[~np.isnan(merged)]
+        if len(merged) == 0: return [0.0, 1.0]
+            
+        r_min = float(np.percentile(merged, p_low))
+        r_max = float(np.percentile(merged, p_high))
+        
+        if r_min == r_max: r_max = r_min + 1e-6 # Safety expand
+        return [r_min, r_max]
 
     # --- Data Update Core ---
     def _bind_data_to_mesh(self, t_idx: int):
@@ -1123,8 +1287,8 @@ class WHTVisualizer:
                     if t_idx < array_3d.shape[0]:
                         data = np.nan_to_num(array_3d[t_idx], nan=0.0, posinf=0.0, neginf=0.0)
                         if orig_ids is not None:
-                            # Submesh mapping
-                            if len(data) >= np.max(orig_ids):
+                            # Submesh mapping: Use >= to avoid skipping boundary case
+                            if len(data) > np.max(orig_ids):
                                 val = data[orig_ids]
                                 mesh.point_data[sc_name] = val
                         else:
@@ -1149,7 +1313,7 @@ class WHTVisualizer:
                         data = array_3d[t_idx] 
                         orig_cids = mesh.cell_data.get('vtkOriginalCellIds')
                         if orig_cids is not None:
-                            # Strict Index Safety Guard: Ensure data array covers all original IDs
+                            # Strict Index Safety Guard (>=)
                             if len(data) > np.max(orig_cids):
                                 c_data = data[orig_cids]
                             else:
@@ -1172,9 +1336,25 @@ class WHTVisualizer:
                                 mesh.cell_data[f"{sc_name}_XX"] = s11
                                 mesh.cell_data[f"{sc_name}_YY"] = s22
                                 mesh.cell_data[f"{sc_name}_ZZ"] = s33
+                                mesh.cell_data[f"{sc_name}_XY"] = s12
+                                mesh.cell_data[f"{sc_name}_XZ"] = s13
+                                mesh.cell_data[f"{sc_name}_YZ"] = s23
                                 
-                                # 2. Von Mises (Classic)
-                                vm = np.sqrt(0.5 * ((s11-s22)**2 + (s22-s33)**2 + (s33-s11)**2 + 6*(s12**2 + s13**2 + s23**2)))
+                                # 2. Von Mises (Stress) vs Equivalent Strain (Engineering)
+                                is_strain = ("Strain" in sc_name)
+                                if is_strain:
+                                    # Equivalent Strain formula for engineering shear strains (gamma_12, etc.)
+                                    # Factor = sqrt(2)/3 * sqrt( (e1-e2)^2 + ... + 1.5 * gamma^2 )
+                                    # We use 1.5 * gamma^2 because gamma = 2 * epsilon_12.
+                                    diff_sq = (s11-s22)**2 + (s22-s33)**2 + (s33-s11)**2
+                                    shear_sq = 1.5 * (s12**2 + s13**2 + s23**2)
+                                    vm = (np.sqrt(2.0)/3.0) * np.sqrt(diff_sq + shear_sq)
+                                else:
+                                    # Traditional Von Mises Stress
+                                    diff_sq = (s11-s22)**2 + (s22-s33)**2 + (s33-s11)**2
+                                    shear_sq = 6.0 * (s12**2 + s13**2 + s23**2)
+                                    vm = np.sqrt(0.5 * (diff_sq + shear_sq))
+
                                 mesh.cell_data[f"{sc_name}_VonMises"] = vm
                                 
                                 # 3. Principal Stresses (Simplified 2D for shell models)
@@ -1264,6 +1444,9 @@ class WHTVisualizer:
             
             self._bind_data_to_mesh(t_idx)
             self._apply_warping()
+            # [WHT Performance] Scalar range is usually held static during playback 
+            # unless Dynamic mode is on.
+            self._apply_colorbar_range() 
             self.plotter.render()
         finally:
             self._is_updating = False
@@ -1277,11 +1460,13 @@ class WHTVisualizer:
         
         if category == "Body Color":
             self.combo_component.setEnabled(False)
+            self.btn_adjust_range.setEnabled(False)
             self.combo_component.blockSignals(False)
             self._update_active_result()
             return
             
         self.combo_component.setEnabled(True)
+        self.btn_adjust_range.setEnabled(True)
         
         # Find all fields belonging to this category
         comps = []
@@ -1311,10 +1496,30 @@ class WHTVisualizer:
         elif self.combo_component.count() > 0: self.combo_component.setCurrentIndex(0)
             
         self.combo_component.blockSignals(False)
+        
+        # [User Request] Ensure user feels the change: 
+        # Trigger a range reset if switching categories to a meaningful new field
+        if category != "Body Color":
+            self.combo_range_mode.setCurrentText("Robust (Auto)")
+            print(f" -> [Visualizer] Category changed to '{category}'. Auto-resetting range for visibility.")
+            
         self._update_active_result()
 
     def _on_component_changed(self, component):
         self._update_active_result()
+
+    def _on_range_mode_changed(self, mode):
+        """[User Request] Handles transition between Auto, Robust, and Fixed ranges."""
+        # Spinboxes removed from main panel as requested; Adjust dialog covers details.
+        self._apply_colorbar_range()
+
+    def _open_range_adjust_dialog(self):
+        """[User Request] Opens interactive slider-driven range adjustment with real-time sync."""
+        field = self._get_active_field_name()
+        if not field or field == "Body Color": return
+        
+        dialog = WHTRangeDialog(self, field)
+        dialog.exec_()
 
     def _update_active_result(self):
         """Synthesizes the full result name and applies it."""
@@ -1361,6 +1566,7 @@ class WHTVisualizer:
                             actor.mapper.lookup_table.Build()
                     
         self._apply_colorbar_range()
+        print(f" -> [Visualizer] Switched result to: {name}")
         self.plotter.render()
 
     def _on_time_slider_changed(self, value):
@@ -1619,8 +1825,8 @@ class WHTVisualizer:
         
         self._on_category_changed(self.combo_category.currentText())
 
-    def show(self):
-        """Displays the visualizer and enters the event loop if necessary."""
+    def show(self, block=True):
+        """Displays the visualizer and enters the event loop if requested."""
         if not self.plotter or not hasattr(self.plotter, 'app_window'):
             print(" -> [Visualizer Error] Plotter or app_window not initialized.")
             return
@@ -1631,17 +1837,22 @@ class WHTVisualizer:
         self.plotter.app_window.activateWindow()
             
         app = QtWidgets.QApplication.instance()
-        if app:
+        if not app:
+            # BackgroundPlotter usually handles this, but we provide a fallback for robustness.
+            import sys
+            app = QtWidgets.QApplication(sys.argv)
+            
+        if block:
             app.setQuitOnLastWindowClosed(True)
             app.processEvents()
             print(" -> [Visualizer] Entering Qt Event Loop. Close window to release terminal.")
             # Use exec_() for compatibility or exec() for modern PySide
             if hasattr(app, 'exec'):
                 app.exec()
+            elif hasattr(app, 'exec_'):
+                app.exec_()
             else:
                 app.exec_()
-        else:
-            print(" -> [Visualizer Error] No active QApplication instance.")
 
     def visualize(self):
         """Compatibility alias for script execution."""
@@ -1652,3 +1863,33 @@ class WHTVisualizer:
         self.anim_timer.stop()
         if self.plotter:
             self.plotter.close()
+
+
+def export_to_wht_result(model, result):
+    """
+    Convenience function to convert WHTSolverResult -> WHTResultData.
+    Internalizes WHTMetadata creation with default N-mm-ton-s units.
+    """
+    from wht_converter.wht_models import WHTMetadata
+    metadata = WHTMetadata(
+        solver_name="WHTSolver",
+        solver_version="0.1.0",
+        analysis_type=result.analysis_type,
+        coordinate_system="cartesian",
+        unit_length="mm",
+        unit_force="N",
+        unit_mass="tonne",
+        unit_time="s"
+    )
+    return result.to_wht_result_data(metadata, model)
+
+
+def visualize(result_data, block=True):
+    """
+    Convenience function to pop up the WHTVisualizer frame with a given result.
+    If block=False, returns the visualizer instance without entering the event loop.
+    """
+    vis = WHTVisualizer()
+    vis.show_result(result_data)
+    vis.show(block=block)
+    return vis
