@@ -1,42 +1,14 @@
-# Implementation Plan - Enhanced Scalar Bar Range Adjustment
+# 솔버 검증 및 패치 테스트(SolverVerification) 구축 계획 (2026-04-20)
 
-This plan addresses the user's request for a robust, real-time scalar bar range adjustment system in `WHTVisualizer`. It focuses on handling outliers using statistical methods and providing a high-fidelity adjustment UI.
+현재 WHTSolver의 쉘 요소(QUAD4, TRIA3) 성능을 검증하고, 고유진동수가 비정상적으로 높게 나오는 원인을 분석하기 위해 표준 패치 테스트 및 벤치마크 스위트를 구축합니다.
 
-## User Review Required
+## 제안된 변경 사항
 
-> [!IMPORTANT]
-> **Statistical Range Suggestion**: I propose using **Percentile-based clipping (2th to 98th percentile)** as the primary method for the "Robust Auto" feature. This effectively ignores common FEA singularities at constraint points or sharp edges, ensuring the main structural response is clearly visible without manual trial-and-error.
+### [SolverVerification] 신규 폴더 생성
 
-> [!NOTE]
-> **Live Update Mechanism**: The new adjustment dialog will hold a temporary reference to the visualizer to trigger `_apply_colorbar_range` on every slider/spinbox interaction, providing instant visual feedback.
+1. **analytical_solutions.py**: Kirchhoff 판 이론 및 보 이론에 기반한 해석적 해 제공.
+2. **patch_tests.py**: `WHTMeshModel`과 `WHTSolver`를 사용하는 테스트 케이스 구현. (3점 굽힘, 인장 패치, 고유진동수 등)
+3. **verification_runner.py**: 모든 테스트를 실행하고 테이블 형식으로 출력.
 
-## Proposed Changes
-
-### Visualization Engine Updates
-#### [MODIFY] [wht_visualizer.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/wht_visualizer/wht_visualizer.py)
-- **UI Component**:
-    - Add an "Adjust Range..." button in the "Fields" group.
-    - Create a custom `QDialog` named `RangeAdjustDialog` with the following:
-        - Min/Max Sliders (0-1000 scale mapped to global data range).
-        - Min/Max DoubleSpinBoxes (linked to sliders).
-        - "Robust Auto (2nd-98th)" button.
-        - "Global Auto (Full)" button.
-- **Logic**:
-    - Implement `_calculate_robust_range(field_name)` using `np.percentile`.
-    - Update `_on_category_changed` and `_on_component_changed` to immediately re-calculate and apply ranges when the result type is switched.
-    - Ensure `_apply_colorbar_range` is called whenever values in the Adjustment Dialog change.
-
-## Verification Plan
-
-### Automated/Manual Testing via Script
-- Run `python exam2_shell_jaxSSO_load.py`.
-- Change result field to "Stress".
-- Click "Adjust Range...".
-- Move Min/Max sliders and verify that the colorbar and mesh colors updated **instantly**.
-- Click "Robust Auto" and verify that the range narrows to exclude extreme peaks (e.g., at supports).
-- Type a specific value in the spinbox and verify the slider moves accordingly.
-
-### Success Criteria
-- [ ] No more "lag" between field change and range update.
-- [ ] Outliers no longer flatten the entire contour plot (resolved via Robust Auto).
-- [ ] Smooth real-time interaction between sliders and visualizer.
+## 검증 계획
+- `python .\SolverVerification\verification_runner.py` 실행 및 오차율 5% 이내 확인.

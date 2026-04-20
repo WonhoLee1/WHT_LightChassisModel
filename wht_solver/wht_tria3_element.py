@@ -36,12 +36,34 @@ def _element_K_tria3(c1, c2, c3, t, E, nu):
     G = E / (2.0 * (1.0 + nu)); k_shear = 5.0 / 6.0; inv_nu2 = 1.0 / (1.0 - nu**2)
     
     # 1. Membrane (CST): Standard [u, v]
-    dN_dx = np.array([-y3, y3, 0.0]) / (2.0 * A); dN_dy = np.array([x3-x2, -x3, x2]) / (2.0 * A)
+    # Robust dN/dx, dN/dy for general triangle coordinates
+    # N1 = 1 - xi - eta, N2 = xi, N3 = eta
+    # x = x2*xi + x3*eta, y = y2*xi + y3*eta
+    # J = x2*y3 - x3*y2 = 2*A (Note: y1=x1=0, y2=0 in local frame)
+    y2 = 0.0
+    invJ = 1.0 / (2.0 * A)
+    # dN/dx = [-(y3-y2), y3, -y2] * invJ
+    # dN/dy = [(x3-x2), -x3, x2] * invJ
+    dN_dx = np.array([-(y3-y2), y3, -y2]) * invJ
+    dN_dy = np.array([(x3-x2), -x3, x2]) * invJ
+
     Dm = (E * t * inv_nu2) * np.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1-nu)/2]])
     Bm = np.zeros((3, 18))
     for i in range(3):
-        Bm[0, 6*i] = dN_dx[i]; Bm[1, 6*i+1] = dN_dy[i]; Bm[2, 6*i] = dN_dy[i]; Bm[2, 6*i+1] = dN_dx[i]
+        Bm[0, 6*i]   = dN_dx[i]
+        Bm[1, 6*i+1] = dN_dy[i]
+        Bm[2, 6*i]   = dN_dy[i]
+        Bm[2, 6*i+1] = dN_dx[i]
     K_loc = (Bm.T @ Dm @ Bm) * A
+
+    # Adding Drilling Stiffness (Allman's penalty style) to prevent singularity and improve stability
+    # k_theta = penalty * G * Volume
+    # We use a small penalty to avoid locking while providing numerical stability for Theta_Z
+    G = E / (2.0 * (1.0 + nu))
+    penalty_drilling = 1e-4 # Small penalty factor
+    k_drilling = penalty_drilling * G * A * t
+    for i in range(3):
+        K_loc[6*i+5, 6*i+5] += k_drilling
 
     # 2. MITC3+ Bending & Shear (Enriched 21x21)
     K_full = np.zeros((21, 21))
@@ -121,7 +143,8 @@ def _element_K_tria3(c1, c2, c3, t, E, nu):
     K_loc += K_cond
 
     # 3. Drilling Stabilization (Standard OpenSees Penalty)
-    Ktt = 0.01 * G * t
+    # Reduced from 0.01 to 1e-5 to prevent excessive stiffness in membrane modes
+    Ktt = 1.0e-5 * G * t
     for i in range(3):
         Bd = np.zeros((1, 18))
         Bd[0, 6*i] = -0.5 * dN_dy[i]; Bd[0, 6*i+1] = 0.5 * dN_dx[i]; Bd[0, 6*i+5] = -1.0/3.0

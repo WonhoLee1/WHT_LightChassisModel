@@ -30,7 +30,7 @@ class PipelineConfig:
     mesh_type: str = 'quad4'          # 'quad4' or 'tria3'
     width: float = 1800.0
     length: float = 1200.0
-    height: float = 10.0
+    height: float = 35.0
     thickness: float = 0.6
     mesh_size_xy: float = 40.0
     draft_angle: float = 15.0
@@ -38,7 +38,8 @@ class PipelineConfig:
     E: float = 210.0e3                # MPa
     nu: float = 0.3
     rho: float = 7.85e-9              # ton/mm^3
-    num_modes: int = 16
+    num_modes: int = 10
+    solver_method: str = 'auto'       # 'arpack', 'dense', or 'auto'
 
 
 # ---------------------------------------------------------------------------
@@ -92,11 +93,10 @@ def solve_modal(model: WHTMeshModel, cfg: PipelineConfig):
     sorted_nids = model.sorted_node_ids()
     nid_to_idx  = {nid: i for i, nid in enumerate(sorted_nids)}
     M_diag = solver._assemble_lumped_mass(jm_tmp, jm_tmp.ndof, sorted_nids, nid_to_idx)
-    M_diag += M_tria3_lumped(model, jm_tmp.ndof, sorted_nids, nid_to_idx)
     total_m = np.sum(M_diag[::6])
     print(f"    Total shell mass: {total_m:.6f} tons")
 
-    return solver.solve_modal(num_modes=cfg.num_modes)
+    return solver.solve_modal(num_modes=cfg.num_modes, method=cfg.solver_method)
 
 
 def print_results(results, cfg: PipelineConfig):
@@ -142,7 +142,7 @@ def run_pipeline(cfg: PipelineConfig):
         results = solve_modal(model, cfg)
         print_results(results, cfg)
         wht_data = export_results(model, results, cfg)
-        #visualize(wht_data, cfg)
+        visualize(wht_data, cfg)
         return results
     except BaseException:
         print(f"\n[ERROR] {cfg.mesh_type.upper()} pipeline failed:")
@@ -157,9 +157,9 @@ def run_pipeline(cfg: PipelineConfig):
 def main():
     cfgs = [        
         PipelineConfig(mesh_type='quad4'),
-        PipelineConfig(mesh_type='tria3'),
+        PipelineConfig(mesh_type='tria3'),        
         PipelineConfig(mesh_type='mixed'),
-        PipelineConfig(mesh_type='tria3_free'),
+        PipelineConfig(mesh_type='tria3_free'),        
     ]
     results = [run_pipeline(cfg) for cfg in cfgs]
 

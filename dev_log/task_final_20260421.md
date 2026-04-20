@@ -1,0 +1,7 @@
+- [/] QUAD4 Drilling DOF 안정화 개선 (Dynamic Penalty)
+- [ ] TRIA3 Membrane Locking 완화 (Bubble Function/Enrichment)
+- [ ] WHTSolver AUTOSPC 로직 고도화
+- [ ] SolverVerification 고차 모드(1~5차) 비교 로직 구현
+    - [ ] `patch_tests.py` 수정
+    - [ ] `verification_runner.py` 수정
+- [ ] 최종 검증 및 보고서 업데이트

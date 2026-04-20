@@ -118,14 +118,15 @@ def _element_K_mitc4_plus(c1, c2, c3, c4, t, E, nu):
     K_loc = np.zeros((24, 24))
     K_drill = np.zeros((24, 24))
     gp = [-1.0/np.sqrt(3), 1.0/np.sqrt(3)]
-    Ktt = 0.01 * G # Penalty parameter (OpenSees rationale)
+    # [WHT] Robust Drilling Penalty: Linked to Shear Modulus & Thickness
+    # Higher penalty (1.0) ensures drilling modes stay above bending fundamental.
+    Ktt = 1.0 * G * t 
 
     for xi_g in gp:
         for eta_g in gp:
             Bm, Bb, detJ = _get_mb_matrices(xi_g, eta_g, coords_2d)
             
             # (1) B-matrix for Drilling (gamma_z = theta_z - 0.5*(v,x - u,y))
-            # OpenSees/Bathe: B_drill = [ -0.5*dN/dy, 0.5*dN/dx, 0, 0, 0, -N ]
             N_list = _get_shape_functions(xi_g, eta_g)
             dN_dxi, dN_deta = _get_shape_derivatives(xi_g, eta_g)
             J = np.array([
@@ -134,16 +135,17 @@ def _element_K_mitc4_plus(c1, c2, c3, c4, t, E, nu):
             ])
             invJ = np.linalg.inv(J)
             detJ = np.linalg.det(J)
-            if detJ < 1e-11: continue # Skip degenerate integration point
+            if detJ < 1e-11: continue 
             
             dN_dx = invJ[0,0]*dN_dxi + invJ[0,1]*dN_deta
             dN_dy = invJ[1,0]*dN_dxi + invJ[1,1]*dN_deta
             
             Bd = np.zeros((1, 24))
             for i in range(4):
-                Bd[0, 6*i]   = -0.5 * dN_dy[i] # u component
-                Bd[0, 6*i+1] =  0.5 * dN_dx[i] # v component
-                Bd[0, 6*i+5] = -N_list[i]      # theta_z component
+                # Standard Allman-type drilling component rationale
+                Bd[0, 6*i]   = -0.5 * dN_dy[i] 
+                Bd[0, 6*i+1] =  0.5 * dN_dx[i] 
+                Bd[0, 6*i+5] = -N_list[i]      
             
             K_drill += (Bd.T @ Bd) * Ktt * detJ
 

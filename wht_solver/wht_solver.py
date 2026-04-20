@@ -28,6 +28,31 @@ from .wht_tria3_element import K_tria3_scipy, M_tria3_lumped
 from .wht_quad4_element import K_quad4_scipy, M_quad4_lumped
 
 
+def _arpack_subprocess_worker(K, M_diag, k, sigma, maxiter, result_queue):
+    """Isolated worker to run ARPACK and report results or errors back to parent.
+    Optimized for Windows stability by forcing single-threading and array-M.
+    """
+    import os
+    # Force single-threading for BLAS/LAPACK to prevent ARPACK segfaults on Windows
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    
+    try:
+        from scipy.sparse.linalg import eigsh
+        import numpy as np
+        from scipy.sparse import diags
+        
+        # M as 1D array is often more stable in certain ARPACK builds
+        M_op = diags([M_diag], [0], format='csc')
+        
+        vals, vecs = eigsh(K, k=k, M=M_op, which="LM", sigma=sigma, tol=1e-5, maxiter=maxiter)
+        result_queue.put((vals, vecs))
+    except Exception as ex:
+        result_queue.put(ex)
+
 class WHTSolver:
     """
     JaxSSO wrapper.
@@ -51,76 +76,159 @@ class WHTSolver:
     # Public API
     # ------------------------------------------------------------------
 
-    def solve_modal(self, num_modes: int = 10) -> WHTSolverResult:
+    def solve_modal(self, num_modes: int = 10, method: str = 'auto') -> WHTSolverResult:
         """
-        Modal analysis using scipy eigsh on free DOFs.
-
-        Returns WHTSolverResult with:
-            frequencies : (n_modes,) [Hz]
-            mode_shapes : (n_modes, N, 6)
+        Solve generalized eigenvalue problem: K x = lambda M x
+        
+        Parameters:
+            num_modes: Number of modes to find.
+            method: 'arpack' (sparse), 'dense' (scipy.eigh), or 'auto' (Try sparse first)
         """
-        from JaxSSO import assemblemodel
+        import time
         from scipy.sparse.linalg import eigsh
-        from scipy.sparse import csr_matrix, diags
-
+        from scipy.sparse import diags
+        from scipy.sparse.csgraph import reverse_cuthill_mckee
+        
+        # User may use 'arpack' as an alias for 'sparse'
+        if method == 'arpack': method = 'sparse'
+        
+        print(f" -> Solving modal (method={method})...", flush=True)
         jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
         jm.model_ready()
-        ndof = jm.ndof
-
-        # Use unified K assembly with stabilization
+        
+        # Consistent total DOF (N*6)
+        ndof_total = len(sorted_nids) * 6
+        jm_ndof = jm.ndof # Structural DOFs
+        
+        print(f"    - Assembling matrices (NDOF: {jm_ndof})...", end="", flush=True)
+        t_start = time.time()
         K_scipy = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
+        M_all = self._assemble_lumped_mass(jm, jm_ndof, sorted_nids, nid_to_idx)
+        print(f" Done ({time.time()-t_start:.2f}s)", flush=True)
 
-        # [WHT] Filter Free DOFs & Mass Assembly
-        unknown_id   = jm.unknown_id
+        # [WHT] Filter Free DOFs
+        unknown_id = np.array(jm.unknown_id, dtype=np.int64)
         actual_modes = min(num_modes, len(unknown_id) - 1)
         
         K_free = K_scipy[unknown_id, :][:, unknown_id].tocsc()
+        M_free = M_all[unknown_id]
+        ndof_free = len(unknown_id)
         
-        M_diag = self._assemble_lumped_mass(jm, ndof, sorted_nids, nid_to_idx)
-        M_free = M_diag[unknown_id]
+        # [WHT] Robustness: Add floor mass
+        m_max = np.max(M_free)
+        M_free = np.maximum(M_free, max(m_max * 1e-8, 1e-10))
         
-        # [WHT] Bandwidth Reduction (RCM Reordering)
-        # Unstructured meshes (TRIA3_FREE) produce massive sparse bandwidth.
-        from scipy.sparse.csgraph import reverse_cuthill_mckee
+        # [WHT] Bandwidth Reduction (RCM)
+        print("    - Reordering degrees of freedom (RCM)...", end="", flush=True)
+        r_start = time.time()
         perm = reverse_cuthill_mckee(K_free, symmetric_mode=True)
         rev_perm = np.argsort(perm)
-
         K_free_rcm = K_free[perm, :][:, perm].tocsc()
-        M_free_rcm = M_free[perm]  # 1D array reordered
+        M_free_rcm = M_free[perm]
+        print(f" Done ({time.time()-r_start:.2f}s)", flush=True)
 
-        # [WHT] Solve Generalized Eigenvalue Problem (Kx = lambda Mx)
-        vals, vecs_rcm = eigsh(
-            K_free_rcm,
-            k=actual_modes,
-            M=diags([M_free_rcm], [0], format='csc'),
-            which="LM",
-            sigma=-0.1,
-            tol=1e-5,
-        )
+        vals, vecs_rcm = None, None
+        
+        # [WHT] Multi-Stage Hybrid Solver Chain (Optimized for JAX & Stability)
+        if method == 'auto':
+            # Stage 1: ARPACK (Isolated Subprocess for stability)
+            import multiprocessing
+            print(f"    - [Stage 1: arpack] Attempting in isolated process...", flush=True)
+            q = multiprocessing.Queue()
+            p = multiprocessing.Process(
+                target=_arpack_subprocess_worker, 
+                args=(K_free_rcm, M_free_rcm, actual_modes, -1.0, ndof_free*20, q)
+            )
+            p.start()
+            try:
+                res = q.get(timeout=300)
+                p.join()
+                if not isinstance(res, Exception):
+                    vals, vecs_rcm = res
+                    print("      [Success] ARPACK Isolated.", flush=True)
+                    method = 'completed'
+                else:
+                    print(f"      [Failed] ARPACK logic error: {res}", flush=True)
+            except:
+                if p.is_alive(): p.terminate(); p.join()
+                print("      [Failed] ARPACK process crashed/stalled.", flush=True)
+            
+            # Stage 2: LOBPCG (Robust Sparse alternative, JAX-friendly)
+            if method == 'auto':
+                from scipy.sparse.linalg import lobpcg
+                print(f"    - [Stage 2: lobpcg] Attempting (JAX-friendly sparse)...", flush=True)
+                try:
+                    # Initial guess for eigenvectors
+                    X = np.random.rand(ndof_free, actual_modes)
+                    M_op = diags([M_free_rcm], [0], format='csc')
+                    vals, vecs_rcm = lobpcg(K_free_rcm, X, B=M_op, tol=1e-5, largest=False)
+                    print("      [Success] LOBPCG Sparse.", flush=True)
+                    method = 'completed'
+                except Exception as e:
+                    print(f"      [Failed] LOBPCG error: {e}", flush=True)
+                    
+            # Stage 3: JAX Native EIGH (Differentiable, GPU accelerated if available)
+            if method == 'auto':
+                import jax.numpy as jnp
+                from jax.lax.linalg import eigh as jax_eigh
+                print(f"    - [Stage 3: jaxeigh] Attempting JAX-native eigh...", flush=True)
+                try:
+                    K_dense = jnp.array(K_free_rcm.toarray())
+                    M_dense = jnp.diag(jnp.array(M_free_rcm))
+                    # Note: Generalized eigh in JAX requires Cholesky of M or standard form
+                    # For simplicity, we use standard form conversion K_tilde = L^-1 K L^-T
+                    L = jnp.sqrt(M_dense) # M is diagonal here
+                    K_tilde = K_dense / (L[:, None] * L[None, :])
+                    vals_j, vecs_j = jax_eigh(K_tilde)
+                    vals = np.array(vals_j[:actual_modes])
+                    # Restore scale: y = L^-1 x
+                    vecs_rcm = np.array(vecs_j[:, :actual_modes] / L[:, None])
+                    print("      [Success] JAX-native eigh.", flush=True)
+                    method = 'completed'
+                except Exception as e:
+                    print(f"      [Failed] jaxeigh error: {e}", flush=True)
+
+            # Stage 4: Scipy Dense Eigh (The final fallback)
+            if method == 'auto':
+                print(f"    - [Stage 4: dense] Final fallback to Scipy eigh...", flush=True)
+                import scipy.linalg as la
+                K_dense = K_free_rcm.toarray()
+                M_dense = np.diag(M_free_rcm)
+                vals_all, vecs_all = la.eigh(K_dense, M_dense)
+                vals = vals_all[:actual_modes]
+                vecs_rcm = vecs_all[:, :actual_modes]
+                print("      [Success] Scipy Dense eigh.", flush=True)
+                method = 'completed'
+
+        # Explicit individual methods (if user didn't use 'auto')
+        if method == 'sparse' or method == 'arpack':
+            # ... kept for backward compatibility or direct calls ...
+            vals, vecs_rcm = eigsh(K_free_rcm, k=actual_modes, M=diags([M_free_rcm], [0], format='csc'),
+                                   which="LM", sigma=-1.0, tol=1e-5, maxiter=ndof_free*20)
+        elif method == 'dense':
+            import scipy.linalg as la
+            vals_all, vecs_all = la.eigh(K_free_rcm.toarray(), np.diag(M_free_rcm))
+            vals = vals_all[:actual_modes]
+            vecs_rcm = vecs_all[:, :actual_modes]
+        
+        print("    - Eigensolve completed successfully.", flush=True)
         
         # Restore original DOF ordering
         vecs_free = vecs_rcm[rev_perm, :]
 
         freqs = np.sqrt(np.maximum(vals, 0)) / (2 * np.pi)
 
-        # Expand to full DOF space
-        vecs_full = np.zeros((ndof, actual_modes))
+        # Expand to full DOF space (matching sorted_nids * 6)
+        vecs_full = np.zeros((ndof_total, actual_modes))
         vecs_full[unknown_id, :] = vecs_free
         
-        # --- [WHT] Normalize Mode Shapes ---
-        # User requested to disable normalization so modes remain mass-normalized natively.
-        # for m in range(actual_modes):
-        #     # Translational DOFs (0, 1, 2) maximum
-        #     max_disp = np.max(np.abs(vecs_full[:, m].reshape(-1, 6)[:, :3]))
-        #     if max_disp > 1e-12:
-        #         vecs_full[:, m] /= max_disp
-
         # Reshape to (n_modes, N, 6) — DOF layout: node_idx * 6
         n_nodes   = len(sorted_nids)
         mode_shapes = np.zeros((actual_modes, n_nodes, 6))
         for i, nid in enumerate(sorted_nids):
             idx = nid_to_idx[nid]
-            mode_shapes[:, i, :] = vecs_full[idx * 6: idx * 6 + 6, :].T
+            # Ensure idx*6 + 6 fits in ndof_total
+            mode_shapes[:, i, :] = vecs_full[idx * 6 : idx * 6 + 6, :].T
 
         result = WHTSolverResult("modal", sorted_nids)
         result.frequencies  = freqs
@@ -258,10 +366,13 @@ class WHTSolver:
             k_diag = K_out.diagonal()
             k_max = np.abs(k_diag).max()
             if k_max > 0:
-                threshold = max(k_max * 1e-10, 1e-2)
+                # [WHT] Robust AUTOSPC: Higher threshold for shell stability (especially for thin plates)
+                threshold = max(k_max * 1e-8, 1e-3)
                 bad_dofs = (np.abs(k_diag) <= threshold)
                 if np.any(bad_dofs):
-                    K_out = K_out + diags([bad_dofs.astype(float) * k_max * 1e-4], [0])
+                    # Add stronger spring stiffness to floating DOFs ONLY
+                    penalty_val = k_max * 1e-4
+                    K_out = K_out + diags([bad_dofs.astype(float) * penalty_val], [0])
         return K_out.tocsr()
 
     def get_k_func_args(self) -> dict:
