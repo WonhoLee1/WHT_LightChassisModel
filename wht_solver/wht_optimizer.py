@@ -143,59 +143,59 @@ class WHTOptimizer:
         init_vars:  DesignVariables,
         n_steps:    int = 500,
         log_every:  int = 10,
+        solver_method: str = 'auto',
     ) -> Tuple[DesignVariables, List[float]]:
         """
-        Run optimization loop.
+        Run optimization loop using analytical eigensensitivity.
 
         Returns
         -------
         (best_vars, loss_history)
         """
         import optax
-        from JaxSSO.assemblemodel import K_func, K_aug_func, f_aug_func
-        from JaxSSO.solver import sci_sparse_solve
         from .objectives import multi_objective_loss
+        from .wht_eigensolver import make_modal_freq_fn
 
-        optimizer   = optax.adam(self.lr)
-        opt_state   = optimizer.init(init_vars)
-        current     = init_vars
+        optimizer    = optax.adam(self.lr)
+        opt_state    = optimizer.init(init_vars)
+        current      = init_vars
         loss_history: List[float] = []
 
-        # Pre-compute target data (numpy)
-        target_modal = self.target_results.get("modal")
-        freqs_target = (jnp.array(target_modal.frequencies)
-                        if target_modal else None)
-        phis_target  = (jnp.array(target_modal.mode_shapes[:, :, :3]
-                                  .reshape(len(target_modal.frequencies), -1))
-                        if target_modal else None)
+        # Build JAX-differentiable frequency function once
+        freq_fn = make_modal_freq_fn(
+            self.base_model,
+            num_modes=self.num_modes,
+            solver_method=solver_method,
+        )
 
-        # Build loss function (closed over k_args)
-        k_args = self._k_args
+        # Pre-compute target data
+        target_modal = self.target_results.get("modal")
+        freqs_target = (jnp.array(target_modal.frequencies[:self.num_modes])
+                        if target_modal else None)
+        phis_target  = (jnp.array(target_modal.mode_shapes[:self.num_modes, :, :3]
+                                  .reshape(self.num_modes, -1))
+                        if target_modal else None)
 
         def loss_fn(dv: DesignVariables) -> jnp.ndarray:
-            # Update node coordinates with z_offsets
-            base_crds  = jnp.array(k_args["base_crds"])
-            node_crds  = base_crds.at[:, 2].add(dv.z_offsets)
-
-            # Update element thicknesses
-            base_pq    = jnp.array(k_args["base_prop_quads"])
-            prop_quads = base_pq.at[:, 0].set(dv.t_field)
-
-            # K matrix (pure JAX, jit-able)
-            K = K_func(
-                node_crds,
-                k_args["ndof"],
-                k_args["n_beamcol"],
-                k_args["cnct_beamcols"],
-                k_args["prop_beamcols"],
-                k_args["n_quad"],
-                k_args["cnct_quads"],
-                prop_quads,
+            freqs_opt = freq_fn(
+                dv.t_field,
+                dv.z_offsets,
+                jnp.array(dv.E),
+                jnp.array(dv.rho),
             )
-            # Placeholder: actual loss needs modal solve
-            # For jit compatibility, return a simple trace-based proxy here.
-            # Full modal optimization requires custom_vjp for eigh.
-            return jnp.sum(jnp.array(K.data))   # TODO: replace with full modal
+            # Dummy mode shapes placeholder (MAC requires actual shapes;
+            # for frequency-only optimization set mac weight to 0)
+            phis_opt = jnp.zeros_like(phis_target) if phis_target is not None else None
+
+            return multi_objective_loss(
+                freqs_opt    = freqs_opt,
+                freqs_target = freqs_target,
+                phis_opt     = phis_opt,
+                phis_target  = phis_target,
+                z_offsets    = dv.z_offsets,
+                adjacency    = self.adjacency,
+                weights      = self.weights,
+            )
 
         loss_and_grad = jax.value_and_grad(loss_fn)
 

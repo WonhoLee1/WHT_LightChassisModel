@@ -579,6 +579,35 @@ class WHTSolver:
 
         return K_aug, f_aug
 
+    def _prepare_matrices(self):
+        """
+        Assemble K_free and M_free without solving the eigenvalue problem.
+        Used by WHTSensitivity for gradient computation.
+
+        Returns
+        -------
+        K_free      : (ndof_free, ndof_free) CSC sparse stiffness matrix
+        M_free      : (ndof_free,) lumped mass diagonal
+        jm_ndof     : total structural DOF count
+        unknown_id  : (ndof_free,) global DOF indices of free DOFs
+        sorted_nids : sorted node ID list
+        nid_to_idx  : {nid: 0-based index} mapping
+        """
+        jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
+        jm.model_ready()
+        jm_ndof = jm.ndof
+
+        K_scipy = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
+        M_all   = self._assemble_lumped_mass(jm, jm_ndof, sorted_nids, nid_to_idx)
+
+        unknown_id = np.array(jm.unknown_id, dtype=np.int64)
+        K_free = K_scipy[unknown_id, :][:, unknown_id].tocsc()
+        M_free = M_all[unknown_id]
+        m_max  = np.max(M_free)
+        M_free = np.maximum(M_free, max(m_max * 1e-8, 1e-10))
+
+        return K_free, M_free, jm_ndof, unknown_id, sorted_nids, nid_to_idx
+
     def _assemble_lumped_mass(
         self,
         jm,
