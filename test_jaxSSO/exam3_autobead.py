@@ -244,18 +244,14 @@ def inject_bead_metadata(wht_data: WHTResultData, model: WHTMeshModel, n_orig: D
         dz = n_new[nid][2] - n_orig[nid][2]
         dz_list.append(dz)
         
-    num_t = len(wht_data.time_values) if wht_data.time_values is not None else 1
-    dz_array = np.array(dz_list, dtype=np.float32).reshape(1, -1, 1)
-    dz_array = np.repeat(dz_array, num_t, axis=0) # Same bead height for all modes
-    
     if wht_data.point_data is None: wht_data.point_data = {}
     
-    # NEW: Add as a 3D Vector for Deform support [0, 0, DZ]
+    # NEW: Merge into a single 3D Vector field named 'Bead_Height'
+    # This supports both Magnitude coloring and Deform warping.
     dz_vector = np.zeros((num_t, len(dz_list), 3), dtype=np.float32)
-    dz_vector[:, :, 2] = dz_array[:, :, 0] # Map beads to Z displacement
+    dz_vector[:, :, 2] = np.array(dz_list, dtype=np.float32).reshape(1, -1)
     
-    wht_data.point_data["Bead_Height"] = dz_array
-    wht_data.point_data["Bead_Height_Vector"] = dz_vector
+    wht_data.point_data["Bead_Height"] = dz_vector
     return wht_data
 
 
