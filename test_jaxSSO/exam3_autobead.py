@@ -265,7 +265,7 @@ def inject_bead_metadata(wht_data: WHTResultData, model: WHTMeshModel, n_orig: D
 def main():
     parser = argparse.ArgumentParser(description="Unified Modal Analysis with Auto Beads")
     parser.add_argument("--solve", type=str, choices=['shell', 'solid'], default='shell', help="Solver type")
-    parser.add_argument("--mode", type=str, choices=['grid', 'random'], default='grid', help="Bead pattern mode")
+    parser.add_argument("--mode", type=str, choices=['grid', 'random'], default='random', help="Bead pattern mode")
     parser.add_argument("--modes", type=int, default=8, help="Number of modes to calculate")
     parser.add_argument("--min", type=float, default=3.0, help="Min bead depth [mm]")
     parser.add_argument("--max", type=float, default=10.0, help="Max bead depth [mm]")
