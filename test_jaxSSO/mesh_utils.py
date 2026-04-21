@@ -333,9 +333,12 @@ def apply_auto_beads(
             rx = np.random.uniform(0, inner_w/2)
             ry = np.random.uniform(0, inner_l/2)
             
-            # Random Size (5% to 25% of inner floor size)
-            rw = np.random.uniform(0.05 * inner_w, 0.25 * inner_w)
-            rh = np.random.uniform(0.05 * inner_l, 0.25 * inner_l)
+            # Random Size (Controlled by user-defined ratios)
+            min_sz = kwargs.get('min_size_ratio', 0.05)
+            max_sz = kwargs.get('max_size_ratio', 0.20)
+            
+            rw = np.random.uniform(min_sz * inner_w, max_sz * inner_w)
+            rh = np.random.uniform(min_sz * inner_l, max_sz * inner_l)
             
             # Random Height/Depth
             min_d = kwargs.get('min_depth', max_depth * 0.3)
