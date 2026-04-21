@@ -75,6 +75,7 @@ class PipelineConfig:
     bead_mode: str = 'grid'         # 'grid' or 'random'
     bead_margin: float = 30.0
     bead_target_ratio: float = 0.5  # 50% bead coverage
+    bead_min_depth: float = 3.0     # Min vertical morphing [mm]
     bead_max_depth: float = 10.0    # Max vertical morphing [mm]
     
     # 5. Solver & Analysis Settings
@@ -122,6 +123,7 @@ def apply_topography_beads(node_db: Dict, cfg: PipelineConfig) -> Dict:
         width=cfg.width, length=cfg.length,
         margin=cfg.bead_margin,
         target_ratio=cfg.bead_target_ratio,
+        min_depth=cfg.bead_min_depth,
         max_depth=cfg.bead_max_depth,
         origin='center',
         mode=cfg.bead_mode
@@ -256,7 +258,8 @@ def main():
     parser.add_argument("--solve", type=str, choices=['shell', 'solid'], default='shell', help="Solver type")
     parser.add_argument("--mode", type=str, choices=['grid', 'random'], default='grid', help="Bead pattern mode")
     parser.add_argument("--modes", type=int, default=8, help="Number of modes to calculate")
-    parser.add_argument("--depth", type=float, default=10.0, help="Max bead depth [mm]")
+    parser.add_argument("--min", type=float, default=3.0, help="Min bead depth [mm]")
+    parser.add_argument("--max", type=float, default=10.0, help="Max bead depth [mm]")
     parser.add_argument("--preview", action="store_true", help="Preview beads and exit")
     args = parser.parse_args()
 
@@ -267,7 +270,8 @@ def main():
         solve_mode=args.solve,
         bead_mode=args.mode,
         num_modes=args.modes,
-        bead_max_depth=args.depth,
+        bead_min_depth=args.min,
+        bead_max_depth=args.max,
         flange_segments=hook_sequence
     )
 
