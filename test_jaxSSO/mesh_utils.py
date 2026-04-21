@@ -75,7 +75,7 @@ def generate_shell_tray(
         gmsh.model.occ.addPoint(x0 + width + wall_offset, y0 + length + wall_offset, height, mesh_size_xy),
         gmsh.model.occ.addPoint(x0 - wall_offset, y0 + length + wall_offset, height, mesh_size_xy)
     ]
-
+    
     # --- 3. Create Boundary Lines ---
     l_base = [gmsh.model.occ.addLine(p_base[i], p_base[(i + 1) % 4]) for i in range(4)]
     l_rim  = [gmsh.model.occ.addLine(p_rim[i], p_rim[(i + 1) % 4]) for i in range(4)]
@@ -89,7 +89,6 @@ def generate_shell_tray(
     
     s_walls = []
     for i in range(4):
-        # Wall loop order: base_line[i], wall_vert[i+1], -rim_line[i], -wall_vert[i]
         loop = [l_base[i], l_wall[(i + 1) % 4], -l_rim[i], -l_wall[i]]
         cl_wall = gmsh.model.occ.addCurveLoop(loop)
         s_walls.append(gmsh.model.occ.addPlaneSurface([cl_wall]))
@@ -97,7 +96,7 @@ def generate_shell_tray(
     # --- 5. Tiered Flanges Generation ---
     tiers_p = [p_rim]
     tiers_l_rim = [l_rim]
-    flange_surfs_data = [] # Side-wise data for transfinite mapping
+    flange_surfs_data = [] 
     
     current_offset = wall_offset
     current_z = height
@@ -107,7 +106,6 @@ def generate_shell_tray(
         current_offset += seg_w
         current_z += seg_dz
         
-        # New points for this flange tier
         new_points = [
             gmsh.model.occ.addPoint(x0 - current_offset, y0 - current_offset, current_z, mesh_size_xy),
             gmsh.model.occ.addPoint(x0 + width + current_offset, y0 - current_offset, current_z, mesh_size_xy),
@@ -119,7 +117,6 @@ def generate_shell_tray(
         
         for i in range(4):
             if flanges[i]:
-                # Flange surface loop
                 loop = [tiers_l_rim[-1][i], new_l_rad[(i + 1) % 4], -new_l_rim[i], -new_l_rad[i]]
                 cl_flange = gmsh.model.occ.addCurveLoop(loop)
                 s_tag = gmsh.model.occ.addPlaneSurface([cl_flange])
@@ -135,18 +132,15 @@ def generate_shell_tray(
 
     # --- 6. Transfinite Meshing Configuration ---
     if mesh_type in ('quad4', 'tria3', 'mixed'):
-        # Density calculations
         nx = max(2, int(round(width / mesh_size_xy)) + 1)
         ny = max(2, int(round(length / mesh_size_xy)) + 1)
         nz = max(1, int(round(height / mesh_size_z)))
         
-        # 6.1 Base Mesh
         gmsh.model.mesh.setTransfiniteCurve(l_base[0], nx); gmsh.model.mesh.setTransfiniteCurve(l_base[2], nx)
         gmsh.model.mesh.setTransfiniteCurve(l_base[1], ny); gmsh.model.mesh.setTransfiniteCurve(l_base[3], ny)
         gmsh.model.mesh.setTransfiniteSurface(s_base)
         if mesh_type in ('quad4', 'mixed'): gmsh.model.mesh.setRecombine(2, s_base)
         
-        # 6.2 Wall Mesh
         for i in range(4):
             gmsh.model.mesh.setTransfiniteCurve(l_rim[i], nx if i in (0, 2) else ny)
             gmsh.model.mesh.setTransfiniteCurve(l_wall[i], nz + 1)
@@ -154,7 +148,6 @@ def generate_shell_tray(
             gmsh.model.mesh.setTransfiniteSurface(s)
             if mesh_type == 'quad4': gmsh.model.mesh.setRecombine(2, s)
             
-        # 6.3 Flange Mesh
         for f_data in flange_surfs_data:
             t_idx = f_data['tier']
             seg_w, seg_dz = flange_segments[t_idx]
@@ -184,12 +177,13 @@ def generate_shell_tray(
     nodes_xyz = node_coords.reshape(-1, 3)
     tag_to_idx = {int(tag): i for i, tag in enumerate(node_tags)}
     
-    node_data = {i: nodes_xyz[i] for i in range(len(node_tags))}
+    node_data = {tag_to_idx[int(tag)]: nodes_xyz[i] for i, tag in enumerate(node_tags)}
     
     elem_data = {}
-    elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(2)
+    dim_elem = 2
+    elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(dim_elem)
     for etype, etags, enodes in zip(elem_types, elem_tags, elem_node_tags):
-        num_v = 3 if etype == 2 else 4 # TRIA3=2, QUAD4=3
+        num_v = 3 if etype == 2 else 4
         nodes_flat = enodes.reshape(-1, num_v)
         for i, tag in enumerate(etags):
             elem_data[int(tag)] = [tag_to_idx[int(n)] for n in nodes_flat[i]]
@@ -198,13 +192,137 @@ def generate_shell_tray(
     return node_data, elem_data
 
 
+def generate_solid_hexa_tray(
+    width: float = 100.0,
+    length: float = 100.0,
+    height: float = 10.0,
+    mesh_size_xy: float = 50.0,
+    mesh_size_z: float = 5.0,
+    draft_angle: float = 0.0,
+    wall_layers: int = 2,
+    flange_segments: Optional[List[Tuple[float, float]]] = None,
+    origin: str = 'corner',
+    flanges: Tuple[bool, bool, bool, bool] = (True, True, True, True)
+) -> Tuple[Dict[int, np.ndarray], Dict[int, List[int]]]:
+    """
+    Generates a Solid Hexa (HEXA8) Tray mesh using Gmsh Extrude.
+    Converts 2D surface elements to 3D volume elements.
+
+    Parameters:
+        wall_layers: Number of element layers through the wall thickness.
+    """
+    node_shell, elem_shell = generate_shell_tray(
+        width=width, length=length, height=height,
+        mesh_size_xy=mesh_size_xy, mesh_size_z=mesh_size_z,
+        draft_angle=draft_angle, flange_segments=flange_segments,
+        origin=origin, mesh_type='quad4', flanges=flanges
+    )
+    
+    gmsh.initialize()
+    gmsh.model.add("SolidTray")
+    
+    # Re-create the shell nodes in Gmsh to extrude them
+    tag_to_new = {}
+    for nid, r in node_shell.items():
+        tag_to_new[nid] = gmsh.model.occ.addPoint(r[0], r[1], r[2])
+    
+    # We use a trick: Re-import shell connectivity and extrude volumes.
+    # But for a cleaner JAX-friendly result, we can manually "stack" nodes.
+    # Here we'll do a programmatic stack/extrude as it's more stable for HEXA8.
+    
+    # 0.6mm thickness example (Scale it or use a default)
+    t = 0.6 
+    
+    node_data_3d = {}
+    elem_data_3d = {}
+    
+    # Stack nodes: Layer 0 (Bottom/Shell) ... Layer N (Top)
+    num_nodes_shell = len(node_shell)
+    for layer in range(wall_layers + 1):
+        z_offset = (layer / wall_layers) * t
+        for nid, r in node_shell.items():
+            new_id = nid + layer * num_nodes_shell
+            node_data_3d[new_id] = np.array([r[0], r[1], r[2] + z_offset])
+            
+    # Create HEXA8 elements
+    e_idx = 1
+    for eid, nids in elem_shell.items():
+        if len(nids) != 4: continue # Only Quad-based HEXA8
+        for layer in range(wall_layers):
+            # Bottom face nodes
+            b1, b2, b3, b4 = [n + layer * num_nodes_shell for n in nids]
+            # Top face nodes
+            t1, t2, t3, t4 = [n + (layer + 1) * num_nodes_shell for n in nids]
+            # Standard HEXA8 ordering
+            elem_data_3d[e_idx] = [b1, b2, b3, b4, t1, t2, t3, t4]
+            e_idx += 1
+            
+    gmsh.finalize()
+    return node_data_3d, elem_data_3d
+
+
+def apply_auto_beads(
+    node_db: Dict[int, np.ndarray],
+    width: float,
+    length: float,
+    margin: float = 30.0,
+    target_ratio: float = 0.5,
+    max_depth: float = 10.0,
+    origin: str = 'center'
+) -> Dict[int, np.ndarray]:
+    """
+    Applies professional symmetric bead patterns (Topography) to the tray floor.
+    Ensures perfect symmetry regardless of the 'origin' setting.
+    """
+    new_node_db = {nid: np.copy(coords) for nid, coords in node_db.items()}
+    
+    # 1. Define bounds and center for symmetry reference
+    # Center-based logic ensures the bead starts/ends at predictable offsets.
+    if origin == 'corner':
+        cx, cy = width / 2.0, length / 2.0
+    else:
+        cx, cy = 0.0, 0.0
+        
+    inner_w = width - 2 * margin
+    inner_l = length - 2 * margin
+    
+    # 2. Pattern Parameters
+    # Using integer freq ensures periodicity matches the symmetry.
+    freq_x, freq_y = 2.0, 2.0 
+    
+    for nid, r in new_node_db.items():
+        # Target base nodes (z ~ 0) within the inner safety margin
+        if abs(r[2]) < 0.1 and abs(r[0] - cx) < (inner_w/2) and abs(r[1] - cy) < (inner_l/2):
+            
+            # Local coordinates normalized to [-1, 1]
+            nx = (r[0] - cx) / (inner_w/2)
+            ny = (r[1] - cy) / (inner_l/2)
+            
+            # Symmetric Grid Formula: cos(pi*nx*f) * cos(pi*ny*f)
+            # Shaping: Squared cosine provides a smoother "bead-like" crown.
+            val_x = math.cos(math.pi * nx * freq_x)
+            val_y = math.cos(math.pi * ny * freq_y)
+            surface = val_x * val_y
+            
+            # Apply bead offset if surface magnitude exceeds threshold
+            # threshold is based on target_ratio
+            threshold = 1.0 - target_ratio
+            if abs(surface) > threshold:
+                # Smoothing factor for transition [0.0 to 1.0]
+                smooth = (abs(surface) - threshold) / (1.0 - threshold)
+                # Apply depth with shaping
+                new_node_db[nid][2] += max_depth * np.sign(surface) * (smooth ** 1.5)
+                
+    return new_node_db
+
+
 def get_nodes_in_box(
     nodes: Dict[int, np.ndarray],
     x_range: Optional[Tuple[float, float]] = None,
     y_range: Optional[Tuple[float, float]] = None,
     z_range: Optional[Tuple[float, float]] = None
 ) -> List[int]:
-    """Helper to select node IDs within a specific 3D bounding box."""
+    """Selection helper based on bounding box."""
     selected_ids = []
     for nid, r in nodes.items():
         if (x_range[0] <= r[0] <= x_range[1] if x_range else True) and \

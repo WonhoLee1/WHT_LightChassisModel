@@ -124,7 +124,8 @@ def main():
     
     # Target Configuration
     cfg = PipelineConfig(
-        mesh_type='quad4',
+        #mesh_type='quad4',
+        mesh_type='tria3_free',
         flanges=(False, True, True, True), # Bottom Disabled
         flange_segments=hook_sequence,
         num_modes=10

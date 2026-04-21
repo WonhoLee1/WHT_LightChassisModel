@@ -145,7 +145,9 @@ class PatchTestRunner:
         print(f"    [Diagnostic] Total Mesh Mass ({etype}): {total_mass:.6f} ton")
         
         t0 = time.perf_counter()
-        result = solver.solve_modal(num_modes=15)
+        # TRIA3 has more low-frequency in-plane modes than QUAD4, requiring
+        # more modes to reach the bending targets (122.9+ Hz).
+        result = solver.solve_modal(num_modes=30)
         t_ms = (time.perf_counter() - t0) * 1000.0
         
         print(f"    [Diagnostic] First 10 Frequencies ({etype}): {result.frequencies[:10]}")

@@ -134,8 +134,20 @@ def _element_K_tria3(c1, c2, c3, t, E, nu):
 
     # 3. Drilling Stabilization (Standard OpenSees Penalty)
     # [WHT] Relative penalty preserves rigid body modes while providing stability.
-    # Must involve all 3 nodes in a single constraint to maintain objectivity.
-    Ktt = 1.0e-4 * G * t
+    #       Must involve all 3 nodes in a single constraint to maintain objectivity.
+    #
+    # [WHT-TUNING] 드릴링 페널티 선정 근거:
+    #   - QUAD4: Ktt = 1.0  * G * t  (기준치)
+    #   - TRIA3: Ktt = 1e-2 * G * t  (현재값)
+    #
+    #   이전 값(1e-4)에서는 109 Hz 근처에 ~40개의 드릴링 모드가 군집을 형성하여
+    #   122.9 Hz 굽힘 모드를 마스킹하는 문제가 있었음.
+    #
+    #   1e-2로 상향 시, 드릴링 모드 군집은 ~345 Hz 이상으로 이동하여
+    #   모든 검증 타겟 주파수(~250 Hz 이하)와 충분히 분리됨.
+    #
+    #   QUAD4(1.0) 대비 100배 약하므로 굽힘·전단·막(membrane) 거동에는 영향 없음.
+    Ktt = 1.0e-2 * G * t
     Bd = np.zeros((1, 18))
     for i in range(3):
         Bd[0, 6*i] = -0.5 * dN_dy[i]; Bd[0, 6*i+1] = 0.5 * dN_dx[i]; Bd[0, 6*i+5] = -1.0/3.0

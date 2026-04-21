@@ -339,29 +339,32 @@ class WHTVisualizer:
         prop_layout.setSpacing(2) # User requested ~2px gap
         prop_layout.setContentsMargins(5, 5, 5, 5)
         
-        # Basics Group (Renamed from Deformation)
-        group_basics = QtWidgets.QGroupBox("Basics")
-        vbox_basics = QtWidgets.QVBoxLayout()
-        vbox_basics.setSpacing(2)
+        # Deform Group (Renamed from Basics/Deformation)
+        group_deform = QtWidgets.QGroupBox("Deform")
+        vbox_deform = QtWidgets.QVBoxLayout()
+        vbox_deform.setSpacing(2)
         
-        # Row 1: Deformation
+        # Row 1: Deform Control
         hbox_warp = QtWidgets.QHBoxLayout()
         hbox_warp.setSpacing(5)
-        self.chk_warp = QtWidgets.QCheckBox("Use Deformation")
+        self.chk_warp = QtWidgets.QCheckBox("Use Deform")
         self.chk_warp.setChecked(True)
+        self.chk_warp.setToolTip("Enable/Disable mesh warping based on a vector field.")
         self.chk_warp.stateChanged.connect(self._on_warp_toggled)
         
         self.spin_scale = QtWidgets.QDoubleSpinBox()
         self.spin_scale.setRange(-1000.0, 1000.0)
         self.spin_scale.setValue(1.0)
         self.spin_scale.setFixedWidth(80)
+        self.spin_scale.setToolTip("Warping scale factor.")
         self.spin_scale.valueChanged.connect(self._on_warp_scale_changed)
         
         hbox_warp.addWidget(self.chk_warp)
         
-        # New: Selectable Deformation Vector Field
+        # Deform Vector Selection
         self.combo_warp_vec = QtWidgets.QComboBox()
-        self.combo_warp_vec.setMinimumWidth(100)
+        self.combo_warp_vec.setMinimumWidth(120)
+        self.combo_warp_vec.setToolTip("Select the vector field [X,Y,Z] to use for deformation.")
         self.combo_warp_vec.currentTextChanged.connect(self._on_warp_field_changed)
         hbox_warp.addWidget(self.combo_warp_vec)
         
@@ -380,9 +383,9 @@ class WHTVisualizer:
         hbox_bcload.addWidget(self.chk_bc)
         hbox_bcload.addWidget(self.chk_load)
         
-        vbox_basics.addLayout(hbox_warp)
-        vbox_basics.addLayout(hbox_bcload)
-        group_basics.setLayout(vbox_basics)
+        vbox_deform.addLayout(hbox_warp)
+        vbox_deform.addLayout(hbox_bcload)
+        group_deform.setLayout(vbox_deform)
 
         
         # Contour/Colorbar Group
@@ -466,7 +469,7 @@ class WHTVisualizer:
         
         group_contour.setLayout(vbox_contour)
         
-        prop_layout.addWidget(group_basics)
+        prop_layout.addWidget(group_deform)
         prop_layout.addWidget(group_contour)
 
         # UI Theme Group (Disabled - Using Native Dark Mode)
@@ -1813,13 +1816,16 @@ class WHTVisualizer:
             
         self.combo_category.blockSignals(False)
         
-        # Populate Warp Field Selector (Vectors only)
+        # Populate Warp Field Selector (Discovery: All 3D point-data vectors)
         self.combo_warp_vec.blockSignals(True)
         self.combo_warp_vec.clear()
         warp_candidates = []
         for name, data in self.result_data.point_data.items():
-            if data.ndim == 3 and data.shape[2] >= 3: # (steps, nodes, components)
+            # Standard WHT Vector is (Steps, Nodes, 3) or (Steps, Nodes, D>=3)
+            # We filter for fields that can provide a coordinate offset.
+            if data.ndim == 3 and data.shape[2] >= 3:
                 warp_candidates.append(name)
+                
         self.combo_warp_vec.addItems(sorted(warp_candidates))
         self.combo_warp_vec.blockSignals(False)
         

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Read(//c/Users/GOODMAN/miniconda3/envs/vdmc/Lib/site-packages/JaxSSO/**)"
+      "Read(//c/Users/GOODMAN/miniconda3/envs/vdmc/Lib/site-packages/JaxSSO/**)",
+      "Bash(C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe -c ' *)"
     ]
   }
 }

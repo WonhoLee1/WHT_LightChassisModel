@@ -1,307 +1,321 @@
 # -*- coding: utf-8 -*-
 """
-[WHT_LightChassisModel] Exam 3: Unified Modal Analysis with Auto Beads
-======================================================================
-1. Solver: JaxSSO (Shell) & jax-fem (Solid Hexa)
-2. Topography: Random symmetric beads (Auto Beads)
-3. Boundary Condition: Fixed at 'flange' nodes
-4. Export: Industrial formats (.k, .rad, .fem) with ID options
+exam3_autobead.py
+=================
+WHT FEM Framework — Unified Modal Analysis with Topography Auto-Beads
+
+Overview:
+---------
+This script performs a high-fidelity modal analysis on a structural shell/solid tray
+enhanced with "Topography Beads" for stiffness optimization.
+
+Key Features:
+-------------
+- Hook-Fold Flange Structure (Rise -> Inward -> Fall -> Inward).
+- Auto-Bead Generation: Random symmetric bead patterns for floor reinforcement.
+- Dual Solver Support: JaxSSO (Standard Shell) & jax-fem (High-fidelity Solid Hexa).
+- Visualizer Integration: Preview bead heights and results with WHT Visualizer.
 """
 
 import os
 import sys
 import argparse
+import traceback
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Union, Tuple
+
 import numpy as np
 import jax
-jax.config.update("jax_enable_x64", True) # JAX float64 필수 (고유치 해석 수치 안정성 보장)
+import jax.numpy as jnp
+
+# JAX float64 필수 (고유치 해석 수치 안정성 보장)
+jax.config.update("jax_enable_x64", True) 
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from test_jaxSSO.mesh_utils import generate_shell_tray, generate_solid_hexa_tray, apply_auto_beads
 from wht_modeler.wht_mesh_model import WHTMeshModel
-from wht_modeler.wht_selectors import apply_named_sets_by_recipe
 from wht_modeler.wht_entities import WHTSPCEntry
 from wht_solver.wht_solver import WHTSolver
 from wht_converter.wht_models import WHTMetadata, WHTResultData
-from wht_converter.wht_adapters import JaxSSOAdapter, JaxFEMAdapter
+from wht_converter.wht_adapters import JaxFEMAdapter
 from wht_visualizer.wht_visualizer import WHTVisualizer
+from mesh_utils import generate_shell_tray, generate_solid_hexa_tray, apply_auto_beads
 
-# --- Material and Geometry Configuration ---
-MAT_STEEL = {'E': 210000.0, 'nu': 0.3, 'rho': 7.85e-9, 't': 0.6}
-TRAY_GEOM = {'width': 1800.0, 'length': 1200.0, 'height': 30.0, 'thickness': 0.6}
-BEAD_PARAMS = {'margin': 30.0, 'target_ratio': 0.5, 'max_depth': 10.0}
 
-def inject_bead_data(wht_data, model, node_db_orig, node_db_new):
-    """모든 타임스텝(모드)에 대해 비드 높이와 변위(Warping) 데이터를 주입합니다."""
-    dz_list = []
-    disp_list = []
-    for nid in model.sorted_node_ids():
-        z_old = node_db_orig[nid][2]
-        z_new = node_db_new[nid][2]
-        dz = z_new - z_old
-        dz_list.append(dz)
-        disp_list.append([0.0, 0.0, dz])
-        
-    T = max(1, len(wht_data.time_values) if wht_data.time_values is not None else 1)
-    dz_array = np.array(dz_list, dtype=np.float32).reshape(1, -1, 1)
-    disp_array = np.array(disp_list, dtype=np.float32).reshape(1, -1, 3)
-    
-    # 모달 해석 시 N개의 모드에 대해 형태를 유지할 수 있도록 반복 복사
-    dz_array = np.repeat(dz_array, T, axis=0)
-    disp_array = np.repeat(disp_array, T, axis=0)
-    
-    if getattr(wht_data, 'point_data', None) is None: wht_data.point_data = {}
-    wht_data.point_data["Bead_Height"] = dz_array
-    wht_data.point_data["Bead_Displacement"] = disp_array
-    
-    return wht_data
+# ==============================================================================
+# 0. CONFIGURATION & SCHEMA
+# ==============================================================================
 
-def show_bead_preview(model, node_db_orig, node_db_new):
-    print("\n -> [Preview] Launching Bead Height Viewer...", flush=True)
-    ir = model.to_wht_result_data()
-    ir.time_values = np.array([0.0])
-    ir = inject_bead_data(ir, model, node_db_orig, node_db_new)
+@dataclass
+class PipelineConfig:
+    """
+    Unified settings for the Shell/Solid Tray with Auto-Beads.
+    """
+    # 1. Geometry Dimensions [mm]
+    width:  float = 1800.0
+    length: float = 1200.0
+    height: float = 35.0
+    thickness: float = 0.6  # Default shell thickness
     
-    viz = WHTVisualizer(title="Auto Bead Height Preview", show=True)
-    viz.load_results(ir)
-    viz.show()
+    # 2. Mesh Control
+    # 'shell' uses JaxSSO, 'solid' uses jax-fem (HEXA8)
+    solve_mode: str = 'shell' 
+    mesh_size_xy: float = 40.0
+    mesh_size_z:  float = 10.0
+    draft_angle:  float = 25.0
+    wall_layers:  int = 2    # Only for solid hexa
+    
+    # 3. Flange Configuration (Hook-Fold Sequence)
+    flanges: tuple = (False, True, True, True) # Bottom disabled
+    flange_segments: List[Tuple[float, float]] = field(default_factory=list)
+    
+    # 4. Auto-Bead Configuration (Topography)
+    bead_margin: float = 30.0
+    bead_target_ratio: float = 0.5  # 50% bead coverage
+    bead_max_depth: float = 10.0    # Max vertical morphing [mm]
+    
+    # 5. Solver & Analysis Settings
+    num_modes: int = 8
+    solver_method: str = 'auto'
+    
+    # 6. Material (Steel)
+    E:   float = 210000.0
+    nu:  float = 0.3
+    rho: float = 7.85e-9
 
-def run_shell_pipeline(num_modes=5, preview=False):
-    print("\n>>> [Shell Analysis] JaxSSO Pipeline Start", flush=True)
-    
-    # 1. Mesh & Beads
-    shell_geom = {k: v for k, v in TRAY_GEOM.items() if k != 'thickness'}
-    node_db, elem_db = generate_shell_tray(
-        **shell_geom, mesh_size_xy=40.0, mesh_size_z=10.0, draft_angle=15.0, flange_width=10.0, origin='center'
+
+# ==============================================================================
+# 1. CORE PIPELINE FUNCTIONS
+# ==============================================================================
+
+def build_base_geometry(cfg: PipelineConfig) -> Tuple[Dict, Dict]:
+    """Generates the raw tray geometry before morphing."""
+    if cfg.solve_mode == 'shell':
+        print(f" -> Generating Base Shell Tray Mesh (size={cfg.mesh_size_xy})...")
+        node_db, elem_db = generate_shell_tray(
+            width=cfg.width, length=cfg.length, height=cfg.height,
+            mesh_size_xy=cfg.mesh_size_xy, mesh_size_z=cfg.mesh_size_z,
+            draft_angle=cfg.draft_angle, flange_segments=cfg.flange_segments,
+            flanges=cfg.flanges, mesh_type='quad4',
+            origin='center'
+        )
+    else:
+        print(f" -> Generating Base Solid Hexa Tray Mesh (layers={cfg.wall_layers})...")
+        node_db, elem_db = generate_solid_hexa_tray(
+            width=cfg.width, length=cfg.length, height=cfg.height,
+            mesh_size_xy=cfg.mesh_size_xy, mesh_size_z=cfg.mesh_size_z,
+            draft_angle=cfg.draft_angle, wall_layers=cfg.wall_layers,
+            flange_segments=cfg.flange_segments, flanges=cfg.flanges,
+            origin='center'
+        )
+    return node_db, elem_db
+
+
+def apply_topography_beads(node_db: Dict, cfg: PipelineConfig) -> Dict:
+    """Applies random bead patterns to the flat sections of the tray."""
+    print(" -> Applying Symmetric Auto-Beads (Morphed Topography)...")
+    node_db_morphed = apply_auto_beads(
+        node_db=node_db, 
+        width=cfg.width, length=cfg.length,
+        margin=cfg.bead_margin,
+        target_ratio=cfg.bead_target_ratio,
+        max_depth=cfg.bead_max_depth,
+        origin='center'
     )
-    node_db_orig = {nid: np.copy(coords) for nid, coords in node_db.items()}
-    node_db = apply_auto_beads(node_db, TRAY_GEOM['width'], TRAY_GEOM['length'], origin='center', **BEAD_PARAMS)
-    
-    # 2. Build Model (exam2_shell_jaxSSO.py 방식)
-    model = WHTMeshModel(name="Shell_Tray_Exam3")
-    
-    # Add Material & Property
-    model.add_material(1, MAT_STEEL['E'], MAT_STEEL['nu'], MAT_STEEL['rho'])
-    model.add_property(1, "PSHELL", MAT_STEEL['t'], 1)
+    return node_db_morphed
 
-    for nid, coords in node_db.items():
-        model.add_node(nid, *coords)
+
+def build_wht_model(node_db: Dict, elem_db: Dict, cfg: PipelineConfig) -> WHTMeshModel:
+    """Converts raw DB to WHT Model and applies BCs/Materials."""
+    is_solid = (cfg.solve_mode == 'solid')
+    model = WHTMeshModel.from_node_elem_db(node_db, elem_db, is_solid=is_solid)
+    model.name = f"{cfg.solve_mode.capitalize()}_Beaded_Tray"
+    
+    # 1. Material & Property
+    model.add_material(1, cfg.E, cfg.nu, cfg.rho)
+    if is_solid:
+        model.add_property(1, "PSOLID", 0.0, 1)
+    else:
+        model.add_property(1, "PSHELL", cfg.thickness, 1)
+    
+    for elem in model.elements.values():
+        elem.pid = 1
         
-    for eid, nids in elem_db.items():
-        model.add_element(eid, nids, "QUAD4" if len(nids)==4 else "TRIA3", pid=1)
-
-    # 3. Apply Boundary Conditions (Fixed Top Flange)
-    print(" -> Applying Boundary Conditions (Fixed Top Flange)...", flush=True)
+    # 2. Boundary Conditions (Fixed Top Flange)
+    # The top flange end height is the sum of height + all flange dz
+    max_z = cfg.height + sum([seg[1] for seg in cfg.flange_segments])
     fixed_count = 0
     for nid, node in model.nodes.items():
-        if abs(node.z - TRAY_GEOM['height']) < 0.1: # Top flange location
-            model.spc_conditions.append(WHTSPCEntry(nid, (0, 1, 2, 3, 4, 5)))
+        if abs(node.z - max_z) < 0.2:
+            model.apply_spc(nid, (0, 1, 2, 3, 4, 5))
             fixed_count += 1
-    print(f"    Nodes constrained: {fixed_count}", flush=True)
-
-    if preview:
-        # 해석을 수행하지 않고 비드 미리보기만 실행 후 종료
-        show_bead_preview(model, node_db_orig, node_db)
-        return model, None, None, None
-
-    # 4. Solve
-    print(" -> Initializing JaxSSO Solver & Solving Modal...", flush=True)
-    solver = WHTSolver(model)
+    print(f"    [BC] Constrained {fixed_count} nodes at top flange rim.")
     
-    # Sanity check: Total mass
-    jm_temp, _, _ = solver._build_jaxsso_model()
-    jm_temp.model_ready() # Must call model_ready before accessing ndof
-    M_diag = solver._assemble_lumped_mass(jm_temp, jm_temp.ndof, model.sorted_node_ids(), {nid: i for i, nid in enumerate(model.sorted_node_ids())})
-    total_m_shell = np.sum(M_diag[::6])
-    print(f" -> [Sanity Check] Total Shell Mass from M: {total_m_shell:.6f} tons", flush=True)
+    return model
 
-    print(f" -> Solving for {num_modes} modes via JaxSSO...", flush=True)
+
+def evaluate_modal_response(model: WHTMeshModel, cfg: PipelineConfig):
+    """Executes the specialized solver based on mesh type."""
+    if cfg.solve_mode == 'shell':
+        print(f" -> Solving Modal Problem (JaxSSO Sparse, modes={cfg.num_modes})...")
+        solver = WHTSolver(model)
+        return solver.solve_modal(num_modes=cfg.num_modes, method=cfg.solver_method)
+    else:
+        return _solve_solid_jaxfem(model, cfg)
+
+
+# ==============================================================================
+# 2. INTERNAL SOLVER (SOLID/JAX-FEM)
+# ==============================================================================
+
+def _solve_solid_jaxfem(model: WHTMeshModel, cfg: PipelineConfig):
+    """Specialized modal logic for Solid Hexa using jax-fem wrapper."""
+    print(f" -> Initializing jax-fem pipeline for Solid Hexa (modes={cfg.num_modes})...")
     try:
-        res = solver.solve_modal(num_modes=num_modes)
-    except Exception as e:
-        print(f" -> [Error] JaxSSO solver failed: {e}", flush=True)
-        return model, None, None, None
-
-    print("\n[Shell Result] Natural Frequencies (Hz):", flush=True)
-    for i, f in enumerate(res.frequencies):
-        print(f"  Mode {i+1}: {f:8.2f} Hz", flush=True)
-        
-    return model, res, node_db_orig, node_db
-
-def run_solid_pipeline(num_modes=5, preview=False):
-    print("\n>>> [Solid Analysis] jax-fem Pipeline Start", flush=True)
-    
-    # 1. Mesh & Beads
-    node_db, elem_db = generate_solid_hexa_tray(
-        **TRAY_GEOM, mesh_size_xy=40.0, mesh_size_z=10.0, draft_angle=15.0, wall_layers=2, flange_width=10.0, origin='center'
-    )
-    node_db_orig = {nid: np.copy(coords) for nid, coords in node_db.items()}
-    node_db = apply_auto_beads(node_db, TRAY_GEOM['width'], TRAY_GEOM['length'], origin='center', **BEAD_PARAMS)
-    
-    # 2. Build Model & Sets
-    model = WHTMeshModel.from_node_elem_db(node_db, elem_db, is_solid=True, name="Solid_Tray")
-    recipe = {
-        "set_node-flange": {"type": "box", "z_range": (TRAY_GEOM['height'] - 0.1, TRAY_GEOM['height'] + 0.1)}
-    }
-    apply_named_sets_by_recipe(model, recipe)
-    
-    if preview:
-        # 해석을 수행하지 않고 비드 미리보기만 실행 후 종료
-        show_bead_preview(model, node_db_orig, node_db)
-        return model, None, None, None
-
-    # 3. Solver Setup (jax-fem uses its own classes)
-    try:
-        import jax.numpy as jnp
         from jax_fem.generate_mesh import Mesh
         from jax_fem.problem import Problem
         from scipy.sparse.linalg import eigsh
-        from scipy.sparse import diags
-    except ImportError as e:
-        print(f" -> [Error] jax-fem not installed: {e}", flush=True)
-        return model, None, None, None
+        from scipy.sparse import diags, csr_matrix
+    except ImportError:
+        raise ImportError("jax-fem is required for solid mode analysis.")
 
+    # Convert WHT to jax-fem mesh
     points = model.nodes_array()
     nid_to_idx = model.node_id_to_index()
-    cells = np.array([[nid_to_idx[n] for n in model.elements[eid].node_ids] 
+    cells = np.array([[nid_to_idx[nid] for nid in model.elements[eid].node_ids] 
                      for eid in sorted(model.elements.keys()) if model.elements[eid].type == "HEXA8"])
-    
     mesh = Mesh(points, cells)
-    E, nu, rho = MAT_STEEL['E'], MAT_STEEL['nu'], MAT_STEEL['rho']
     
-    class ModalProblem(Problem):
+    class ModalSolidProblem(Problem):
         def get_tensor_map(self):
-            def constitutive_equation(u_grad):
-                mu = E / (2.0 * (1.0 + nu)); lmbda = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+            def constitutive(u_grad):
+                mu = cfg.E / (2.0 * (1.0 + cfg.nu))
+                lmbda = cfg.E * cfg.nu / ((1.0 + cfg.nu) * (1.0 - 2.0 * cfg.nu))
                 eps = 0.5 * (u_grad + u_grad.T)
                 return lmbda * jnp.trace(eps) * jnp.eye(3) + 2.0 * mu * eps
-            return constitutive_equation
+            return constitutive
 
-    # Boundary: Fixed at flange
-    def dirichlet_val(point): return 0.0
-    z_top = TRAY_GEOM['height']
-    def flange_filter(x): return jnp.isclose(x[2], z_top, atol=0.2)
+    max_z = cfg.height + sum([seg[1] for seg in cfg.flange_segments])
+    def flange_filter(x): return jnp.isclose(x[2], max_z, atol=0.2)
     
-    # Correct structure for jax-fem: [location_fns, vecs, value_fns]
-    dirichlet_bc_info = [
-        [flange_filter, flange_filter, flange_filter],
-        [0, 1, 2],
-        [dirichlet_val, dirichlet_val, dirichlet_val]
-    ]
-
-    print(" -> Assembling K & M matrices (jax-fem)...", flush=True)
-    prob = ModalProblem(mesh, vec=3, dim=3, dirichlet_bc_info=dirichlet_bc_info)
-    sol_list = prob.unflatten_fn_sol_list(np.zeros(prob.num_total_dofs_all_vars))
-    prob.newton_update(sol_list)
-    import scipy.sparse as sps
-    K = sps.csr_matrix((np.array(prob.V), (prob.I, prob.J)), shape=(prob.num_total_dofs_all_vars, prob.num_total_dofs_all_vars))
+    dirichlet_bc = [[flange_filter]*3, [0, 1, 2], [lambda x: 0.0]*3]
+    prob = ModalSolidProblem(mesh, vec=3, dim=3, dirichlet_bc_info=dirichlet_bc)
     
-    # Simple lumped mass for Demo (Total mass distributed)
+    # Assembly
+    print("    [Solid] Assembling K (jax-fem Stiff) and M (Lumped Mass)...")
+    prob.newton_update(prob.unflatten_fn_sol_list(np.zeros(prob.num_total_dofs_all_vars)))
+    K = csr_matrix((np.array(prob.V), (prob.I, prob.J)), shape=(prob.num_total_dofs_all_vars, prob.num_total_dofs_all_vars))
+    
+    # Lumped mass calculation logic
     import pyvista as pv
-    grid = pv.UnstructuredGrid(np.hstack([np.full((cells.shape[0], 1), 8), cells]).flatten(), np.full(cells.shape[0], 12, dtype=np.uint8), points)
-    total_m = grid.volume * rho
-    # Accurate volume-based lumped mass distribution
-    cell_volumes = grid.compute_cell_sizes()["Volume"]
+    grid = pv.UnstructuredGrid(np.hstack([np.full((cells.shape[0], 1), 8), cells]).flatten(), 
+                               np.full(cells.shape[0], 12, dtype=np.uint8), points)
     nodal_mass = np.zeros(len(points))
+    cell_volumes = grid.compute_cell_sizes()["Volume"]
     for i, cell in enumerate(cells):
-        m_cell = cell_volumes[i] * rho
+        m_cell = cell_volumes[i] * cfg.rho
         nodal_mass[cell] += m_cell / 8.0
-    
-    dof_mass = np.repeat(nodal_mass, 3)
-    M = diags([dof_mass], [0], shape=K.shape, dtype=K.dtype).tocsr()
-    
-    # Safety Check
-    if not np.all(np.isfinite(K.data)) or not np.all(np.isfinite(M.data)):
-        print(" -> [Error] K or M matrix contains non-finite values (NaN/Inf).", flush=True)
-        return model, None, None, None
+    M = diags([np.repeat(nodal_mass, 3)], [0], shape=K.shape, dtype=K.dtype).tocsr()
 
-    print(f" -> Solving for {num_modes} modes via eigsh (Improved Mass Matrix)...", flush=True)
-    try:
-        vals, vecs = eigsh(K, k=num_modes, M=M, which='LM', sigma=-0.1)
-    except Exception as e:
-        print(f" -> [Error] Eigenvalue solver failed: {e}", flush=True)
-        return model, None, None, None
+    # Solve
+    vals, vecs = eigsh(K, k=cfg.num_modes, M=M, which='LM', sigma=-0.1)
+    res_vecs = vecs.reshape((len(points), 3, cfg.num_modes)).transpose(2, 0, 1)
+    return (prob, {"eigvecs": res_vecs, "eigvals": vals})
+
+
+# ==============================================================================
+# 3. POST-PROCESSING & VISUALIZATION
+# ==============================================================================
+
+def inject_bead_metadata(wht_data: WHTResultData, model: WHTMeshModel, n_orig: Dict, n_new: Dict):
+    """Adds the bead height (DZ) data as a viewable result field in visualizer."""
+    dz_list = []
+    for nid in model.sorted_node_ids():
+        dz = n_new[nid][2] - n_orig[nid][2]
+        dz_list.append(dz)
         
-    freqs = np.sqrt(np.abs(vals)) / (2 * np.pi)
+    num_t = len(wht_data.time_values) if wht_data.time_values is not None else 1
+    dz_array = np.array(dz_list, dtype=np.float32).reshape(1, -1, 1)
+    dz_array = np.repeat(dz_array, num_t, axis=0) # Same bead height for all modes
     
-    print("\n[Solid Result] Natural Frequencies (Hz):", flush=True)
-    for i, f in enumerate(sorted(freqs)):
-        print(f"  Mode {i+1}: {f:8.2f} Hz", flush=True)
-        
-    # Format for visualization
-    # [WHT] Normalize Mode Shapes to Max Displacement = 1.0 directly like JaxSSO
-    # User requested to disable normalization so modes remain mass-normalized natively.
-    # for m in range(num_modes):
-    #     max_disp = np.max(np.abs(vecs[:, m]))
-    #     if max_disp > 1e-12:
-    #         vecs[:, m] /= max_disp
-            
-    res_vecs = vecs.reshape((len(points), 3, num_modes)).transpose(2, 0, 1)
-    res_data = {"eigvecs": res_vecs, "eigvals": vals}
-    return model, (prob, res_data), node_db_orig, node_db
+    if wht_data.point_data is None: wht_data.point_data = {}
+    wht_data.point_data["Bead_Height"] = dz_array
+    return wht_data
 
-def export_model(model):
-    print("\n--- Export Module ---", flush=True)
-    ans = input(" -> Export model to industrial formats? (y/n): ").lower()
-    if ans != 'y': return
-    
-    reorder_ans = input(" -> Reorder IDs sequentially (1..N)? (y/n) [Default: Keep Original]: ").lower()
-    reorder = (reorder_ans == 'y')
-    
-    formats = {'1': ('lsdyna', '.k'), '2': ('radioss', '.rad'), '3': ('optistruct', '.fem')}
-    print(" Select formats to export (e.g. 1,2):")
-    for k, v in formats.items(): print(f"  {k}. {v[0].upper()}")
-    
-    choices = input(" Choice: ").split(',')
-    for c in choices:
-        c = c.strip()
-        if c in formats:
-            stype, ext = formats[c]
-            fname = f"{model.name}_morphed{ext}"
-            model.export_to_solver(stype, fname, reorder=reorder)
 
-if __name__ == "__main__":
-    # =========================================================================
-    # 실행 방법 (Usage Examples):
-    # 1. 기본 Shell 해석 (JaxSSO, 5개 모드): 
-    #    python exam3_autobead.py
-    # 2. Solid 해석 (jax-fem, 10개 모드):
-    #    python exam3_autobead.py --mode solid --modes 10
-    # 3. 해석 후 모델 파일(K, RAD 등) 내보내기 묻기:
-    #    python exam3_autobead.py --export
-    # 4. 비드 높이 미리보기 (해석 건너뜀):
-    #    python exam3_autobead.py --preview
-    # =========================================================================
+# ==============================================================================
+# 4. MAIN EXECUTION
+# ==============================================================================
+
+def main():
     parser = argparse.ArgumentParser(description="Unified Modal Analysis with Auto Beads")
     parser.add_argument("--mode", type=str, choices=['shell', 'solid'], default='shell', help="Solver type")
-    parser.add_argument("--modes", type=int, default=5, help="Number of modes to calculate")
-    parser.add_argument("--export", action="store_true", help="Prompt to export model to industrial formats")
-    parser.add_argument("--preview", action="store_true", help="Preview auto bead height and exit before solving")
+    parser.add_argument("--modes", type=int, default=8, help="Number of modes to calculate")
+    parser.add_argument("--depth", type=float, default=10.0, help="Max bead depth [mm]")
+    parser.add_argument("--preview", action="store_true", help="Preview beads and exit")
     args = parser.parse_args()
+
+    # 1. Pipeline Sequence (Hook-Fold Flange)
+    hook_sequence = [(0.0, 12.0), (-5.0, 0.0), (0.0, -10.0), (-10.0, 0.0)]
     
-    if args.mode == 'shell':
-        model, result, n_orig, n_new = run_shell_pipeline(num_modes=args.modes, preview=args.preview)
-        if result:
-            if args.export:
-                export_model(model)
+    cfg = PipelineConfig(
+        solve_mode=args.mode,
+        num_modes=args.modes,
+        bead_max_depth=args.depth,
+        flange_segments=hook_sequence
+    )
+
+    print("\n" + "="*80)
+    print(f" [ANALYSIS RUN] {cfg.solve_mode.upper()} TRAY WITH AUTO-BEADS")
+    print("="*80)
+
+    try:
+        # A. Geometry Generation
+        node_db_orig, elem_db = build_base_geometry(cfg)
+        node_db_morphed = apply_topography_beads(node_db_orig, cfg)
+        
+        # B. Model Assembly
+        model = build_wht_model(node_db_morphed, elem_db, cfg)
+        
+        if args.preview:
+            print("\n -> [PREVIEW MODE] Launching Bead Visualizer...")
+            # [WHT] Metadata 필수 파라미터 (solver_name, version, coord_sys, unit_force) 누락 해결
             meta = WHTMetadata(
-                solver_name="JaxSSO", solver_version="0.1.0", 
+                solver_name="WHT_Geometry_Preview",
+                solver_version="1.0.0",
+                analysis_type="modal",
+                coordinate_system="cartesian",
+                unit_length="mm",
+                unit_force="N"
+            )
+            wht_data = model.to_wht_result_data(meta)
+            wht_data = inject_bead_metadata(wht_data, model, node_db_orig, node_db_morphed)
+            
+            viz = WHTVisualizer(title="Topography Bead Preview (Morphed Floor)", show=True)
+            viz.load_results(wht_data)
+            viz.show(); return
+
+        # C. Solver Execution (해석 수행)
+        results = evaluate_modal_response(model, cfg)
+        
+        # D. Reporting & Visualization (결과 보고 및 시각화)
+        if cfg.solve_mode == 'shell':
+            print("\n" + "#"*80)
+            print(" #  SHELL MODAL FREQUENCIES (Hz) - (JaxSSO Sparse Solver)               #")
+            print("#"*80)
+            for i, f in enumerate(results.frequencies): 
+                print(f"  Mode {i+1:2d}: {f:8.3f} Hz")
+            
+            meta = WHTMetadata(
+                solver_name="JaxSSO", solver_version="2.1.0",
                 analysis_type="modal", coordinate_system="cartesian",
                 unit_length="mm", unit_force="N"
             )
-            wht_data = result.to_wht_result_data(meta, model)
-            wht_data = inject_bead_data(wht_data, model, n_orig, n_new)
-            viz = WHTVisualizer(title="Shell Modal Analysis", show=True)
-            viz.load_results(wht_data)
-            viz.show()
-    else:
-        model, result, n_orig, n_new = run_solid_pipeline(num_modes=args.modes, preview=args.preview)
-        if result:
-            if args.export:
-                export_model(model)
-            prob, res_dict = result
+            wht_data = results.to_wht_result_data(meta, model)
+        else:
+            prob, res_dict = results
             adapter = JaxFEMAdapter()
             meta = WHTMetadata(
                 solver_name="jax-fem", solver_version="0.1.0",
@@ -309,7 +323,22 @@ if __name__ == "__main__":
                 unit_length="mm", unit_force="N"
             )
             wht_data = adapter.convert(prob, res_dict, "modal", meta)
-            wht_data = inject_bead_data(wht_data, model, n_orig, n_new)
-            viz = WHTVisualizer(title="Solid Modal Analysis", show=True)
-            viz.load_results(wht_data)
-            viz.show()
+            print("\n -> [Solid Result] Modal solution extracted. Launching viewer...")
+
+        # Inject original bead data (비드 높이 데이터를 시각화 모듈에 주입)
+        wht_data = inject_bead_metadata(wht_data, model, node_db_orig, node_db_morphed)
+        
+        viz = WHTVisualizer(title=f"Beaded Tray Modal Shapes [{cfg.solve_mode.upper()}]", show=True)
+        viz.load_results(wht_data, color="black")
+        viz.plotter.view_isometric()
+        if hasattr(viz.plotter, 'app'): viz.plotter.app.exec_()
+            
+    except Exception:
+        print("\n" + "!"*80)
+        print(" [CRITICAL ERROR] Auto-Bead Pipeline failed.")
+        print("!"*80)
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
