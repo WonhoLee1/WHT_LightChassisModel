@@ -246,6 +246,9 @@ def inject_bead_metadata(wht_data: WHTResultData, model: WHTMeshModel, n_orig: D
         
     if wht_data.point_data is None: wht_data.point_data = {}
     
+    # Define num_t based on existing context
+    num_t = len(wht_data.time_values) if wht_data.time_values is not None else 1
+    
     # NEW: Merge into a single 3D Vector field named 'Bead_Height'
     # This supports both Magnitude coloring and Deform warping.
     dz_vector = np.zeros((num_t, len(dz_list), 3), dtype=np.float32)
