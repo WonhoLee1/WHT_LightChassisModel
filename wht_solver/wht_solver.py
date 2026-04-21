@@ -15,7 +15,7 @@ JAX jit boundary strategy (Strategy B):
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, Union, TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
@@ -153,16 +153,20 @@ class WHTSolver:
         # [WHT] Multi-Stage Hybrid Solver Chain (Optimized for JAX & Stability)
         if method == 'auto':
             # Stage 1: ARPACK (Isolated Subprocess for stability)
+            # On Windows, eigsh with shift-invert (sigma) is known to deadlock for
+            # large unstructured meshes due to ARPACK library threading issues.
+            # Use a short timeout: ARPACK either succeeds quickly or hangs indefinitely.
+            arpack_timeout = 20 if ndof_free > 8000 else 60
             import multiprocessing
-            print(f"    - [Stage 1: arpack] Attempting in isolated process...", flush=True)
+            print(f"    - [Stage 1: arpack] ndof={ndof_free}, timeout={arpack_timeout}s...", flush=True)
             q = multiprocessing.Queue()
             p = multiprocessing.Process(
-                target=_arpack_subprocess_worker, 
+                target=_arpack_subprocess_worker,
                 args=(K_free_rcm, M_free_rcm, actual_modes, sigma_val, ndof_free*20, q)
             )
             p.start()
             try:
-                res = q.get(timeout=300)
+                res = q.get(timeout=arpack_timeout)
                 p.join()
                 if not isinstance(res, Exception):
                     vals, vecs_rcm = res
@@ -172,7 +176,7 @@ class WHTSolver:
                     print(f"      [Failed] ARPACK logic error: {res}", flush=True)
             except:
                 if p.is_alive(): p.terminate(); p.join()
-                print("      [Failed] ARPACK process crashed/stalled.", flush=True)
+                print("      [Failed] ARPACK timed out or crashed — falling back.", flush=True)
             
             # Stage 2: LOBPCG (Robust Sparse alternative, JAX-friendly)
             if method == 'auto':
