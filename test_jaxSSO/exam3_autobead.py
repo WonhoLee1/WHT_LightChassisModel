@@ -249,7 +249,13 @@ def inject_bead_metadata(wht_data: WHTResultData, model: WHTMeshModel, n_orig: D
     dz_array = np.repeat(dz_array, num_t, axis=0) # Same bead height for all modes
     
     if wht_data.point_data is None: wht_data.point_data = {}
+    
+    # NEW: Add as a 3D Vector for Deform support [0, 0, DZ]
+    dz_vector = np.zeros((num_t, len(dz_list), 3), dtype=np.float32)
+    dz_vector[:, :, 2] = dz_array[:, :, 0] # Map beads to Z displacement
+    
     wht_data.point_data["Bead_Height"] = dz_array
+    wht_data.point_data["Bead_Height_Vector"] = dz_vector
     return wht_data
 
 
