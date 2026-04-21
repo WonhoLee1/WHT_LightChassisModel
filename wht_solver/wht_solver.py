@@ -76,13 +76,23 @@ class WHTSolver:
     # Public API
     # ------------------------------------------------------------------
 
-    def solve_modal(self, num_modes: int = 10, method: str = 'auto') -> WHTSolverResult:
+    def solve_modal(self, num_modes: int = 10, method: str = 'auto', 
+                    exclude_rigid_body: Union[bool, str] = False,
+                    shift_hz: Optional[float] = None) -> WHTSolverResult:
         """
         Solve generalized eigenvalue problem: K x = lambda M x
         
         Parameters:
-            num_modes: Number of modes to find.
-            method: 'arpack' (sparse), 'dense' (scipy.eigh), or 'auto' (Try sparse first)
+            num_modes (int): Target number of elastic modes to return.
+            method (str): 'sparse'/'arpack' (standard), 'dense' (scipy.eigh), or 'auto'.
+            exclude_rigid_body (Union[bool, str, float]): Strategy to identify and remove rigid body modes.
+                - 'skip6': Deterministically ignores the first 6 modes.
+                - 'cutoff:0.1': Filters out modes with frequencies below 0.1 Hz.
+                - 'range:0.1,1000': Retains only modes within [0.1, 1000] Hz.
+                - 'auto' / True: Automatically detects the first significant frequency jump (Quantum Jump).
+                - 'mass:0.8': Advanced Participation filtering. Removes modes with near-zero 
+                              frequency and high global mass participation factors.
+            shift_hz (float): Optional frequency shift (Hz) to solve for modes near a target value.
         """
         import time
         from scipy.sparse.linalg import eigsh
@@ -96,6 +106,12 @@ class WHTSolver:
         jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
         jm.model_ready()
         
+        # [WHT] Redefine num_modes as 'Elastic Mode Target'
+        original_num_modes = num_modes
+        if exclude_rigid_body:
+            # Solve for 6 extra modes to account for standard 3D rigid body DOFs
+            num_modes += 6
+
         # Consistent total DOF (N*6)
         ndof_total = len(sorted_nids) * 6
         jm_ndof = jm.ndof # Structural DOFs
@@ -129,6 +145,11 @@ class WHTSolver:
 
         vals, vecs_rcm = None, None
         
+        sigma_val = -1.0
+        if shift_hz is not None:
+            sigma_val = (2.0 * np.pi * shift_hz)**2
+            print(f"    - Applying Frequency Shift: {shift_hz} Hz (sigma: {sigma_val:.2f})")
+
         # [WHT] Multi-Stage Hybrid Solver Chain (Optimized for JAX & Stability)
         if method == 'auto':
             # Stage 1: ARPACK (Isolated Subprocess for stability)
@@ -137,7 +158,7 @@ class WHTSolver:
             q = multiprocessing.Queue()
             p = multiprocessing.Process(
                 target=_arpack_subprocess_worker, 
-                args=(K_free_rcm, M_free_rcm, actual_modes, -1.0, ndof_free*20, q)
+                args=(K_free_rcm, M_free_rcm, actual_modes, sigma_val, ndof_free*20, q)
             )
             p.start()
             try:
@@ -204,7 +225,7 @@ class WHTSolver:
         if method == 'sparse' or method == 'arpack':
             # ... kept for backward compatibility or direct calls ...
             vals, vecs_rcm = eigsh(K_free_rcm, k=actual_modes, M=diags([M_free_rcm], [0], format='csc'),
-                                   which="LM", sigma=-1.0, tol=1e-5, maxiter=ndof_free*20)
+                                   which="LM", sigma=sigma_val, tol=1e-5, maxiter=ndof_free*20)
         elif method == 'dense':
             import scipy.linalg as la
             vals_all, vecs_all = la.eigh(K_free_rcm.toarray(), np.diag(M_free_rcm))
@@ -230,9 +251,10 @@ class WHTSolver:
             # Ensure idx*6 + 6 fits in ndof_total
             mode_shapes[:, i, :] = vecs_full[idx * 6 : idx * 6 + 6, :].T
 
-        result = WHTSolverResult("modal", sorted_nids)
-        result.frequencies  = freqs
-        result.mode_shapes  = mode_shapes
+        res = WHTSolverResult("modal", sorted_nids)
+        res.frequencies = freqs
+        res.mode_shapes = mode_shapes
+        res.solver_info = {'method': method, 'ndof': jm_ndof, 'ndof_free': ndof_free}
         
         # --- [WHT] Element Stress & Strain Recovery ---
         n_cells = len(self.model.elements)
@@ -247,9 +269,19 @@ class WHTSolver:
             strains[m]  = e_q + e_t
             seds[m, :, 0] = 0.5 * np.sum(stresses[m] * strains[m], axis=1)
             
-        result.cell_data = {"Stress": stresses, "Strain": strains, 
-                            "StrainEnergyDensity": seds}
-        return result
+        res.cell_data = {"Stress": stresses, "Strain": strains, 
+                         "StrainEnergyDensity": seds}
+        
+        # Attach physical data for filtering
+        res.node_coords = self.model.nodes_array()
+        res.nodal_mass = M_all  # Full lumped mass array (N*6)
+        
+        # [WHT] Filter Rigid Body Modes
+        if exclude_rigid_body:
+            res.filter_rigid_body_modes(exclude_rigid_body)
+            res.truncate(original_num_modes)
+            
+        return res
 
     def solve_static(self, load_case: WHTLoadCase) -> WHTSolverResult:
         """

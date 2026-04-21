@@ -56,16 +56,6 @@ def _element_K_tria3(c1, c2, c3, t, E, nu):
         Bm[2, 6*i+1] = dN_dx[i]
     K_loc = (Bm.T @ Dm @ Bm) * A
 
-    # Adding Drilling Stiffness (Allman's penalty style) to prevent singularity and improve stability
-    # k_theta = penalty * G * Volume
-    # We use a small penalty to avoid locking while providing numerical stability for Theta_Z
-    G = E / (2.0 * (1.0 + nu))
-    penalty_drilling = 1e-4 # Small penalty factor
-    k_drilling = penalty_drilling * G * A * t
-    for i in range(3):
-        K_loc[6*i+5, 6*i+5] += k_drilling
-
-    # 2. MITC3+ Bending & Shear (Enriched 21x21)
     K_full = np.zeros((21, 21))
     Db = (E * t**3 / 12.0 * inv_nu2) * np.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1-nu)/2]])
     Ds = (k_shear * G * t) * np.eye(2)
@@ -143,12 +133,14 @@ def _element_K_tria3(c1, c2, c3, t, E, nu):
     K_loc += K_cond
 
     # 3. Drilling Stabilization (Standard OpenSees Penalty)
-    # Reduced from 0.01 to 1e-5 to prevent excessive stiffness in membrane modes
-    Ktt = 1.0e-5 * G * t
+    # [WHT] Relative penalty preserves rigid body modes while providing stability.
+    # Must involve all 3 nodes in a single constraint to maintain objectivity.
+    Ktt = 1.0e-4 * G * t
+    Bd = np.zeros((1, 18))
     for i in range(3):
-        Bd = np.zeros((1, 18))
         Bd[0, 6*i] = -0.5 * dN_dy[i]; Bd[0, 6*i+1] = 0.5 * dN_dx[i]; Bd[0, 6*i+5] = -1.0/3.0
-        K_loc += (Bd.T @ Bd) * Ktt * A
+    K_loc += (Bd.T @ Bd) * Ktt * A
+
         
     # Global Transformation
     T_18 = np.zeros((18, 18))
