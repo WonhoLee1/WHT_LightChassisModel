@@ -333,12 +333,12 @@ def apply_auto_beads(
             rx = np.random.uniform(0, inner_w/2)
             ry = np.random.uniform(0, inner_l/2)
             
-            # Random Size (Controlled by user-defined ratios)
-            min_sz = kwargs.get('min_size_ratio', 0.05)
-            max_sz = kwargs.get('max_size_ratio', 0.20)
+            # Random Size (Absolute mm values from kwargs)
+            min_sz = kwargs.get('min_size', 50.0)  # Default 50mm
+            max_sz = kwargs.get('max_size', 200.0) # Default 200mm
             
-            rw = np.random.uniform(min_sz * inner_w, max_sz * inner_w)
-            rh = np.random.uniform(min_sz * inner_l, max_sz * inner_l)
+            rw = np.random.uniform(min_sz, max_sz)
+            rh = np.random.uniform(min_sz, max_sz)
             
             # Random Height/Depth
             min_d = kwargs.get('min_depth', max_depth * 0.3)

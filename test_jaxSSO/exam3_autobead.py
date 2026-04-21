@@ -77,8 +77,8 @@ class PipelineConfig:
     bead_target_ratio: float = 0.4  # 50% bead coverage
     bead_min_depth: float = 3.0     # Min vertical morphing [mm]
     bead_max_depth: float = 10.0    # Max vertical morphing [mm]
-    bead_min_size_ratio: float = 0.05  # Min square size (5%)
-    bead_max_size_ratio: float = 0.20  # Max square size (20%)
+    bead_min_size: float = 50.0     # Min square size [mm]
+    bead_max_size: float = 200.0    # Max square size [mm]
     
     # 5. Solver & Analysis Settings
     num_modes: int = 8
@@ -127,8 +127,8 @@ def apply_topography_beads(node_db: Dict, cfg: PipelineConfig) -> Dict:
         target_ratio=cfg.bead_target_ratio,
         min_depth=cfg.bead_min_depth,
         max_depth=cfg.bead_max_depth,
-        min_size_ratio=cfg.bead_min_size_ratio,
-        max_size_ratio=cfg.bead_max_size_ratio,
+        min_size=cfg.bead_min_size,
+        max_size=cfg.bead_max_size,
         origin='center',
         mode=cfg.bead_mode
     )
@@ -264,8 +264,8 @@ def main():
     parser.add_argument("--modes", type=int, default=8, help="Number of modes to calculate")
     parser.add_argument("--min", type=float, default=3.0, help="Min bead depth [mm]")
     parser.add_argument("--max", type=float, default=10.0, help="Max bead depth [mm]")
-    parser.add_argument("--min_size", type=float, default=0.05, help="Min bead size ratio (0.05=5%)")
-    parser.add_argument("--max_size", type=float, default=0.20, help="Max bead size ratio (0.20=20%)")
+    parser.add_argument("--min_size", type=float, default=50.0, help="Min bead size [mm]")
+    parser.add_argument("--max_size", type=float, default=200.0, help="Max bead size [mm]")
     parser.add_argument("--preview", action="store_true", help="Preview beads and exit")
     args = parser.parse_args()
 
@@ -278,8 +278,8 @@ def main():
         num_modes=args.modes,
         bead_min_depth=args.min,
         bead_max_depth=args.max,
-        bead_min_size_ratio=args.min_size,
-        bead_max_size_ratio=args.max_size,
+        bead_min_size=args.min_size,
+        bead_max_size=args.max_size,
         flange_segments=hook_sequence
     )
 
