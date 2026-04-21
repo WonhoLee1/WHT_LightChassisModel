@@ -72,7 +72,7 @@ class PipelineConfig:
     flange_segments: List[Tuple[float, float]] = field(default_factory=list)
     
     # 4. Auto-Bead Configuration (Topography)
-    bead_mode: str = 'grid'         # 'grid' or 'random'
+    bead_mode: str = 'random'         # Default to 'random' as requested
     bead_margin: float = 50.0
     bead_target_ratio: float = 0.4  # 50% bead coverage
     bead_min_depth: float = 3.0     # Min vertical morphing [mm]
