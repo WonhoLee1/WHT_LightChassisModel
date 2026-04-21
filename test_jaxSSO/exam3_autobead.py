@@ -72,6 +72,7 @@ class PipelineConfig:
     flange_segments: List[Tuple[float, float]] = field(default_factory=list)
     
     # 4. Auto-Bead Configuration (Topography)
+    bead_mode: str = 'grid'         # 'grid' or 'random'
     bead_margin: float = 30.0
     bead_target_ratio: float = 0.5  # 50% bead coverage
     bead_max_depth: float = 10.0    # Max vertical morphing [mm]
@@ -122,7 +123,8 @@ def apply_topography_beads(node_db: Dict, cfg: PipelineConfig) -> Dict:
         margin=cfg.bead_margin,
         target_ratio=cfg.bead_target_ratio,
         max_depth=cfg.bead_max_depth,
-        origin='center'
+        origin='center',
+        mode=cfg.bead_mode
     )
     return node_db_morphed
 
@@ -251,7 +253,8 @@ def inject_bead_metadata(wht_data: WHTResultData, model: WHTMeshModel, n_orig: D
 
 def main():
     parser = argparse.ArgumentParser(description="Unified Modal Analysis with Auto Beads")
-    parser.add_argument("--mode", type=str, choices=['shell', 'solid'], default='shell', help="Solver type")
+    parser.add_argument("--solve", type=str, choices=['shell', 'solid'], default='shell', help="Solver type")
+    parser.add_argument("--mode", type=str, choices=['grid', 'random'], default='grid', help="Bead pattern mode")
     parser.add_argument("--modes", type=int, default=8, help="Number of modes to calculate")
     parser.add_argument("--depth", type=float, default=10.0, help="Max bead depth [mm]")
     parser.add_argument("--preview", action="store_true", help="Preview beads and exit")
@@ -261,7 +264,8 @@ def main():
     hook_sequence = [(0.0, 12.0), (-5.0, 0.0), (0.0, -10.0), (-10.0, 0.0)]
     
     cfg = PipelineConfig(
-        solve_mode=args.mode,
+        solve_mode=args.solve,
+        bead_mode=args.mode,
         num_modes=args.modes,
         bead_max_depth=args.depth,
         flange_segments=hook_sequence

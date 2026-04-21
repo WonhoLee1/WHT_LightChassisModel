@@ -268,16 +268,18 @@ def apply_auto_beads(
     margin: float = 30.0,
     target_ratio: float = 0.5,
     max_depth: float = 10.0,
-    origin: str = 'center'
+    origin: str = 'center',
+    mode: str = 'grid'
 ) -> Dict[int, np.ndarray]:
     """
-    Applies professional symmetric bead patterns (Topography) to the tray floor.
-    Ensures perfect symmetry regardless of the 'origin' setting.
+    Applies topography bead patterns to the tray floor.
+    
+    Modes:
+        'grid': Symmetric sinusoidal patterns (design intent).
+        'random': Symmetric random rectangular patches (topography optimization feel).
     """
     new_node_db = {nid: np.copy(coords) for nid, coords in node_db.items()}
     
-    # 1. Define bounds and center for symmetry reference
-    # Center-based logic ensures the bead starts/ends at predictable offsets.
     if origin == 'corner':
         cx, cy = width / 2.0, length / 2.0
     else:
@@ -286,33 +288,58 @@ def apply_auto_beads(
     inner_w = width - 2 * margin
     inner_l = length - 2 * margin
     
-    # 2. Pattern Parameters
-    # Using integer freq ensures periodicity matches the symmetry.
-    freq_x, freq_y = 2.0, 2.0 
-    
-    for nid, r in new_node_db.items():
-        # Target base nodes (z ~ 0) within the inner safety margin
-        if abs(r[2]) < 0.1 and abs(r[0] - cx) < (inner_w/2) and abs(r[1] - cy) < (inner_l/2):
+    if mode == 'grid':
+        freq_x, freq_y = 2.0, 2.0 
+        for nid, r in new_node_db.items():
+            if abs(r[2]) < 0.1 and abs(r[0] - cx) < (inner_w/2) and abs(r[1] - cy) < (inner_l/2):
+                nx = (r[0] - cx) / (inner_w/2)
+                ny = (r[1] - cy) / (inner_l/2)
+                val_x = math.cos(math.pi * nx * freq_x)
+                val_y = math.cos(math.pi * ny * freq_y)
+                surface = val_x * val_y
+                threshold = 1.0 - target_ratio
+                if abs(surface) > threshold:
+                    smooth = (abs(surface) - threshold) / (1.0 - threshold)
+                    new_node_db[nid][2] += max_depth * np.sign(surface) * (smooth ** 1.5)
+                    
+    elif mode == 'random':
+        # 1. Setup Random Seed for Reproducibility
+        np.random.seed(42)
+        
+        # 2. Define a Coarse Random Site Grid [Quadrant-based]
+        # Divide one quadrant (half-width, half-length) into sites
+        res_x, res_y = 12, 10
+        site_map = np.random.rand(res_x, res_y) < target_ratio
+        
+        # Also assign random polarity (+1 or -1) per patch
+        polarity_map = np.random.choice([-1.0, 1.0], size=(res_x, res_y))
+        
+        for nid, r in new_node_db.items():
+            dx = r[0] - cx
+            dy = r[1] - cy
             
-            # Local coordinates normalized to [-1, 1]
-            nx = (r[0] - cx) / (inner_w/2)
-            ny = (r[1] - cy) / (inner_l/2)
-            
-            # Symmetric Grid Formula: cos(pi*nx*f) * cos(pi*ny*f)
-            # Shaping: Squared cosine provides a smoother "bead-like" crown.
-            val_x = math.cos(math.pi * nx * freq_x)
-            val_y = math.cos(math.pi * ny * freq_y)
-            surface = val_x * val_y
-            
-            # Apply bead offset if surface magnitude exceeds threshold
-            # threshold is based on target_ratio
-            threshold = 1.0 - target_ratio
-            if abs(surface) > threshold:
-                # Smoothing factor for transition [0.0 to 1.0]
-                smooth = (abs(surface) - threshold) / (1.0 - threshold)
-                # Apply depth with shaping
-                new_node_db[nid][2] += max_depth * np.sign(surface) * (smooth ** 1.5)
+            if abs(r[2]) < 0.1 and abs(dx) < (inner_w/2) and abs(dy) < (inner_l/2):
+                # Normalized Coordinate [0, 1] for mirroring
+                nx = abs(dx) / (inner_w/2)
+                ny = abs(dy) / (inner_l/2)
                 
+                # Snap to grid site
+                ix = int(np.clip(nx * res_x, 0, res_x - 1))
+                iy = int(np.clip(ny * res_y, 0, res_y - 1))
+                
+                if site_map[ix, iy]:
+                    # Symmetry is automatically held because we use abs(dx), abs(dy)
+                    # For extra smoothness, apply centered bump within the site
+                    site_center_x = (ix + 0.5) / res_x
+                    site_center_y = (iy + 0.5) / res_y
+                    
+                    dist_to_center = math.sqrt((nx - site_center_x)**2 + (ny - site_center_y)**2)
+                    radius = 0.6 / max(res_x, res_y)
+                    
+                    # Rounded box factor
+                    offset = 1.0 - min(1.0, dist_to_center / radius)
+                    new_node_db[nid][2] += max_depth * polarity_map[ix, iy] * (offset**2)
+                    
     return new_node_db
 
 
