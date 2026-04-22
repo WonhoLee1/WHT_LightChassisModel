@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import datetime
 import numpy as np
 from typing import List
 
@@ -33,6 +34,35 @@ def print_result_table(results: List[TestResult]):
     print(f" Total: {len(results)} | Passed: {passed_count} | Failed: {len(results) - passed_count}")
     print("="*110 + "\n")
 
+def save_result_to_md(results: List[TestResult]):
+    """Saves test results to a Markdown file in the results directory."""
+    results_dir = Path(__file__).resolve().parent / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    filename = f"verification_report_{timestamp}.md"
+    filepath = results_dir / filename
+    
+    passed_count = sum(1 for r in results if r.passed)
+    failed_count = len(results) - passed_count
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(f"# [WHT] Solver Verification Report\n\n")
+        f.write(f"- **Date:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- **Summary:** Total {len(results)} tests, {passed_count} PASSED, {failed_count} FAILED\n\n")
+        
+        f.write("| Test Case | Element | Quantity | Theory | FEM | Error% | Result |\n")
+        f.write("| :--- | :--- | :--- | ---: | ---: | ---: | :---: |\n")
+        
+        for res in results:
+            status = "✅ PASS" if res.passed else "❌ FAIL"
+            f.write(f"| {res.name} | {res.element_type} | {res.quantity} | {res.theory:.4g} | {res.fem:.4g} | {res.error_pct:.2f}% | {status} |\n")
+        
+        f.write(f"\n---\n")
+        f.write(f"**Final Result:** {'PASS' if failed_count == 0 else 'FAIL'}\n")
+
+    print(f" -> [Success] Verification report saved to: {filepath}")
+
 def main():
     runner = PatchTestRunner()
     all_results = []
@@ -52,6 +82,7 @@ def main():
     all_results.extend(runner.test_membrane_uniaxial(etype='TRIA3'))
 
     print_result_table(all_results)
+    save_result_to_md(all_results)
 
     # Detailed debug for failed cases
     for res in all_results:

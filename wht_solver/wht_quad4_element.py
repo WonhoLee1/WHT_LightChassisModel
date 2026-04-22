@@ -178,13 +178,18 @@ def K_quad4_scipy(wht_model, sorted_nids, nid_to_idx) -> csr_matrix:
     nid_arr = list(sorted_nids)
     nid_to_crds = {nid: [wht_model.nodes[nid].x, wht_model.nodes[nid].y, wht_model.nodes[nid].z] for nid in nid_arr}
     
-    for eid, elem in wht_model.elements.items():
-        if elem.type not in ('QUAD4', 'QUAD'): continue
+    for i, (eid, elem) in enumerate(wht_model.elements.items()):
+        e_type = elem.type.upper()
+        if e_type not in ('QUAD4', 'QUAD'): continue
         nids = elem.node_ids
         pid = elem.pid
         prop = wht_model.properties.get(pid); mat = wht_model.materials.get(prop.mid) if prop else None
         t = prop.t if prop else 1.0; E = mat.E if mat else 210000.0; nu = mat.nu if mat else 0.3
         
+        # [Diagnostic] Print thickness and E for the first element processed
+        if i == 0:
+            print(f"    [Assembly] Quad4 Sample: E={E:.2e}, thickness={t:.4f}")
+
         K_e = _element_K_mitc4_plus(
             np.array(nid_to_crds[nids[0]]), np.array(nid_to_crds[nids[1]]),
             np.array(nid_to_crds[nids[2]]), np.array(nid_to_crds[nids[3]]),

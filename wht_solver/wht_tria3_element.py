@@ -164,7 +164,8 @@ def K_tria3_scipy(wht_model, sorted_nids, nid_to_idx) -> csr_matrix:
     ndof = len(sorted_nids) * 6; rows, cols, data = [], [], []
     nid_arr = list(sorted_nids); nid_to_crds = {nid: [wht_model.nodes[nid].x, wht_model.nodes[nid].y, wht_model.nodes[nid].z] for nid in nid_arr}
     for eid, elem in wht_model.elements.items():
-        if elem.type not in ('TRIA3', 'TRIA'): continue
+        e_type = elem.type.upper()
+        if e_type not in ('TRIA3', 'TRIA'): continue
         nids = elem.node_ids; pid = elem.pid; prop = wht_model.properties.get(pid); mat = wht_model.materials.get(prop.mid) if prop else None
         if not prop: continue
         # Default E/nu if Material is missing

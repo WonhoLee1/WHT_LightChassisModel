@@ -135,6 +135,89 @@ def evaluate_static_response(model: WHTMeshModel, cfg: PipelineConfig):
     return solver.solve_static(lc)
 
 
+def evaluate_static_response_twist(model: WHTMeshModel, cfg: PipelineConfig):
+    """
+    Executes a torsion test (Twist) using RBE2 master nodes.
+    - Clears existing rim BCs to allow torsion.
+    - Left side: Rigidly connected to a master node, all 6 DOFs fixed.
+    - Right side: Rigidly connected to a master node, rotated 10 deg around X-axis.
+    """
+    print("\n" + "-"*80)
+    print(" -> [Twist Scenario] Setting up Torsion Test with RBE2 Master Nodes...")
+    print("-"*80)
+    
+    # [CRITICAL] Clear existing SPCs (like Rim BC) so the load can pass through the plate
+    old_spc_count = len(model.spc_conditions)
+    model.spc_conditions = []
+    print(f"    [Setup] Cleared {old_spc_count} existing SPCs to enable pure torsion.")
+    
+    # 1. Identify Left and Right boundary nodes (Xmin, Xmax)
+    nodes_arr = model.nodes_array()
+    xmin, xmax = nodes_arr[:, 0].min(), nodes_arr[:, 0].max()
+    
+    left_slave_nids = [nid for nid, node in model.nodes.items() if abs(node.x - xmin) < 0.1]
+    right_slave_nids = [nid for nid, node in model.nodes.items() if abs(node.x - xmax) < 0.1]
+    
+    # 2. Add Master Nodes at centers of X-ends
+    # We'll use high IDs for master nodes to avoid conflict
+    max_id = max(model.nodes.keys())
+    m_left_id = max_id + 1
+    m_right_id = max_id + 2
+    
+    y_mid = (nodes_arr[:, 1].max() + nodes_arr[:, 1].min()) / 2.0
+    z_mid = (nodes_arr[:, 2].max() + nodes_arr[:, 2].min()) / 2.0
+    
+    model.add_node(m_left_id, xmin, y_mid, z_mid)
+    model.add_node(m_right_id, xmax, y_mid, z_mid)
+    
+    # 3. Add RBE2 Rigid Elements
+    # rbe2_id starts from a high range
+    model.add_rbe2(900, m_left_id, left_slave_nids)
+    model.add_rbe2(901, m_right_id, right_slave_nids)
+    
+    # 4. Setup Load Case with Prescribed Twist
+    lc = WHTLoadCase("Twist_10deg_X")
+    
+    # Left Master: All 6 DOFs fixed to zero
+    lc.add_bc(m_left_id, (0, 1, 2, 3, 4, 5), 0.0)
+    
+    # Right Master: Twist 10 deg around X (DOF 3)
+    # Note: DOF indices are 0..5. Rotation around X is DOF 3.
+    # Degrees to Radians: 10 * pi / 180
+    angle_rad = 10.0 * np.pi / 180.0
+    
+    # Request says: "오른쪽 노드는 x축 회전으로 10도 비튼다. 다른 자유도는 고정한다."
+    # So DOFs 0,1,2, 4,5 are fixed to 0.0, and DOF 3 is fixed to angle_rad.
+    lc.add_bc(m_right_id, (0, 1, 2, 4, 5), 0.0)
+    lc.add_bc(m_right_id, (3,), angle_rad)
+    
+    print(f"    [Setup] RBE2 Left: master {m_left_id} with {len(left_slave_nids)} slaves.")
+    print(f"    [Setup] RBE2 Right: master {m_right_id} with {len(right_slave_nids)} slaves.")
+    print(f"    [BC] Applied +10 deg rotation to master {m_right_id}.")
+
+    solver = WHTSolver(model)
+    result = solver.solve_static(lc)
+    
+    # 5. Output Reaction Forces (6-DOFs)
+    reac_l = result.reaction_force(m_left_id)
+    reac_r = result.reaction_force(m_right_id)
+    
+    print("\n" + "="*80)
+    print(f" {'[WHT] Torsion Test Reaction Forces':^78}")
+    print("="*80)
+    labels = ["Fx(N)", "Fy(N)", "Fz(N)", "Mx(Nmm)", "My(Nmm)", "Mz(Nmm)"]
+    
+    print(f" Master Node Path | {' | '.join([f'{l:>10}' for l in labels])}")
+    print("-" * 110)
+    row_l = f" Left (Fixed)     | " + " | ".join([f"{v:10.2e}" for v in reac_l])
+    row_r = f" Right (Twisted)  | " + " | ".join([f"{v:10.2e}" for v in reac_r])
+    print(row_l)
+    print(row_r)
+    print("="*110 + "\n")
+    
+    return result
+
+
 # ==============================================================================
 # 2. ANALYSIS EXECUTION & REPORTING
 # ==============================================================================
@@ -208,13 +291,27 @@ def main():
     # --- STEP 3: Reporting ---
     print_result_table(all_summary)
 
-    # --- STEP 4: Visualization ---
+    # --- STEP 4: Twist Scenario (New Request) ---
+    cfg_twist = PipelineConfig(mesh_type='quad4', mesh_size_xy=60.0) 
+    model_twist, _ = build_structural_model(cfg_twist)
+    result_twist = evaluate_static_response_twist(model_twist, cfg_twist)
+    
+    # Add to visualization queue
+    meta_twist = WHTMetadata(
+        solver_name="JaxSSO", solver_version="2.1.0",
+        analysis_type="static", coordinate_system="cartesian",
+        unit_length="mm", unit_force="N"
+    )
+    vis_queue.append((cfg_twist, result_twist, model_twist, meta_twist))
+
+    # --- STEP 5: Visualization ---
     if vis_queue:
-        print("\n -> Launching WHT Visualizer for first result...")
-        cfg0, res0, model0, meta0 = vis_queue[0]
-        wht_data = res0.to_wht_result_data(meta0, model0)
+        print("\n -> Launching WHT Visualizer for results...")
+        # We'll visualize the Twist result (last in queue)
+        cfg_v, res_v, model_v, meta_v = vis_queue[-1] 
+        wht_data = res_v.to_wht_result_data(meta_v, model_v)
         
-        viz = WHTVisualizer(title=f"Static Response - {cfg0.mesh_type.upper()}", show=True)
+        viz = WHTVisualizer(title=f"Static Analysis - {cfg_v.mesh_type.upper()} ({res_v.analysis_type})", show=True)
         viz.load_results(wht_data, color="black")
         viz.plotter.view_isometric()
         if hasattr(viz.plotter, 'app'):

@@ -104,7 +104,6 @@ class WHTSolver:
         
         print(f" -> Solving modal (method={method})...", flush=True)
         jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
-        jm.model_ready()
         
         # [WHT] Redefine num_modes as 'Elastic Mode Target'
         original_num_modes = num_modes
@@ -300,7 +299,6 @@ class WHTSolver:
         import jax.numpy as jnp
 
         jm, sorted_nids, nid_to_idx = self._build_jaxsso_model(load_case)
-        jm.model_ready()
 
         ndof = jm.ndof
 
@@ -341,6 +339,25 @@ class WHTSolver:
         # Calculate Max Von-Mises for diagnostic summary
         vm_static = np.sqrt(0.5 * ((s_static[:,0]-s_static[:,1])**2 + (s_static[:,1]-s_static[:,2])**2 + (s_static[:,2]-s_static[:,0])**2 + 6*(s_static[:,3]**2 + s_static[:,4]**2 + s_static[:,5]**2)))
         max_vm = np.max(vm_static)
+        p95_vm = np.percentile(vm_static, 95)
+        median_vm = np.median(vm_static)
+
+        # [WHT] Diagnostic Summary for Torsion check
+        u_max = np.abs(displacement).max()
+        print(f"    - [Static Outcome] Max Disp: {u_max:.4e} mm, "
+              f"Max Stress: {max_vm:.2f} MPa | P95: {p95_vm:.2f} | Median: {median_vm:.2f}, "
+              f"Constrained: {len(bc_dof_ids)} DOFs.")
+
+        # --- [WHT] Reaction Force Mapping Audit ---
+        idx_to_nid = {i: nid for nid, i in nid_to_idx.items()}
+        # Define lambda_ properly
+        lambda_ = u_aug_np[ndof:]
+        print(f"    - [Reaction Audit] Checking {len(jm.known_id)} constrained DOFs...")
+        for i, gid in enumerate(jm.known_id):
+            nid = idx_to_nid[gid // 6]
+            if nid in [1051, 1052, 1053, 1054]: # Master nodes area
+                val = lambda_[i]
+                print(f"      [DEBUG] Node {nid} DOF {gid%6} -> Reaction: {val:.4e}")
 
         result = WHTSolverResult("static", sorted_nids)
         result.displacement  = displacement
@@ -350,11 +367,13 @@ class WHTSolver:
             "Strain (Membrane)": e_static_membrane[np.newaxis, :, :],
             "Strain (Bending)": e_static_bending[np.newaxis, :, :]
         }
-        result._max_vm_diagnostic = max_vm # Keep for table summary
+        result._max_vm_diagnostic = max_vm 
         result._u_aug        = u_aug_np
         result._ndof         = ndof
-        result._bc_dof_ids   = bc_dof_ids
-        result._bc_node_ids  = bc_node_original
+        
+        # Explicit mapping to ensure no mismatch
+        result._bc_node_ids  = np.array([idx_to_nid[gid // 6] for gid in jm.known_id])
+        result._bc_dof_ids   = np.array(jm.known_id)
         return result
 
     def solve_all(
@@ -382,19 +401,34 @@ class WHTSolver:
 
         ndof = jm.ndof
         if self._has_jaxsso_elements():
-            K_bcoo = assemblemodel.model_K(jm)
-            K_out = csr_matrix(
-                (np.array(K_bcoo.data),
-                 (np.array(K_bcoo.indices[:, 0]),
-                  np.array(K_bcoo.indices[:, 1]))),
-                shape=(ndof, ndof),
-            )
+            K_raw = assemblemodel.model_K(jm)
+            # Robust conversion from JAX BCOO or Scipy COO to Scipy CSR
+            if hasattr(K_raw, 'indices') and hasattr(K_raw, 'data'):
+                # JAX BCOO handles indices as (nnz, 2) or (2, nnz)
+                indices = np.array(K_raw.indices)
+                data = np.array(K_raw.data)
+                if indices.shape[1] == 2:
+                    row, col = indices[:, 0], indices[:, 1]
+                else:
+                    row, col = indices[0, :], indices[1, :]
+            elif hasattr(K_raw, 'row'):
+                row, col, data = K_raw.row, K_raw.col, K_raw.data
+            else:
+                # Fallback: Treat as dense or empty
+                K_dense = np.array(K_raw)
+                from scipy.sparse import coo_matrix
+                tmp = coo_matrix(K_dense)
+                row, col, data = tmp.row, tmp.col, tmp.data
+
+            K_out = csr_matrix((data, (row, col)), shape=(ndof, ndof))
         else:
             K_out = csr_matrix((ndof, ndof))
 
-        K_out = K_out + K_quad4_scipy(self.model, sorted_nids, nid_to_idx)
-        K_out = K_out + K_tria3_scipy(self.model, sorted_nids, nid_to_idx)
-        
+        K_q = K_quad4_scipy(self.model, sorted_nids, nid_to_idx)
+        K_t = K_tria3_scipy(self.model, sorted_nids, nid_to_idx)
+        K_out = K_out + K_q + K_t
+        print(f"    - [Assembly] Stiffness Audit: {K_q.nnz} non-zeros from shells.")
+
         if stabilize:
             # [WHT] AUTOSPC: Automatically patch zero or near-zero diagonal stiffness DOFs
             # Necessary for static and modal stability on shell meshes.
@@ -466,14 +500,15 @@ class WHTSolver:
             jm.add_node(idx, node.x, node.y, node.z)
 
         # BCs from model-level SPC conditions
-        bc_map: Dict[int, List[int]] = {}  # {node_idx: [dofs...]}
+        bc_map: Dict[int, Dict[int, float]] = {}  # {node_idx: {dof: value}}
         for spc in self.model.spc_conditions:
             idx = nid_to_idx.get(spc.node_id)
             if idx is None:
                 continue
             if idx not in bc_map:
-                bc_map[idx] = []
-            bc_map[idx].extend(spc.dofs)
+                bc_map[idx] = {}
+            for d in spc.dofs:
+                bc_map[idx][d] = spc.value
 
         # BCs from load case (override / add)
         if load_case is not None:
@@ -482,12 +517,13 @@ class WHTSolver:
                 if idx is None:
                     continue
                 if idx not in bc_map:
-                    bc_map[idx] = []
-                bc_map[idx].extend(bc.dofs)
+                    bc_map[idx] = {}
+                for d in bc.dofs:
+                    bc_map[idx][d] = bc.value
 
-        for idx, dof_list in bc_map.items():
+        for idx, dof_dict in bc_map.items():
             support = [0] * 6
-            for d in set(dof_list):
+            for d in dof_dict.keys():
                 if 0 <= d < 6:
                     support[d] = 1
             jm.add_support(idx, support)
@@ -503,8 +539,10 @@ class WHTSolver:
             pid  = elem.pid
             # ... (rest of beam assembly continues safely)
 
-        # RBE2 → stiff beams
-        self._add_rbe2_beams(jm, nid_to_idx)
+        # RBE2 → Lagrange MPC (NOT stiff beams - handled in _augment_K_scipy)
+        # NOTE: _add_rbe2_beams is intentionally NOT called here to prevent
+        #       double-counting with the Lagrange MPC implementation.
+        # self._add_rbe2_beams(jm, nid_to_idx)  # DISABLED
 
         # Loads from load case
         if load_case is not None:
@@ -512,6 +550,23 @@ class WHTSolver:
                 idx = nid_to_idx.get(force.node_id)
                 if idx is not None:
                     jm.add_nodal_load(idx, list(force.load_vector))
+
+        # After model_ready, populate known_val (Prescribed Displacement)
+        jm.model_ready()
+        
+        # global DOFs indices (node_idx * 6 + local_dof) that are constrained.
+        prescribed = np.zeros(len(jm.known_id))
+        known_id_to_val = {}
+        for n_idx, dof_dict in bc_map.items():
+            for d, val in dof_dict.items():
+                global_dof = n_idx * 6 + d
+                known_id_to_val[global_dof] = val
+                
+        for i, gid in enumerate(jm.known_id):
+            prescribed[i] = known_id_to_val.get(gid, 0.0)
+        
+        # Unconditionally set known_val to ensure prescribed displacements are handled
+        jm.known_val = prescribed
 
         return jm, sorted_nids, nid_to_idx
 
@@ -540,42 +595,91 @@ class WHTSolver:
                 beam_id += 1
 
     def _has_jaxsso_elements(self) -> bool:
-        """Check if any elements belong to JaxSSO (excluding our MITC+ shells)."""
+        """Check if any elements belong to JaxSSO (excluding our MITC+ shells AND RBE2).
+        
+        RBE2 요소는 Lagrange MPC로만 처리되므로, JaxSSO 엔진에 포함시키지 않습니다.
+        """
         mitc_plus_types = ('TRIA3', 'TRIA', 'QUAD4', 'QUAD')
+        rbe2_types = ('RBE2',)  # RBE2 제외: Lagrange MPC로 처리
         for e in self.model.elements.values():
-            if getattr(e, 'type', '') not in mitc_plus_types:
+            etype = getattr(e, 'type', '')
+            if etype not in mitc_plus_types and etype not in rbe2_types:
                 return True
-        return bool(self.model.rbe2s)
+        return False  # RBE2는 여기서 제외
 
     def _augment_K_scipy(self, K_scipy, jm):
         """
-        Lagrange-multiplier augmented system from a scipy sparse K.
-
-        Returns (K_aug_scipy, f_aug_np) — same semantics as
-        assemblemodel.model_K_aug / model_f_aug but accepting an external K.
+        Augment K with Lagrange multipliers for SPCs AND RBE2 MPCs.
+        System: [K C^T; C 0] {u; lambda} = {f; v}
         """
-        from scipy.sparse import csr_matrix, vstack, hstack, coo_matrix
-        import jax.numpy as jnp
+        from scipy.sparse import csr_matrix, coo_matrix, vstack, hstack
+        ndof = K_scipy.shape[0]
+        # Remap original node IDs to indices in jm (0 to n_nodes-1)
+        nid_to_idx = {nid: i for i, nid in enumerate(self.model.sorted_node_ids())}
 
-        ndof   = jm.ndof
-        known  = np.array(jm.known_id, dtype=np.int64)
-        ncons  = len(known)
+        # 1. Collect SPC Constraints (Single Point)
+        # jm.known_id contains global DOFs (node_idx * 6 + local_dof)
+        known = np.array(jm.known_id, dtype=np.int64)
+        n_spc = len(known)
+        spc_rows, spc_cols, spc_vals = [], [], []
+        v_spc = []
+        
+        # Ensure jm.known_val is available
+        target_vals = np.zeros(n_spc)
+        if jm.known_val is not None:
+            # Match lengths
+            n_copy = min(n_spc, len(jm.known_val))
+            target_vals[:n_copy] = jm.known_val[:n_copy]
+            
+        for i, gid in enumerate(known):
+            spc_rows.append(i)
+            spc_cols.append(gid)
+            spc_vals.append(1.0)
+            v_spc.append(target_vals[i])
+        
+        # 2. Collect RBE2 MPC Constraints (Multi Point)
+        mpc_rows, mpc_cols, mpc_vals = [], [], []
+        v_mpc = []
+        mpc_count = 0
+        
+        if self.model.rbe2s:
+            for rbe2 in self.model.rbe2s.values():
+                m_idx = nid_to_idx.get(rbe2.master_nid)
+                if m_idx is None: continue
+                m_node = self.model.nodes[rbe2.master_nid]
+                
+                for s_nid in rbe2.slave_nids:
+                    s_idx = nid_to_idx.get(s_nid)
+                    if s_idx is None: continue
+                    s_node = self.model.nodes[s_nid]
+                    
+                    r = np.array([s_node.x - m_node.x, s_node.y - m_node.y, s_node.z - m_node.z])
+                    T = np.eye(6)
+                    T[0, 4] =  r[2]; T[0, 5] = -r[1]
+                    T[1, 3] = -r[2]; T[1, 5] =  r[0]
+                    T[2, 3] =  r[1]; T[2, 4] = -r[0]
+                    
+                    for d in range(6):
+                        row_idx = n_spc + mpc_count
+                        mpc_rows.append(row_idx); mpc_cols.append(s_idx*6 + d); mpc_vals.append(1.0)
+                        for d_m in range(6):
+                            val_t = -T[d, d_m]
+                            if abs(val_t) > 1e-12:
+                                mpc_rows.append(row_idx); mpc_cols.append(m_idx*6 + d_m); mpc_vals.append(val_t)
+                        v_mpc.append(0.0)
+                        mpc_count += 1
 
-        # Constraint matrix C (ncons × ndof): C[i, known[i]] = 1
-        C = coo_matrix(
-            (np.ones(ncons), (np.arange(ncons), known)),
-            shape=(ncons, ndof),
-        ).tocsr()
-
-        zero_block = csr_matrix((ncons, ncons))
-
+        n_total_cons = n_spc + mpc_count
+        C = coo_matrix((spc_vals + mpc_vals, (spc_rows + mpc_rows, spc_cols + mpc_cols)), 
+                       shape=(n_total_cons, ndof)).tocsr()
+        
         K_aug = vstack([
             hstack([K_scipy, C.T]),
-            hstack([C,       zero_block]),
+            hstack([C, csr_matrix((n_total_cons, n_total_cons))]),
         ]).tocsr()
 
         f_base = np.array(jm.nodal_loads)
-        f_aug  = np.concatenate([f_base, np.zeros(ncons)])
+        f_aug  = np.concatenate([f_base, np.array(v_spc + v_mpc)])
 
         return K_aug, f_aug
 
@@ -594,7 +698,6 @@ class WHTSolver:
         nid_to_idx  : {nid: 0-based index} mapping
         """
         jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
-        jm.model_ready()
         jm_ndof = jm.ndof
 
         K_scipy = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)

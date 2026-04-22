@@ -42,6 +42,12 @@ class WHTRangeDialog(QtWidgets.QDialog):
         
         # Calculate Global limits from current part data for slider range
         self.g_min, self.g_max = self._get_global_limits()
+        
+        # [WHT] Slider Baseline Logic: 
+        # If both are positive, start from 0 for better UI usability (e.g. Stress/Magnitude).
+        if self.g_min >= 0 and self.g_max > 0:
+            self.g_min = 0.0
+            
         if self.g_min == self.g_max:
             self.g_max = self.g_min + 1e-6
             
@@ -1316,26 +1322,32 @@ class WHTVisualizer:
                         data = array_3d[t_idx] 
                         orig_cids = mesh.cell_data.get('vtkOriginalCellIds')
                         if orig_cids is not None:
-                            # Strict Index Safety Guard (>=)
-                            if len(data) > np.max(orig_cids):
-                                c_data = data[orig_cids]
-                            else:
+                            # [WHT] 안전한 인덱스 필터링: data 범위 내 orig_cids만 사용
+                            valid_mask = orig_cids < len(data)
+                            if not np.any(valid_mask):
                                 continue
+                            # 기본값 0으로 초기화 후 유효 셀만 채움
+                            if data.ndim == 1:
+                                c_data = np.zeros(len(orig_cids), dtype=data.dtype)
+                                c_data[valid_mask] = data[orig_cids[valid_mask]]
+                            else:
+                                c_data = np.zeros((len(orig_cids), data.shape[1]), dtype=data.dtype)
+                                c_data[valid_mask] = data[orig_cids[valid_mask]]
                         else:
                             if len(data) == mesh.n_cells:
                                 c_data = data
                             else:
                                 continue
                         
+                        c_data = np.nan_to_num(c_data, nan=0.0, posinf=0.0, neginf=0.0)
                         mesh.cell_data[sc_name] = c_data
                         
                         if "Stress" in sc_name or "Strain" in sc_name:
                             if c_data.ndim > 1 and c_data.shape[1] == 6:
                                 # Standard FEA tensor decomposition
-                                c_data = np.nan_to_num(c_data)
                                 s11, s22, s33, s12, s13, s23 = c_data.T
                                 
-                                # 1. Natural Components
+                                # 1. Natural Components (Cell)
                                 mesh.cell_data[f"{sc_name}_XX"] = s11
                                 mesh.cell_data[f"{sc_name}_YY"] = s22
                                 mesh.cell_data[f"{sc_name}_ZZ"] = s33
@@ -1346,25 +1358,32 @@ class WHTVisualizer:
                                 # 2. Von Mises (Stress) vs Equivalent Strain (Engineering)
                                 is_strain = ("Strain" in sc_name)
                                 if is_strain:
-                                    # Equivalent Strain formula for engineering shear strains (gamma_12, etc.)
-                                    # Factor = sqrt(2)/3 * sqrt( (e1-e2)^2 + ... + 1.5 * gamma^2 )
-                                    # We use 1.5 * gamma^2 because gamma = 2 * epsilon_12.
                                     diff_sq = (s11-s22)**2 + (s22-s33)**2 + (s33-s11)**2
                                     shear_sq = 1.5 * (s12**2 + s13**2 + s23**2)
                                     vm = (np.sqrt(2.0)/3.0) * np.sqrt(diff_sq + shear_sq)
                                 else:
-                                    # Traditional Von Mises Stress
                                     diff_sq = (s11-s22)**2 + (s22-s33)**2 + (s33-s11)**2
                                     shear_sq = 6.0 * (s12**2 + s13**2 + s23**2)
                                     vm = np.sqrt(0.5 * (diff_sq + shear_sq))
-
                                 mesh.cell_data[f"{sc_name}_VonMises"] = vm
                                 
                                 # 3. Principal Stresses (Simplified 2D for shell models)
-                                avg = (s11 + s22) / 2.0
+                                avg    = (s11 + s22) / 2.0
                                 radius = np.sqrt(((s11 - s22) / 2.0)**2 + s12**2)
                                 mesh.cell_data[f"{sc_name}_Max_Principal"] = avg + radius
                                 mesh.cell_data[f"{sc_name}_Min_Principal"] = avg - radius
+                                
+                                # [WHT KEY FIX] Cell → Point Data 절점 평균화
+                                # cell_data_to_point_data()로 연속 색상 표시 구현
+                                try:
+                                    converted = mesh.cell_data_to_point_data()
+                                    for suffix in ["_XX", "_YY", "_ZZ", "_XY", "_XZ", "_YZ",
+                                                   "_VonMises", "_Max_Principal", "_Min_Principal"]:
+                                        field_key = f"{sc_name}{suffix}"
+                                        if field_key in converted.point_data:
+                                            mesh.point_data[field_key] = converted.point_data[field_key]
+                                except Exception as _e:
+                                    pass  # Fallback: cell_data 그대로 사용
 
                 if current_field and (current_field in mesh.point_data or current_field in mesh.cell_data):
                     mesh.set_active_scalars(current_field)
@@ -1785,10 +1804,14 @@ class WHTVisualizer:
         
         # Safely get cell_data keys
         cell_data = getattr(self.result_data, 'cell_data', {})
+        _tensor_suffixes = ["_XX", "_YY", "_ZZ", "_XY", "_XZ", "_YZ",
+                            "_VonMises", "_Max_Principal", "_Min_Principal"]
         for name in cell_data.keys():
             avail.add(name)
             if "Stress" in name or "Strain" in name:
-                avail.add(f"{name}_VonMises")
+                # [WHT] 파생 필드 사전 등록: cell_data_to_point_data() 후 생성될 필드들
+                for sfx in _tensor_suffixes:
+                    avail.add(f"{name}{sfx}")
         
         self.avail_results = avail
         

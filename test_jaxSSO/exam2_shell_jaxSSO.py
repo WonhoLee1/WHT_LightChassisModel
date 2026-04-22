@@ -58,7 +58,7 @@ class PipelineConfig:
     # Modal Solver Settings
     num_modes: int = 12
     solver_method: str = 'auto'
-    exclude_rigid_body: Union[bool, str] = 'mass'
+    exclude_rigid_body: Union[bool, str] = 'auto'
     shift_hz: Optional[float] = None
 
 

@@ -75,14 +75,15 @@ class PipelineConfig:
     bead_mode: str = 'random'         # Default to 'random' as requested
     bead_margin: float = 50.0
     bead_target_ratio: float = 0.4  # 50% bead coverage
-    bead_min_depth: float = 3.0     # Min vertical morphing [mm]
-    bead_max_depth: float = 10.0    # Max vertical morphing [mm]
+    bead_min_depth: float = 0.01     # Min vertical morphing [mm]
+    bead_max_depth: float = 0.02    # Max vertical morphing [mm]
     bead_min_size: float = 50.0     # Min square size [mm]
     bead_max_size: float = 200.0    # Max square size [mm]
     
     # 5. Solver & Analysis Settings
-    num_modes: int = 8
+    num_modes: int = 10
     solver_method: str = 'auto'
+    exclude_rigid_body: Union[bool, str] = 'auto'
     
     # 6. Material (Steel)
     E:   float = 210000.0
@@ -153,6 +154,7 @@ def build_wht_model(node_db: Dict, elem_db: Dict, cfg: PipelineConfig) -> WHTMes
         
     # 2. Boundary Conditions (Fixed Top Flange)
     # The top flange end height is the sum of height + all flange dz
+    '''
     max_z = cfg.height + sum([seg[1] for seg in cfg.flange_segments])
     fixed_count = 0
     for nid, node in model.nodes.items():
@@ -160,16 +162,20 @@ def build_wht_model(node_db: Dict, elem_db: Dict, cfg: PipelineConfig) -> WHTMes
             model.apply_spc(nid, (0, 1, 2, 3, 4, 5))
             fixed_count += 1
     print(f"    [BC] Constrained {fixed_count} nodes at top flange rim.")
-    
+    '''
     return model
 
 
 def evaluate_modal_response(model: WHTMeshModel, cfg: PipelineConfig):
     """Executes the specialized solver based on mesh type."""
     if cfg.solve_mode == 'shell':
-        print(f" -> Solving Modal Problem (JaxSSO Sparse, modes={cfg.num_modes})...")
+        print(f" -> Solving Modal Problem (JaxSSO Sparse, Target Elastic Modes={cfg.num_modes})...")
         solver = WHTSolver(model)
-        return solver.solve_modal(num_modes=cfg.num_modes, method=cfg.solver_method)
+        return solver.solve_modal(
+            num_modes=cfg.num_modes, 
+            method=cfg.solver_method,
+            exclude_rigid_body=cfg.exclude_rigid_body
+        )
     else:
         return _solve_solid_jaxfem(model, cfg)
 
@@ -266,9 +272,9 @@ def main():
     parser = argparse.ArgumentParser(description="Unified Modal Analysis with Auto Beads")
     parser.add_argument("--solve", type=str, choices=['shell', 'solid'], default='shell', help="Solver type")
     parser.add_argument("--mode", type=str, choices=['grid', 'random'], default='random', help="Bead pattern mode")
-    parser.add_argument("--modes", type=int, default=8, help="Number of modes to calculate")
-    parser.add_argument("--min", type=float, default=3.0, help="Min bead depth [mm]")
-    parser.add_argument("--max", type=float, default=10.0, help="Max bead depth [mm]")
+    parser.add_argument("--modes", type=int, default=10, help="Number of modes to calculate")
+    parser.add_argument("--min", type=float, default=0.1, help="Min bead depth [mm]")
+    parser.add_argument("--max", type=float, default=0.1, help="Max bead depth [mm]")
     parser.add_argument("--min_size", type=float, default=50.0, help="Min bead size [mm]")
     parser.add_argument("--max_size", type=float, default=200.0, help="Max bead size [mm]")
     parser.add_argument("--preview", action="store_true", help="Preview beads and exit")

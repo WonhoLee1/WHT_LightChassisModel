@@ -93,32 +93,64 @@ class ElementStressRecovery:
         U_disp_loc = np.einsum('mij, mkj -> mki', T, U[:, :, :3])
         U_rot_loc  = np.einsum('mij, mkj -> mki', T, U[:, :, 3:6])
         
-        # 3. Membrane & Bending 변형률 계산 (요소 윗면 z = +t/2 기준)
-        a = norm_V1[:, 0] / 2.0
-        b = np.einsum('mi,mi->m', V2, Y_loc) / 2.0  # local y-projection of V2
+        # 3. 요소 중심(xi=0, eta=0)에서의 Jacobian 기반 형상함수 미분
+        # 로컬 2D 좌표: 절점 0 기준 상대 좌표
+        # QUAD4 절점 (로컬): (-1,-1), (1,-1), (1,1), (-1,1) 순서의 등매개 변환
+        # 중심점(xi=0, eta=0)에서의 形狀函數 미분:
+        # dN/dxi  @ center = 0.25 * [-1, 1, 1, -1]
+        # dN/deta @ center = 0.25 * [-1, -1, 1, 1]
+        # 로컬 2D 좌표 (xi, eta) → 물리 좌표 mapping via Jacobian
+
+        # 절점 로컬 2D 좌표 계산 (절점 0 기준)
+        # X_loc, Y_loc, Z_loc: 각 요소 로컬 기저벡터
+        p0 = C[:, 0, :]  # (M, 3) 절점 0 위치
+        C_loc = np.stack([
+            np.einsum('mi,mi->m', C[:, k, :] - p0, X_loc) for k in range(4)
+        ] , axis=1)  # (M, 4) 로컬 x 좌표
+        D_loc = np.stack([
+            np.einsum('mi,mi->m', C[:, k, :] - p0, Y_loc) for k in range(4)
+        ] , axis=1)  # (M, 4) 로컬 y 좌표
         
+        # 중심(xi=eta=0)에서 J = 0.25 * [ sum(dN/dxi * x_i), sum(dN/dxi * y_i);
+        #                                   sum(dN/deta * x_i), sum(dN/deta * y_i) ]
+        dNxi  = np.array([-1.0, 1.0, 1.0, -1.0]) * 0.25
+        dNeta = np.array([-1.0, -1.0, 1.0, 1.0]) * 0.25
+        
+        J11 = np.dot(C_loc, dNxi)   # (M,)
+        J12 = np.dot(D_loc, dNxi)   # (M,)
+        J21 = np.dot(C_loc, dNeta)  # (M,)
+        J22 = np.dot(D_loc, dNeta)  # (M,)
+        
+        detJ = J11 * J22 - J12 * J21  # (M,)
+        # Clamp near-zero determinants to prevent division by zero
+        detJ_safe = np.where(np.abs(detJ) > 1e-12, detJ, 1e-12)
+        
+        # J^{-1}
+        invJ11 =  J22 / detJ_safe
+        invJ12 = -J12 / detJ_safe
+        invJ21 = -J21 / detJ_safe
+        invJ22 =  J11 / detJ_safe
+        
+        # dN/dx, dN/dy at center: shape (M, 4)
+        dN_dx = np.outer(invJ11, dNxi) + np.outer(invJ12, dNeta)  # (M, 4)
+        dN_dy = np.outer(invJ21, dNxi) + np.outer(invJ22, dNeta)  # (M, 4)
+
         u_x, u_y = U_disp_loc[:, :, 0], U_disp_loc[:, :, 1]
         th_x, th_y = U_rot_loc[:, :, 0], U_rot_loc[:, :, 1]
         
-        dN_dx = np.array([-1, 1, 1, -1]) / (4 * a[:, None])
-        dN_dy = np.array([-1, -1, 1, 1]) / (4 * b[:, None])
-        
         # Membrane (u,v at mid-plane)
-        eps_xx_m = np.sum(dN_dx * u_x, axis=1)
-        eps_yy_m = np.sum(dN_dy * u_y, axis=1)
+        eps_xx_m   = np.sum(dN_dx * u_x, axis=1)
+        eps_yy_m   = np.sum(dN_dy * u_y, axis=1)
         gamma_xy_m = np.sum(dN_dy * u_x + dN_dx * u_y, axis=1)
         
-        # Bending at z = t/2 (Mindlin-Reissner Shell Assumption)
-        # Curvature kappa_x = theta_y,x. eps_x = z * kappa_x
+        # Bending at z = t/2 (Mindlin-Reissner: kappa_x = theta_y,x)
         z_dist = t_arr / 2.0
-        # Correct Factor: Sum(dN/dx * theta_y) gives the gradient.
-        # Ensure units match (mm^-1 * rad = mm^-1).
-        eps_xx_b =  z_dist * np.sum(dN_dx * th_y, axis=1)
-        eps_yy_b = -z_dist * np.sum(dN_dy * th_x, axis=1)
-        gamma_xy_b = z_dist * np.sum(dN_dy * th_y - dN_dx * th_x, axis=1)
+        eps_xx_b   =  z_dist * np.sum(dN_dx * th_y, axis=1)
+        eps_yy_b   = -z_dist * np.sum(dN_dy * th_x, axis=1)
+        gamma_xy_b =  z_dist * np.sum(dN_dy * th_y - dN_dx * th_x, axis=1)
         
-        eps_xx = eps_xx_m + eps_xx_b
-        eps_yy = eps_yy_m + eps_yy_b
+        eps_xx   = eps_xx_m   + eps_xx_b
+        eps_yy   = eps_yy_m   + eps_yy_b
         gamma_xy = gamma_xy_m + gamma_xy_b
         
         factor = E_arr / (1 - nu_arr**2)

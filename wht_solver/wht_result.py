@@ -64,22 +64,13 @@ class WHTSolverResult:
 
         Parameters
         ----------
-        node_ids : None   → all BC nodes, returns (n_bc_nodes, 3) [Rx, Ry, Rz]
-                   int    → single node, returns (3,)
-                   list   → selected nodes, returns (len, 3)
+        node_ids : None   → all BC nodes, returns (n_bc_nodes, 6) [Fx, Fy, Fz, Mx, My, Mz]
+                   int    → single node, returns (6,)
+                   list   → selected nodes, returns (len, 6)
 
         Returns
         -------
-        np.ndarray — translational reaction forces [Rx, Ry, Rz] only.
-
-        Note
-        ----
-        Sign convention: lambda_ = u_aug[ndof:] follows JaxSSO's Lagrange
-        multiplier convention where lambda has the same sign as the applied
-        load direction (i.e. sum(R[:, 2]) = -total_applied_Fz).
-        For equilibrium check use: abs(sum(R[:, 2])) == abs(F_applied_total).
-        Only BC-constrained nodes have non-zero reactions.
-        Non-BC nodes return (0, 0, 0).
+        np.ndarray — nodal reaction forces and moments [Fx, Fy, Fz, Mx, My, Mz].
         """
         if self._u_aug is None:
             raise RuntimeError("No augmented solution stored — solve_static() first.")
@@ -98,7 +89,7 @@ class WHTSolverResult:
                 node_reactions[bc_nid][local_dof] = float(lambda_[i])
 
         def _get(nid: int) -> np.ndarray:
-            return node_reactions.get(nid, np.zeros(6))[:3]
+            return node_reactions.get(nid, np.zeros(6))
 
         if node_ids is None:
             # All BC nodes in sorted order
@@ -250,16 +241,23 @@ class WHTSolverResult:
         # 2. Build Rigid Body Matrix R (N*6, 6)
         # R relates CG 6-DOF to Nodal 6-DOFs
         R = np.zeros((n_nodes, 6, 6))
-        for i in range(n_nodes):
-            r = coords[i] - cg
-            # Translation part
-            R[i, :3, :3] = np.eye(3)
-            # Rotation part (skew-symmetric of r)
-            R[i, :3, 3:] = [[0, r[2], -r[1]],
-                            [-r[2], 0, r[0]],
-                            [r[1], -r[0], 0]]
-            # Rotation DOFs participations
-            R[i, 3:, 3:] = np.eye(3)
+        
+        # Identity parts for Translation (0:3, 0:3) and Rotation (3:6, 3:6)
+        I3 = np.eye(3)
+        R[:, 0:3, 0:3] = I3
+        R[:, 3:6, 3:6] = I3
+        
+        # Skew-symmetric part for r (relates CG rotation to nodal translation)
+        # nodal_u_trans = cg_u_trans + cg_u_rot x r
+        #               = cg_u_trans - r x cg_u_rot
+        # Matrix form: u_node = [I, -skew(r)] * [u_cg, rot_cg]^T
+        r = coords - cg
+        R[:, 0, 4] = r[:, 2]
+        R[:, 0, 5] = -r[:, 1]
+        R[:, 1, 3] = -r[:, 2]
+        R[:, 1, 5] = r[:, 0]
+        R[:, 2, 3] = r[:, 1]
+        R[:, 2, 4] = -r[:, 0]
             
         # 3. Calculate Participation Factors L = phi^T * M * R
         # phi is (n_modes, n_nodes, 6)
