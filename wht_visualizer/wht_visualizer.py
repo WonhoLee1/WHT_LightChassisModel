@@ -12,7 +12,8 @@ import numpy as np
 import pyvista as pv
 from pyvistaqt import BackgroundPlotter
 import matplotlib.pyplot as plt
-from typing import Dict, List, Optional, Any, TYPE_CHECKING
+import koreanize_matplotlib
+from typing import Dict, List, Optional, Any, TYPE_CHECKING, Tuple
 
 # Force qtpy to use PySide6 backend
 os.environ['QT_API'] = 'pyside6'
@@ -31,131 +32,183 @@ if TYPE_CHECKING:
 class WHTRangeDialog(QtWidgets.QDialog):
     """
     [WHT Premium UI] Interactive dialog for real-time scalar range adjustment.
-    Features linked sliders, spinboxes, and statistical robust auto-range suggestions.
+    Features text-input for scientific notation, quick-snap buttons, and custom robust calculation.
     """
-    def __init__(self, parent_vis, field_name: str):
+    def __init__(self, parent_vis, field_name: str, dummy_group, get_limits_fn, get_robust_fn):
         super().__init__(parent_vis.plotter.app_window)
         self.vis = parent_vis
         self.field = field_name
+        self.dummy_group = dummy_group
+        self.get_limits_fn = get_limits_fn
+        self.get_robust_fn = get_robust_fn
+        
         self.setWindowTitle(f"Adjust Range: {field_name}")
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(550)
         
-        # Calculate Global limits from current part data for slider range
-        self.g_min, self.g_max = self._get_global_limits()
+        # Physical limits of the current field via hook
+        self.g_min, self.g_max = self.get_limits_fn()
         
-        # [WHT] Slider Baseline Logic: 
-        # If both are positive, start from 0 for better UI usability (e.g. Stress/Magnitude).
-        if self.g_min >= 0 and self.g_max > 0:
-            self.g_min = 0.0
-            
-        if self.g_min == self.g_max:
-            self.g_max = self.g_min + 1e-6
-            
+        # For slider relative mapping (allows adjustment outside limits)
+        span = self.g_max - self.g_min
+        if span <= 0: span = 1e-6
+        self.s_min = self.g_min - 0.5 * span
+        self.s_max = self.g_max + 0.5 * span
+        
         self._setup_ui()
-        
-    def _get_global_limits(self):
-        rng = [float('inf'), float('-inf')]
-        for part in self.vis.parts.values():
-            m = part["mesh"]
-            if self.field in m.point_data or self.field in m.cell_data:
-                r = m.get_data_range(self.field)
-                rng[0] = min(rng[0], r[0])
-                rng[1] = max(rng[1], r[1])
-        if rng[0] == float('inf'): return 0.0, 1.0
-        return float(rng[0]), float(rng[1])
 
     def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout.setSpacing(15)
         
-        # Helper: Create Slider-Spinbox Pair with bidirectional sync
-        def create_entry(label, val):
+        # Helper: Create Slider-LineEdit Pair with bidirectional sync and snap buttons
+        def create_entry(label, current_val, limit_val):
             group = QtWidgets.QGroupBox(label)
-            h = QtWidgets.QHBoxLayout(group)
+            vbox = QtWidgets.QVBoxLayout(group)
             
-            spin = QtWidgets.QDoubleSpinBox()
-            spin.setRange(-1e15, 1e15)
-            spin.setValue(val)
-            spin.setDecimals(4)
-            spin.setMinimumWidth(120)
+            # Label for physical limit (Always visible context)
+            lbl_limit = QtWidgets.QLabel(f"Field {label.split()[0]} (Actual): {limit_val:.4e}")
+            lbl_limit.setStyleSheet("color: #888888; font-size: 8pt; font-family: 'Consolas', monospace;")
+            vbox.addWidget(lbl_limit)
+            
+            hbox = QtWidgets.QHBoxLayout()
+            
+            # LineEdit for Scientific Notation Support
+            edit = QtWidgets.QLineEdit(f"{current_val:.4e}")
+            val_validator = QtGui.QDoubleValidator()
+            val_validator.setNotation(QtGui.QDoubleValidator.ScientificNotation)
+            edit.setValidator(val_validator)
+            edit.setMinimumWidth(120)
+            
+            # Snap Button
+            btn_snap = QtWidgets.QPushButton("|<" if "Minimum" in label else ">|")
+            btn_snap.setFixedWidth(40)
+            btn_snap.setToolTip(f"Snap to actual field {label.lower()}")
             
             slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
             slider.setRange(0, 1000)
             
             # Sync logic
-            def update_slider_from_spin(v):
-                if not hasattr(self, 'spin_max'): return # Guard during init
-                pct = (v - self.g_min) / (self.g_max - self.g_min)
-                slider.blockSignals(True)
-                slider.setValue(int(np.clip(pct, 0, 1) * 1000))
-                slider.blockSignals(False)
-                self._trigger_update()
+            def update_slider_from_edit():
+                try:
+                    v = float(edit.text())
+                    # Map v to 0-1000 based on s_min, s_max
+                    pct = (v - self.s_min) / (self.s_max - self.s_min)
+                    slider.blockSignals(True)
+                    slider.setValue(int(np.clip(pct, 0, 1) * 1000))
+                    slider.blockSignals(False)
+                    self._trigger_update()
+                except ValueError: pass
 
-            def update_spin_from_slider(v):
-                if not hasattr(self, 'spin_max'): return # Guard during init
-                val = self.g_min + (v / 1000.0) * (self.g_max - self.g_min)
-                spin.blockSignals(True)
-                spin.setValue(val)
-                spin.blockSignals(False)
+            def update_edit_from_slider(v):
+                val = self.s_min + (v / 1000.0) * (self.s_max - self.s_min)
+                edit.blockSignals(True)
+                edit.setText(f"{val:.4e}")
+                edit.blockSignals(False)
                 self._trigger_update()
+                
+            def snap_to_limit():
+                edit.setText(f"{limit_val:.4e}")
+                update_slider_from_edit()
 
-            spin.valueChanged.connect(update_slider_from_spin)
-            slider.valueChanged.connect(update_spin_from_slider)
+            edit.textChanged.connect(update_slider_from_edit)
+            edit.returnPressed.connect(self._trigger_update) # Apply on Enter
+            slider.valueChanged.connect(update_edit_from_slider)
+            btn_snap.clicked.connect(snap_to_limit)
             
-            # Initial Slider position
-            pct_init = (val - self.g_min) / (self.g_max - self.g_min)
+            # Initial Slider position (Block signals to prevent crash during init)
+            pct_init = (current_val - self.s_min) / (self.s_max - self.s_min)
+            slider.blockSignals(True)
             slider.setValue(int(np.clip(pct_init, 0, 1) * 1000))
+            slider.blockSignals(False)
             
-            h.addWidget(slider, 3)
-            h.addWidget(spin, 1)
-            return group, spin, slider
+            hbox.addWidget(slider, 3)
+            hbox.addWidget(edit, 1)
+            hbox.addWidget(btn_snap)
+            vbox.addLayout(hbox)
+            return group, edit, slider
 
-        self.grp_min, self.spin_min, self.slider_min = create_entry("Minimum Threshold", self.vis.range_min)
-        self.grp_max, self.spin_max, self.slider_max = create_entry("Maximum Threshold", self.vis.range_max)
+        self.grp_min, self.edit_min, self.slider_min = create_entry("Minimum Threshold", self.vis.range_min, self.g_min)
+        self.grp_max, self.edit_max, self.slider_max = create_entry("Maximum Threshold", self.vis.range_max, self.g_max)
         
         layout.addWidget(self.grp_min)
         layout.addWidget(self.grp_max)
         
-        # Statistical Recommendations (User Request: Statistical robustness)
-        h_tools = QtWidgets.QHBoxLayout()
-        btn_robust = QtWidgets.QPushButton("Robust Auto (2-98%)")
-        btn_robust.setToolTip("Sets range to 2nd and 98th percentile to ignore extreme outliers.")
+        # Robust Tools Group
+        group_robust = QtWidgets.QGroupBox("Statistical Robustness")
+        h_robust = QtWidgets.QHBoxLayout(group_robust)
+        
+        # User requested editable robust percentage (default 98%)
+        self.spin_robust = QtWidgets.QDoubleSpinBox()
+        self.spin_robust.setRange(50.0, 100.0)
+        self.spin_robust.setValue(self.dummy_group.get_robust_pct())
+        self.spin_robust.setSuffix(" %")
+        self.spin_robust.setToolTip("데이터 분포의 중심 백분율을 설정합니다.\n(예: 98% 설정 시 상/하위 1%씩을 특이점으로 간주하여 제외)")
+        
+        btn_robust = QtWidgets.QPushButton("Apply Robust Auto")
+        btn_robust.setToolTip("설정된 백분율을 기반으로 특이점을 제외한 유효 범위를 자동 계산하여 적용합니다.")
         btn_robust.clicked.connect(self._apply_robust)
         
-        btn_global = QtWidgets.QPushButton("Global Auto (Full)")
-        btn_global.setToolTip("Resets range to absolute min and max of current field.")
+        btn_global = QtWidgets.QPushButton("Full Global Auto")
+        btn_global.setToolTip("전체 데이터의 절대 최소/최대값으로 범위를 확장합니다.")
         btn_global.clicked.connect(self._apply_global)
         
-        h_tools.addWidget(btn_robust)
-        h_tools.addWidget(btn_global)
-        layout.addLayout(h_tools)
+        h_robust.addWidget(QtWidgets.QLabel("Threshold:"))
+        h_robust.addWidget(self.spin_robust)
+        h_robust.addWidget(btn_robust)
+        h_robust.addWidget(btn_global)
+        
+        btn_find = QtWidgets.QPushButton("🔍 Find Outliers")
+        btn_find.setToolTip("현재 입력된 최대값(Max Threshold)을 초과하는 노드들을 3D 뷰에서 강조 표시합니다.")
+        btn_find.clicked.connect(self._find_outliers)
+        h_robust.addWidget(btn_find)
+        
+        layout.addWidget(group_robust)
         
         # Footer
         btn_close = QtWidgets.QPushButton("Done")
         btn_close.clicked.connect(self.accept)
+        btn_close.setAutoDefault(False); btn_close.setDefault(False) # Prevent Enter from closing
         layout.addWidget(btn_close)
+        
+        # Cleanup on close
+        self.finished.connect(self._cleanup)
+
+    def _cleanup(self):
+        """Removes outlier highlights when the dialog is closed."""
+        self.vis.clear_outliers()
 
     def _trigger_update(self):
         """Live-sync with the main visualizer state."""
-        if not hasattr(self, 'spin_min') or not hasattr(self, 'spin_max'):
+        if not hasattr(self, 'edit_min') or not hasattr(self, 'edit_max'):
             return
             
-        # Update internal state on parent
-        self.vis.range_min = self.spin_min.value()
-        self.vis.range_max = self.spin_max.value()
-        
-        # Force switch to Static mode so the manual values persist
-        self.vis.combo_range_mode.setCurrentText("Static (Fixed)")
-        self.vis._apply_colorbar_range()
+        try:
+            self.vis.range_min = float(self.edit_min.text())
+            self.vis.range_max = float(self.edit_max.text())
+            
+            # Force switch to Static mode so the manual values persist
+            self.vis.combo_range_mode.setCurrentText("Static (Fixed)")
+            self.vis._apply_colorbar_range()
+        except ValueError: pass
 
     def _apply_robust(self):
-        rng = self.vis._calculate_robust_range(self.field)
-        self.spin_min.setValue(rng[0])
-        self.spin_max.setValue(rng[1])
+        pct = self.spin_robust.value()
+        p_low = (100.0 - pct) / 2.0
+        p_high = 100.0 - p_low
+        rng = self.vis._calculate_robust_range(self.field, p_low=p_low, p_high=p_high)
+        self.edit_min.setText(f"{rng[0]:.4e}")
+        self.edit_max.setText(f"{rng[1]:.4e}")
 
     def _apply_global(self):
-        self.spin_min.setValue(self.g_min)
-        self.spin_max.setValue(self.g_max)
+        self.edit_min.setText(f"{self.g_min:.4e}")
+        self.edit_max.setText(f"{self.g_max:.4e}")
+
+    def _find_outliers(self):
+        """Triggers the visualizer to highlight nodes exceeding the currently entered max."""
+        try:
+            threshold = float(self.edit_max.text())
+            self.vis._highlight_outliers(self.field, threshold)
+        except ValueError: pass
 
 
 class WHTVisualizer:
@@ -422,10 +475,22 @@ class WHTVisualizer:
         self.range_min = 0.0
         self.range_max = 1.0
         
-        # Colorbar Range Logic (Flattened into Fields)
         self.combo_range_mode = QtWidgets.QComboBox()
         self.combo_range_mode.addItems(["Dynamic (Auto)", "Robust (Auto)", "Static (Fixed)"])
         self.combo_range_mode.currentTextChanged.connect(self._on_range_mode_changed)
+
+        # Robust Percentage Control (Main UI)
+        hbox_robust_main = QtWidgets.QHBoxLayout()
+        hbox_robust_main.setSpacing(2)
+        self.spin_robust_main = QtWidgets.QDoubleSpinBox()
+        self.spin_robust_main.setRange(50.0, 100.0)
+        self.spin_robust_main.setValue(98.0)
+        self.spin_robust_main.setSuffix(" %")
+        self.spin_robust_main.setToolTip("Statistical Outlier Rejection Threshold.\nDefault 98% ignores the top/bottom 1%.")
+        self.spin_robust_main.valueChanged.connect(self._apply_colorbar_range)
+        hbox_robust_main.addWidget(QtWidgets.QLabel("Robust %:"))
+        hbox_robust_main.addWidget(self.spin_robust_main)
+        # Hide it when not in Robust mode? No, keep it as reference.
         
         # --- Colorbar Display Mode Group ---
         hbox_cb_mode = QtWidgets.QHBoxLayout()
@@ -470,6 +535,7 @@ class WHTVisualizer:
         # Assemble into Fields Main Layout in logical order
         vbox_contour.addLayout(hbox_result)
         vbox_contour.addWidget(self.combo_range_mode)
+        vbox_contour.addLayout(hbox_robust_main)
         vbox_contour.addLayout(hbox_cb_mode)
         vbox_contour.addLayout(hbox_cmap)
         
@@ -626,10 +692,19 @@ class WHTVisualizer:
         
         menu.addSeparator()
         
-        # Theme Menu
-        theme_menu = menu.addMenu("Theme")
-        theme_menu.addAction("Dark Mode", lambda: self._set_theme(True))
-        theme_menu.addAction("Light Mode", lambda: self._set_theme(False))
+        # Theme Menu (BG 세부 선택)
+        theme_menu = menu.addMenu("Background")
+        _BG_ITEMS = [
+            ("Black",          "Black"),
+            ("White",          "White"),
+            ("Dark Grey",      "Dark Grey"),
+            ("Light Grey",     "Light Grey"),
+            ("Grey Grad.",     "Grey Grad."),
+            ("Light Grey Grad.", "Light Grey Grad."),
+            ("Light Sky Grad.", "Light Sky Grad."),
+        ]
+        for label, name in _BG_ITEMS:
+            theme_menu.addAction(label, lambda checked=False, n=name: self._on_bg_changed(n))
         
         menu.addSeparator()
         menu.addAction("Reset Camera", lambda: self.plotter.reset_camera())
@@ -765,7 +840,25 @@ class WHTVisualizer:
         self.toolbar.addSeparator()
         self._add_toolbar_action("↺90", "Rotate 90 CCW", self._create_view_icon("rotate"), lambda: self._rotate_camera(90))
         self._add_toolbar_action("Capture", "Take Screenshot", self._create_view_icon("camera"), self._take_screenshot)
-        self._add_toolbar_action("BG", "Toggle Background", self._create_view_icon("bg"), self._on_bg_toggle)
+
+        # [WHT] BG 버튼: 클릭 → 반전 토글 / 화살표 클릭 → 세부 테마 선택 메뉴
+        self.btn_bg_tool = QtWidgets.QToolButton(self.plotter.app_window)
+        self.btn_bg_tool.setIcon(self._create_view_icon("bg"))
+        self.btn_bg_tool.setToolTip("배경색 설정\n  클릭: Dark/Light 반전\n  ▼: 세부 테마 선택")
+        self.btn_bg_tool.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+        self.btn_bg_tool.clicked.connect(self._on_bg_toggle)
+
+        bg_menu = QtWidgets.QMenu(self.plotter.app_window)
+        _BG_LIST = [
+            "Black", "White", "Dark Grey", "Light Grey",
+            "Grey Grad.", "Light Grey Grad.", "Light Sky Grad."
+        ]
+        for bg_name in _BG_LIST:
+            act = bg_menu.addAction(bg_name)
+            act.triggered.connect(lambda checked=False, n=bg_name: self._on_bg_changed(n))
+        self.btn_bg_tool.setMenu(bg_menu)
+        self.toolbar.addWidget(self.btn_bg_tool)
+
         self.list_parts.itemChanged.connect(self._on_part_item_changed)
 
     def _add_toolbar_action(self, text, tooltip, icon, func, checkable=False, checked=False):
@@ -814,28 +907,76 @@ class WHTVisualizer:
         self.plotter.camera.roll += angle
         self.plotter.render()
 
-    def _set_theme(self, is_dark: bool):
-        if self._bg_is_dark == is_dark: return
-        self._bg_is_dark = is_dark
-        
-        bg_color = 'black' if self._bg_is_dark else 'white'
-        font_color = 'white' if self._bg_is_dark else 'black'
-        
-        # 1. Apply to plotter and global theme
-        self.plotter.set_background(bg_color)
-        pv.global_theme.font.color = font_color
-        
-        # 2. Force apply to all renderers (Critical for BackgroundPlotter)
-        for renderer in self.plotter.renderers:
-            renderer.set_background(bg_color)
-            
-        # 3. Update Axes
-        self.plotter.add_axes(color=font_color)
+    def _on_bg_changed(self, color_name: str):
+        """
+        [WHT] 배경색 변경 및 폰트/축 색상 자동 최적화 (whts_multipostprocessor_ui 동일 스타일).
+
+        Parameters
+        ----------
+        color_name : str
+            선택된 배경 테마 이름.
+            지원 목록: "Black", "White", "Dark Grey", "Light Grey",
+                      "Grey Grad.", "Light Grey Grad.", "Light Sky Grad."
+        """
+        # 1. 배경색 및 폰트 포어그라운드 결정
+        if color_name == "Black":
+            self.plotter.set_background("black")
+            fg = "white";  self._bg_is_dark = True
+        elif color_name == "White":
+            self.plotter.set_background("white")
+            fg = "black";  self._bg_is_dark = False
+        elif color_name == "Dark Grey":
+            self.plotter.set_background("#222222")
+            fg = "white";  self._bg_is_dark = True
+        elif color_name == "Light Grey":
+            self.plotter.set_background("#D3D3D3")
+            fg = "black";  self._bg_is_dark = False
+        elif color_name == "Grey Grad.":
+            # ParaView Style: Dark Grey(하단) → Black(상단)
+            self.plotter.set_background("#666666", top="black")
+            fg = "white";  self._bg_is_dark = True
+        elif color_name == "Light Grey Grad.":
+            # 밝은 회색(하단) → 흰색(상단)
+            self.plotter.set_background("white", top="#D3D3D3")
+            fg = "black";  self._bg_is_dark = False
+        elif color_name == "Light Sky Grad.":
+            # 하늘색(하단) → 흰색(상단)
+            self.plotter.set_background("white", top="#E0F7FA")
+            fg = "black";  self._bg_is_dark = False
+        else:
+            return
+
+        fg_rgb = pv.Color(fg).float_rgb
+
+        # 2. 전역 테마 동기화 (plotter.set_background()가 이미 전체 렌더러에 적용됨)
+        pv.global_theme.font.color = fg
+
+        # 3. 좌표축 재생성 (색상 반전 적용)
+        try:
+            self.plotter.add_axes(color=fg)
+        except Exception:
+            pass
+
+        # 4. Scalar Bar 색상 동기화
+        if hasattr(self, 'scalar_bar_actor') and self.scalar_bar_actor is not None:
+            try:
+                self.scalar_bar_actor.title_text_property.color = fg_rgb
+                self.scalar_bar_actor.label_text_property.color = fg_rgb
+            except Exception:
+                pass
+
+        # 5. Qt UI 팔레트 동기화 (다크/라이트 전환)
+        self._apply_ui_theme(is_dark=self._bg_is_dark)
+
         self.plotter.render()
 
     def _on_bg_toggle(self):
-        """[WHT Professional] Toggles between Dark and Light analysis themes."""
-        self._set_theme(not self._bg_is_dark)
+        """[WHT] 현재 배경색 반전 (Dark ↔ Light) — BG 버튼 단순 클릭 시 실행."""
+        self._on_bg_changed("Black" if not self._bg_is_dark else "White")
+
+    def _set_theme(self, is_dark: bool):
+        """[WHT] 하위 호환성 유지용 래퍼. _on_bg_changed 로 위임합니다."""
+        self._on_bg_changed("Black" if is_dark else "White")
 
     def _take_screenshot(self):
         if not QtWidgets: return
@@ -1160,25 +1301,14 @@ class WHTVisualizer:
 
     # --- Colorbar Range Handlers ---
     def _on_range_mode_changed(self, mode):
-        """Toggles spinbox availability and snaps to current range if static."""
+        """Toggles spinbox availability."""
         is_static = (mode == "Static (Fixed)")
         self.spin_min.setEnabled(is_static)
         self.spin_max.setEnabled(is_static)
         
-        if is_static:
-            current_field = self._get_active_field_name()
-            if current_field:
-                # Find global min-max across all parts for this field
-                total_rng = [float('inf'), float('-inf')]
-                for part in self.parts.values():
-                    if current_field in part["mesh"].point_data:
-                        r = part["mesh"].get_data_range(current_field)
-                        total_rng[0] = min(total_rng[0], r[0])
-                        total_rng[1] = max(total_rng[1], r[1])
-                
-                if total_rng[0] != float('inf'):
-                    self.spin_min.setValue(total_rng[0])
-                    self.spin_max.setValue(total_rng[1])
+        # [WHT] Manual Override: Do NOT auto-snap to global range here.
+        # This prevents overwriting user manual input when the dialog switches to Static mode.
+        # Users can still use the 'Fit' button in the main UI if they want to snap.
         
         self.set_timestep(self.current_timestep)
 
@@ -1251,7 +1381,13 @@ class WHTVisualizer:
             )
             self.plotter.update_scalar_bar_range(rng)
             
-    def _calculate_robust_range(self, field_name: str, p_low: float = 2.0, p_high: float = 98.0) -> List[float]:
+    def _calculate_robust_range(self, field_name: str, p_low: float = None, p_high: float = None) -> List[float]:
+        """Ignores outliers based on percentiles."""
+        if p_low is None or p_high is None:
+            pct = self.spin_robust_main.value()
+            p_low = (100.0 - pct) / 2.0
+            p_high = 100.0 - p_low
+            
         """Calculates robust percentile-based range to handle FEA singularities/outliers."""
         if not self.parts: return [0.0, 1.0]
         
@@ -1277,8 +1413,79 @@ class WHTVisualizer:
         r_min = float(np.percentile(merged, p_low))
         r_max = float(np.percentile(merged, p_high))
         
+        if merged.size == 0:
+            return [0.0, 1.0]
+
+        # [WHT-ZERO-DEFECT] Robust Statistical Calculation
+        try:
+            v_max = float(np.nanmax(merged))
+            p99 = float(np.percentile(merged, 99.0))
+            p95 = float(np.percentile(merged, 95.0))
+            
+            mu = np.nanmean(merged)
+            std = np.nanstd(merged)
+            def get_z(val): 
+                if std is None or np.isnan(std) or std <= 1e-12: return 0.0
+                return (val - mu) / std
+            
+            print(f"\n[WHT-STATS] Field: {field_name}")
+            print(f"  > Absolute MAX: {v_max:.4e} (Z: {get_z(v_max):.2f}s)")
+            print(f"  > 99th Pct    : {p99:.4e} (Z: {get_z(p99):.2f}s)")
+            print(f"  > 95th Pct    : {p95:.4e} (Z: {get_z(p95):.2f}s)")
+            print(f"  > Robust MAX ({p_high}%): {r_max:.4e} (Z: {get_z(r_max):.2f}s)")
+            print(f"  > Absolute MIN: {float(np.nanmin(merged)):.4e}")
+            print(f"  > Mean/Std    : {mu:.4e} / {std:.4e}")
+            print(f"  > Total Nodes : {len(merged):,}")
+        except Exception as e:
+            print(f"[WHT-ERROR] Stats calculation failed: {e}")
+
         if r_min == r_max: r_max = r_min + 1e-6 # Safety expand
         return [r_min, r_max]
+
+    def _highlight_outliers(self, field_name: str, threshold: float):
+        """Highlights nodes exceeding the threshold with Magenta spheres."""
+        found_any = False
+        
+        # Clear existing highlight actor if it exists
+        if hasattr(self, "_outlier_actor"):
+            try:
+                self.plotter.remove_actor(self._outlier_actor)
+            except: pass
+            
+        all_pts = []
+        for part in self.parts.values():
+            mesh = part["mesh"]
+            if field_name not in mesh.point_data: continue
+            
+            vals = mesh.point_data[field_name]
+            mask = vals > threshold
+            if np.any(mask):
+                pts = mesh.points[mask]
+                all_pts.append(pts)
+        
+        if all_pts:
+            merged_pts = np.concatenate(all_pts)
+            cloud = pv.PolyData(merged_pts)
+            self._outlier_actor = self.plotter.add_mesh(
+                cloud, color="magenta", point_size=15, 
+                render_points_as_spheres=True, 
+                name="_wht_outliers"
+            )
+            found_any = True
+            print(f" -> [WHT-DEBUG] Highlighted {len(merged_pts)} nodes > {threshold:.4e}")
+        else:
+            print(f" -> [WHT-DEBUG] No nodes found exceeding {threshold:.4e}")
+            
+        self.plotter.render()
+
+    def clear_outliers(self):
+        """Removes the magenta outlier highlight actor."""
+        if hasattr(self, "_outlier_actor"):
+            try:
+                self.plotter.remove_actor(self._outlier_actor)
+                delattr(self, "_outlier_actor")
+                self.plotter.render()
+            except: pass
 
     # --- Data Update Core ---
     def _bind_data_to_mesh(self, t_idx: int):
@@ -1391,6 +1598,13 @@ class WHTVisualizer:
                     # Force scalar visibility if a real result is selected
                     if current_field != "Body Color":
                         part["actor"].mapper.scalar_visibility = True
+                        
+                        # [WHT] Robust Outlier Handling: If mode is Robust, set above-range color to grey
+                        # This "removes" them visually by making them neutral.
+                        if self.combo_range_mode.currentText() == "Robust (Auto)":
+                             part["actor"].mapper.lookup_table.above_range_color = 'grey'
+                        else:
+                             part["actor"].mapper.lookup_table.above_range_color = 'magenta'
                     else:
                         part["actor"].mapper.scalar_visibility = False
 
@@ -1528,7 +1742,38 @@ class WHTVisualizer:
         self._update_active_result()
 
     def _on_component_changed(self, component):
+        # [WHT FIX] Field change should ensure visibility by fitting range if in Static mode
+        if self.combo_range_mode.currentText() == "Static (Fixed)":
+             # Stay in Static mode, but 'Fit' the range to the new field's global limits
+             cat = self.combo_category.currentText()
+             field_key = self._get_full_field_key(cat, component)
+             rng = self._get_field_global_range(field_key)
+             self.range_min, self.range_max = rng
+             print(f" -> [Visualizer] Field component changed to {component}. Fitting Static range to {rng}")
+             
         self._update_active_result()
+
+    def _get_field_global_range(self, field_name: str) -> Tuple[float, float]:
+        """Calculates absolute min/max for a field across all parts."""
+        rng = [float('inf'), float('-inf')]
+        for part in self.parts.values():
+            m = part["mesh"]
+            if field_name in m.point_data or field_name in m.cell_data:
+                r = m.get_data_range(field_name)
+                rng[0] = min(rng[0], r[0])
+                rng[1] = max(rng[1], r[1])
+        if rng[0] == float('inf'): return 0.0, 1.0
+        return float(rng[0]), float(rng[1])
+
+    def _get_full_field_key(self, category, component):
+        """Helper to resolve full field key used in mesh data."""
+        if category == "Body Color": return None
+        if component == "Magnitude": return f"{category}_Magnitude"
+        if component in ["X", "Y", "Z"]: return f"{category}_{component}"
+        # Stress/Strain components like VonMises, XX, etc.
+        if component in ["VonMises", "XX", "YY", "ZZ", "XY", "YZ", "ZX", "Max_Principal", "Min_Principal"]:
+            return f"{category}_{component}"
+        return category
 
     def _on_range_mode_changed(self, mode):
         """[User Request] Handles transition between Auto, Robust, and Fixed ranges."""
@@ -1536,12 +1781,49 @@ class WHTVisualizer:
         self._apply_colorbar_range()
 
     def _open_range_adjust_dialog(self):
-        """[User Request] Opens interactive slider-driven range adjustment with real-time sync."""
+        """[WHT] Range Dialog를 모달리스(Modeless)로 띄워 실시간 조작을 지원합니다."""
         field = self._get_active_field_name()
         if not field or field == "Body Color": return
         
-        dialog = WHTRangeDialog(self, field)
-        dialog.exec_()
+        # 이미 창이 열려 있다면 포커스만 이동
+        if hasattr(self, '_range_dialog') and self._range_dialog is not None:
+            if self._range_dialog.isVisible():
+                self._range_dialog.raise_()
+                self._range_dialog.activateWindow()
+                return
+
+        def get_limits():
+            total_rng = [float('inf'), float('-inf')]
+            for part in self.parts.values():
+                m = part["mesh"]
+                if field in m.point_data or field in m.cell_data:
+                    r = m.get_data_range(field)
+                    total_rng[0] = min(total_rng[0], r[0])
+                    total_rng[1] = max(total_rng[1], r[1])
+            if total_rng[0] == float('inf'): return 0.0, 1.0
+            return float(total_rng[0]), float(total_rng[1])
+
+        def get_robust(pct):
+            return self._calculate_robust_range(field, p_low=(100-pct)/2.0, p_high=100.0-(100-pct)/2.0)
+
+        # Build dummy group to sync with main UI controls
+        class DummyGroup:
+            def __init__(self, vis):
+                self.vis = vis
+                self.cmb_mode = vis.combo_range_mode
+            def get_range(self): return self.vis.range_min, self.vis.range_max
+            def get_robust_pct(self): 
+                if hasattr(self.vis, 'spin_robust_main'): return self.vis.spin_robust_main.value()
+                return 98.0
+            def set_range(self, v_min, v_max):
+                self.vis.range_min, self.vis.range_max = v_min, v_max
+                if hasattr(self.vis, 'spin_min'): self.vis.spin_min.setValue(v_min)
+                if hasattr(self.vis, 'spin_max'): self.vis.spin_max.setValue(v_max)
+                self.vis._apply_colorbar_range()
+
+        self._range_dialog = WHTRangeDialog(self, field, DummyGroup(self), get_limits, get_robust)
+        self._range_dialog.setWindowFlags(self._range_dialog.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+        self._range_dialog.show()
 
     def _update_active_result(self):
         """Synthesizes the full result name and applies it."""
