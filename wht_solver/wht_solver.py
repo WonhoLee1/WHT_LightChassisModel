@@ -655,11 +655,12 @@ class WHTSolver:
                     
                     r = np.array([s_node.x - m_node.x, s_node.y - m_node.y, s_node.z - m_node.z])
                     T = np.eye(6)
+                    # Translation components coupled to master rotation (Kinematic Coupling)
                     T[0, 4] =  r[2]; T[0, 5] = -r[1]
                     T[1, 3] = -r[2]; T[1, 5] =  r[0]
                     T[2, 3] =  r[1]; T[2, 4] = -r[0]
                     
-                    for d in range(6):
+                    for d in rbe2.dofs: # [User Request Fix] Respect specified DOFs
                         row_idx = n_spc + mpc_count
                         mpc_rows.append(row_idx); mpc_cols.append(s_idx*6 + d); mpc_vals.append(1.0)
                         for d_m in range(6):
@@ -668,6 +669,32 @@ class WHTSolver:
                                 mpc_rows.append(row_idx); mpc_cols.append(m_idx*6 + d_m); mpc_vals.append(val_t)
                         v_mpc.append(0.0)
                         mpc_count += 1
+
+        # 3. Collect RBE3 MPC Constraints (Weighted Interpolation)
+        if hasattr(self.model, 'rbe3s') and self.model.rbe3s:
+            for rbe3 in self.model.rbe3s.values():
+                m_idx = nid_to_idx.get(rbe3.master_nid)
+                if m_idx is None: continue
+                
+                weights = rbe3.weights if rbe3.weights else [1.0] * len(rbe3.slave_nids)
+                w_sum = sum(weights)
+                if abs(w_sum) < 1e-12: w_sum = 1.0
+                
+                # Equation: u_master = sum(w_i * u_slave_i) / sum(w_i)
+                # Rewritten: u_master - sum(w_i/w_sum * u_slave_i) = 0
+                for d in rbe3.dofs:
+                    row_idx = n_spc + mpc_count
+                    # Master term (Dependent)
+                    mpc_rows.append(row_idx); mpc_cols.append(m_idx*6 + d); mpc_vals.append(1.0)
+                    
+                    # Slave terms (Independent)
+                    for s_nid, w in zip(rbe3.slave_nids, weights):
+                        s_idx = nid_to_idx.get(s_nid)
+                        if s_idx is None: continue
+                        mpc_rows.append(row_idx); mpc_cols.append(s_idx*6 + d); mpc_vals.append(-w / w_sum)
+                    
+                    v_mpc.append(0.0)
+                    mpc_count += 1
 
         n_total_cons = n_spc + mpc_count
         C = coo_matrix((spc_vals + mpc_vals, (spc_rows + mpc_rows, spc_cols + mpc_cols)), 

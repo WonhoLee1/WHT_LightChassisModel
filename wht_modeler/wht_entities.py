@@ -53,6 +53,20 @@ class WHTRBE2:
 
 
 @dataclass
+class WHTRBE3:
+    """
+    RBE3 Interpolation Element.
+    The master node (dependent) displacement is a weighted average of slave nodes (independent).
+    Used to distribute loads or sense displacement without adding artificial stiffness.
+    """
+    rbe3_id: int
+    master_nid: int
+    slave_nids: List[int]
+    dofs: Tuple[int, ...] = (0, 1, 2, 3, 4, 5)
+    weights: Optional[List[float]] = None # Default is uniform weights (1.0)
+
+
+@dataclass
 class WHTProperty:
     pid: int
     type: str       # "PSHELL" | "PBEAM"

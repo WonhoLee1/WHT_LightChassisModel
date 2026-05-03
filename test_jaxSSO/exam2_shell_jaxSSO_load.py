@@ -2,19 +2,19 @@
 """
 exam2_shell_jaxSSO_load.py
 ==========================
-WHT FEM Framework — Shell Tray Static Analysis Example
+WHT FEM Framework — 쉘(Shell) 트레이 정적 해석 예제 (개선판)
 
-Overview:
+개요:
 ---------
-This script executes a high-fidelity static analysis for a structural shell tray
-under a centralized area load. It utilizes the same advanced Hook-Fold flange 
-geometry as the modal example.
+본 스크립트는 중앙 면적 하중을 받는 구조용 쉘 트레이의 정밀 정적 해석을 수행합니다.
+모드 해석 예제와 동일한 고급 훅-폴드(Hook-Fold) 플랜지 기하구조를 활용합니다.
 
-Key Features:
+주요 기능:
 -------------
-- Centralized Area Load distribution across multiple nodes.
-- High-fidelity static response (Displacement & Von-Mises Stress).
-- Comparison between different mesh types (QUAD4, TRIA3_FREE).
+- 다중 노드에 분산된 중앙 면적 하중(Area Load) 적용.
+- 고정밀 정적 응답 해석 (변위 및 본-미세스 응력).
+- 다양한 메시 타입(QUAD4, TRIA3_FREE) 간의 성능 및 정확도 비교.
+- RBE3 요소 및 WHTSelector를 활용한 고급 노드 선택 시나리오 포함.
 """
 
 import numpy as np
@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Union, Tuple
 
 from wht_modeler.wht_mesh_model import WHTMeshModel
+from wht_modeler.wht_selector import WHTSelector
 from wht_solver.wht_solver import WHTSolver
 from wht_solver.load_cases import WHTLoadCase
 from wht_visualizer.wht_visualizer import WHTVisualizer
@@ -31,233 +32,156 @@ from mesh_utils import generate_shell_tray
 
 
 # ==============================================================================
-# 0. CONFIGURATION & SCHEMA
+# 0. 설정 및 데이터 스키마 (CONFIGURATION & SCHEMA)
 # ==============================================================================
 
 @dataclass
 class PipelineConfig:
     """
-    Unified settings for the Shell Tray Static Pipeline.
+    쉘 트레이 정적 해석 파이프라인을 위한 통합 설정 클래스입니다.
     """
-    # Geometry Dimensions [mm]
     width:  float = 1800.0
     length: float = 1200.0
     height: float = 35.0
     thickness: float = 0.5
-    
-    # Mesh Control [mm]
     mesh_type: str = 'quad4'
     mesh_size_xy: float = 60.0
     mesh_size_z:  float = 10.0
     draft_angle:  float = 35.0
-    
-    # Flange Configuration
     flanges: tuple = (False, True, True, True) 
     flange_segments: List[Tuple[float, float]] = field(default_factory=list)
-    
-    # Static Load Settings
-    load_area_size: float = 200.0     # Square area side length [mm]
-    total_force: float = 100.0        # Total downward force [N]
-    
-    # Material (Steel)
+    load_area_size: float = 200.0
+    total_force: float = 100.0
     E: float = 210000.0
     nu: float = 0.3
     rho: float = 7.85e-9
 
 
 # ==============================================================================
-# 1. CORE PIPELINE FUNCTIONS
+# 1. 핵심 파이프라인 함수 (CORE PIPELINE FUNCTIONS)
 # ==============================================================================
 
 def build_structural_model(cfg: PipelineConfig) -> Tuple[WHTMeshModel, Dict]:
-    """Generates geometry and applies boundary conditions for static analysis."""
-    print(f" -> Generating Geometry [{cfg.mesh_type.upper()}] with Hook-Flanges...")
-    
-    # 1.1 Generate Raw Mesh
+    """기하구조를 생성하고 WHT 모델을 조립합니다."""
+    print(f" -> 기하구조 생성 중 [{cfg.mesh_type.upper()}]...")
     node_db, elem_db = generate_shell_tray(
         width=cfg.width, length=cfg.length, height=cfg.height,
         mesh_size_xy=cfg.mesh_size_xy, mesh_size_z=cfg.mesh_size_z,
         draft_angle=cfg.draft_angle, flange_segments=cfg.flange_segments,
         flanges=cfg.flanges, mesh_type=cfg.mesh_type
     )
-    
-    # 1.2 Convert to WHT Model
     model = WHTMeshModel.from_node_elem_db(node_db, elem_db)
     MID, PID = 1, 1
     model.add_material(MID, E=cfg.E, nu=cfg.nu, rho=cfg.rho)
     model.add_property(PID, "PSHELL", cfg.thickness, MID)
+    for elem in model.elements.values(): elem.pid = PID
     
-    for elem in model.elements.values():
-        elem.pid = PID
-    
-    # 1.3 Apply Boundary Conditions (Fix all DOFs at the top rim/flange)
-    # The rim points end at cumulative height.
-    fixed_count = 0
+    # 상단 림 고정 (SPC)
     max_z = cfg.height + sum([seg[1] for seg in cfg.flange_segments])
-    for nid, node in model.nodes.items():
-        if abs(node.z - max_z) < 0.1:
-            model.apply_spc(nid, (0, 1, 2, 3, 4, 5))
-            fixed_count += 1
-    print(f"    [BC] Constrained {fixed_count} nodes at top flange.")
-            
+    rim_nids = WHTSelector(model).by_box(z=(max_z - 0.1, max_z + 0.1)).get_ids()
+    model.apply_spc(rim_nids, (0, 1, 2, 3, 4, 5))
+    print(f"    [경계조건] 최상단 림 노드 {len(rim_nids)}개 고정.")
     return model, node_db
 
 
 def evaluate_static_response(model: WHTMeshModel, cfg: PipelineConfig):
-    """Defines area load and solves the static system."""
-    solver = WHTSolver(model)
-    lc = WHTLoadCase("AreaLoad")
-    
-    # 2.1 Find nodes in center area for distributed load
-    area_dim = cfg.load_area_size
-    target_nodes = []
-    # If using 'center' origin in generation, x0/y0 are handled. 
-    # Here we assume current generate_shell_tray uses default origin.
-    # We look for nodes near (width/2, length/2)
-    for nid, node in model.nodes.items():
-        if (abs(node.x - cfg.width/2) <= area_dim/2 and 
-            abs(node.y - cfg.length/2) <= area_dim/2 and 
-            node.z < 1.0):
-            target_nodes.append(nid)
+    """중앙 영역 하중 해석을 수행합니다."""
+    # Selector를 사용하여 중앙 영역 노드 선택
+    cx, cy = cfg.width / 2.0, cfg.length / 2.0
+    half_s = cfg.load_area_size / 2.0
+    target_nodes = (WHTSelector(model)
+                    .by_box(x=(cx - half_s, cx + half_s), 
+                            y=(cy - half_s, cy + half_s), 
+                            z=(-0.1, 1.0))
+                    .get_ids())
     
     if not target_nodes:
-        # Fallback to single center node
-        center_nid = min(model.nodes.keys(), key=lambda n: (model.nodes[n].x - cfg.width/2)**2 + (model.nodes[n].y - cfg.length/2)**2)
-        target_nodes = [center_nid]
-        print(f" <!> No nodes in {area_dim}mm area. Falling back to center point.")
+        target_nodes = [min(model.nodes.keys(), key=lambda n: (model.nodes[n].x - cx)**2 + (model.nodes[n].y - cy)**2)]
     
+    lc = WHTLoadCase("AreaLoad")
     force_per_node = -cfg.total_force / len(target_nodes)
-    print(f" -> Applying {cfg.total_force}N over {len(target_nodes)} nodes (Area: {area_dim}sq).")
+    for nid in target_nodes: lc.add_force(nid, (2,), (force_per_node,))
     
-    for nid in target_nodes:
-        lc.add_force(nid, (2,), (force_per_node,))
-    
+    solver = WHTSolver(model)
     return solver.solve_static(lc)
 
 
 def evaluate_static_response_twist(model: WHTMeshModel, cfg: PipelineConfig):
     """
-    Executes a torsion test (Twist) using RBE2 master nodes.
-    - Clears existing rim BCs to allow torsion.
-    - Left side: Rigidly connected to a master node, all 6 DOFs fixed.
-    - Right side: Rigidly connected to a master node, rotated 10 deg around X-axis.
+    RBE3 및 WHTSelector를 활용한 비틀림(Twist) 테스트 시나리오입니다.
+    Selector를 체이닝하여 복잡한 선택 로직을 직관적으로 구현합니다.
     """
     print("\n" + "-"*80)
-    print(" -> [Twist Scenario] Setting up Torsion Test with RBE2 Master Nodes...")
+    print(" -> [비틀림 시나리오] WHTSelector를 활용한 정밀 노드 선택 중...")
     print("-"*80)
     
-    # [CRITICAL] Clear existing SPCs (like Rim BC) so the load can pass through the plate
-    old_spc_count = len(model.spc_conditions)
-    model.spc_conditions = []
-    print(f"    [Setup] Cleared {old_spc_count} existing SPCs to enable pure torsion.")
+    model.spc_conditions = [] # 기존 SPC 제거
     
-    # 1. Identify Left and Right boundary nodes (Xmin, Xmax)
     nodes_arr = model.nodes_array()
     xmin, xmax = nodes_arr[:, 0].min(), nodes_arr[:, 0].max()
+    ymin, ymax = nodes_arr[:, 1].min(), nodes_arr[:, 1].max()
+    zmax = nodes_arr[:, 2].max()
     
-    left_slave_nids = [nid for nid, node in model.nodes.items() if abs(node.x - xmin) < 0.1]
-    right_slave_nids = [nid for nid, node in model.nodes.items() if abs(node.x - xmax) < 0.1]
+    # 좌측 시드 (Xmin, Ymin, Zmax 부근)
+    seed_l = min(model.nodes.keys(), key=lambda n: (model.nodes[n].x - xmin)**2 + (model.nodes[n].y - ymin)**2 + (model.nodes[n].z - zmax)**2)
+    seed_r = min(model.nodes.keys(), key=lambda n: (model.nodes[n].x - xmax)**2 + (model.nodes[n].y - ymin)**2 + (model.nodes[n].z - zmax)**2)
     
-    # 2. Add Master Nodes at centers of X-ends
-    # We'll use high IDs for master nodes to avoid conflict
-    max_id = max(model.nodes.keys())
-    m_left_id = max_id + 1
-    m_right_id = max_id + 2
+    y_range = (ymin + (ymax-ymin)*0.2, ymax - (ymax-ymin)*0.2) # 중앙 60% 영역
+    z_flange_min = cfg.height - 1.0 
     
-    y_mid = (nodes_arr[:, 1].max() + nodes_arr[:, 1].min()) / 2.0
-    z_mid = (nodes_arr[:, 2].max() + nodes_arr[:, 2].min()) / 2.0
+    # --- [WHTSelector 체이닝 적용] ---
+    # 1. 시드로부터 림 경로(Path) 추출 -> 2. Y 영역 필터링(Box) -> 3. 전체 플랜지 단면 확장(Face Curvature)
+    left_slave_nids = (WHTSelector(model)
+                       .by_path(seed_l, angle_limit_deg=20.0)
+                       .by_box(y=y_range)
+                       .expand_by_face(angle_limit_deg=30.0, z_min=z_flange_min)
+                       .get_ids())
+                       
+    right_slave_nids = (WHTSelector(model)
+                        .by_path(seed_r, angle_limit_deg=20.0)
+                        .by_box(y=y_range)
+                        .expand_by_face(angle_limit_deg=30.0, z_min=z_flange_min)
+                        .get_ids())
     
-    model.add_node(m_left_id, xmin, y_mid, z_mid)
-    model.add_node(m_right_id, xmax, y_mid, z_mid)
+    print(f"    [선택] Selector 체이닝 결과: 좌측 {len(left_slave_nids)}개, 우측 {len(right_slave_nids)}개 선택됨.")
     
-    # 3. Add RBE2 Rigid Elements
-    # rbe2_id starts from a high range
-    model.add_rbe2(900, m_left_id, left_slave_nids)
-    model.add_rbe2(901, m_right_id, right_slave_nids)
+    # 마스터 노드 추가 및 RBE3 설정
+    l_mid = np.mean([model.nodes[n].coords() for n in left_slave_nids], axis=0)
+    r_mid = np.mean([model.nodes[n].coords() for n in right_slave_nids], axis=0)
     
-    # 4. Setup Load Case with Prescribed Twist
+    m_left_id, m_right_id = max(model.nodes.keys()) + 1, max(model.nodes.keys()) + 2
+    model.add_node(m_left_id, l_mid[0], l_mid[1], l_mid[2])
+    model.add_node(m_right_id, r_mid[0], r_mid[1], r_mid[2])
+    
+    model.add_rbe3(900, m_left_id, left_slave_nids)
+    model.add_rbe3(901, m_right_id, right_slave_nids)
+    
     lc = WHTLoadCase("Twist_10deg_X")
-    
-    # Left Master: All 6 DOFs fixed to zero
     lc.add_bc(m_left_id, (0, 1, 2, 3, 4, 5), 0.0)
-    
-    # Right Master: Twist 10 deg around X (DOF 3)
-    # Note: DOF indices are 0..5. Rotation around X is DOF 3.
-    # Degrees to Radians: 10 * pi / 180
-    angle_rad = 10.0 * np.pi / 180.0
-    
-    # Request says: "오른쪽 노드는 x축 회전으로 10도 비튼다. 다른 자유도는 고정한다."
-    # So DOFs 0,1,2, 4,5 are fixed to 0.0, and DOF 3 is fixed to angle_rad.
     lc.add_bc(m_right_id, (0, 1, 2, 4, 5), 0.0)
-    lc.add_bc(m_right_id, (3,), angle_rad)
-    
-    print(f"    [Setup] RBE2 Left: master {m_left_id} with {len(left_slave_nids)} slaves.")
-    print(f"    [Setup] RBE2 Right: master {m_right_id} with {len(right_slave_nids)} slaves.")
-    print(f"    [BC] Applied +10 deg rotation to master {m_right_id}.")
+    lc.add_bc(m_right_id, (3,), 10.0 * np.pi / 180.0)
 
     solver = WHTSolver(model)
-    result = solver.solve_static(lc)
-    
-    # 5. Output Reaction Forces (6-DOFs)
-    reac_l = result.reaction_force(m_left_id)
-    reac_r = result.reaction_force(m_right_id)
-    
-    print("\n" + "="*80)
-    print(f" {'[WHT] Torsion Test Reaction Forces':^78}")
-    print("="*80)
-    labels = ["Fx(N)", "Fy(N)", "Fz(N)", "Mx(Nmm)", "My(Nmm)", "Mz(Nmm)"]
-    
-    print(f" Master Node Path | {' | '.join([f'{l:>10}' for l in labels])}")
-    print("-" * 110)
-    row_l = f" Left (Fixed)     | " + " | ".join([f"{v:10.2e}" for v in reac_l])
-    row_r = f" Right (Twisted)  | " + " | ".join([f"{v:10.2e}" for v in reac_r])
-    print(row_l)
-    print(row_r)
-    print("="*110 + "\n")
-    
-    return result
+    return solver.solve_static(lc)
 
-
-# ==============================================================================
-# 2. ANALYSIS EXECUTION & REPORTING
-# ==============================================================================
 
 def print_result_table(all_results: Dict[str, any]):
+    """해석 결과를 요약 출력합니다."""
     print("\n" + "#"*95)
-    print(" #  STATIC ANALYSIS COMPARISON SUMMARY                                                        #")
+    print(" #  정적 해석 결과 비교 요약 (WHTSelector 적용)                                                #")
     print("#"*95)
-    header = f"  {'Mesh Type':<15} | {'Nodes':<10} | {'Max Uz (mm)':<15} | {'Max Stress (MPa)':<15} | {'Diff%'}"
-    print(header)
+    print(f"  {'메시 타입':<15} | {'노드 수':<10} | {'최대 Uz (mm)':<15} | {'최대 응력 (MPa)':<15}")
     print("-" * 95)
-    
-    ref_val = None
     for mtype, res in all_results.items():
         if res is None: continue
-        
         max_uz = np.abs(res.displacement[:, 2]).max()
-        # Access stress diagnostic if available
         max_vm = getattr(res, '_max_vm_diagnostic', 0.0)
-        
-        if ref_val is None:
-            ref_val = max_uz
-            diff_pct = 0.0
-        else:
-            diff_pct = (max_uz - ref_val) / ref_val * 100.0
-            
-        print(f"  {mtype.upper():<15} | {res.displacement.shape[0]:<10} | {max_uz:15.5f} | {max_vm:15.5f} | {diff_pct:8.2f}%")
+        print(f"  {mtype.upper():<15} | {res.displacement.shape[0]:<10} | {max_uz:15.5f} | {max_vm:15.5f}")
     print("-" * 95)
 
 
 def main():
-    # --- STEP 1: Hook-Fold Design ---
-    hook_sequence = [
-        ( 0.0,  12.0), # 1. 상승
-        (-5.0,   0.0), # 2. 내측
-        ( 0.0, -10.0), # 3. 하락
-        (-10.0,  0.0)  # 4. 내측
-    ]
-    
-    # --- STEP 2: Scenarios ---
+    hook_sequence = [(0, 12), (-5, 0), (0, -10), (-10, 0)]
     test_suite = [
         PipelineConfig(mesh_type='quad4', flange_segments=hook_sequence),
         PipelineConfig(mesh_type='tria3_free', flange_segments=hook_sequence),
@@ -267,56 +191,26 @@ def main():
     vis_queue = []
     
     for cfg in test_suite:
-        print("\n" + "="*80)
-        print(f" [RUN] Static Load Analysis - {cfg.mesh_type.upper()}")
-        print("="*80)
         try:
             model, _ = build_structural_model(cfg)
             result = evaluate_static_response(model, cfg)
             all_summary[cfg.mesh_type] = result
-            
-            # Prepare for visualization
-            meta = WHTMetadata(
-                solver_name="JaxSSO", solver_version="2.1.0",
-                analysis_type="static", coordinate_system="cartesian",
-                unit_length="mm", unit_force="N"
-            )
-            vis_queue.append((cfg, result, model, meta))
-            
+            vis_queue.append((cfg, result, model))
         except Exception:
-            print(f"\n[ERROR] {cfg.mesh_type} failed.")
             traceback.print_exc()
-            all_summary[cfg.mesh_type] = None
 
-    # --- STEP 3: Reporting ---
     print_result_table(all_summary)
-
-    # --- STEP 4: Twist Scenario (New Request) ---
-    cfg_twist = PipelineConfig(mesh_type='quad4', mesh_size_xy=60.0) 
-    model_twist, _ = build_structural_model(cfg_twist)
-    result_twist = evaluate_static_response_twist(model_twist, cfg_twist)
     
-    # Add to visualization queue
-    meta_twist = WHTMetadata(
-        solver_name="JaxSSO", solver_version="2.1.0",
-        analysis_type="static", coordinate_system="cartesian",
-        unit_length="mm", unit_force="N"
-    )
-    vis_queue.append((cfg_twist, result_twist, model_twist, meta_twist))
-
-    # --- STEP 5: Visualization ---
-    if vis_queue:
-        print("\n -> Launching WHT Visualizer for results...")
-        # We'll visualize the Twist result (last in queue)
-        cfg_v, res_v, model_v, meta_v = vis_queue[-1] 
-        wht_data = res_v.to_wht_result_data(meta_v, model_v)
-        
-        viz = WHTVisualizer(title=f"Static Analysis - {cfg_v.mesh_type.upper()} ({res_v.analysis_type})", show=True)
-        viz.load_results(wht_data, color="black")
-        viz.plotter.view_isometric()
-        if hasattr(viz.plotter, 'app'):
-            viz.plotter.app.exec_()
-
+    # 비틀림 시나리오 실행
+    cfg_t = test_suite[0]
+    model_t, _ = build_structural_model(cfg_t)
+    result_t = evaluate_static_response_twist(model_t, cfg_t)
+    
+    # 시각화
+    viz = WHTVisualizer(title="WHTSelector 기반 비틀림 해석 결과", show=True)
+    meta = WHTMetadata(solver_name="JaxSSO", analysis_type="static", unit_length="mm", unit_force="N")
+    viz.load_results(result_t.to_wht_result_data(meta, model_t))
+    if hasattr(viz.plotter, 'app'): viz.plotter.app.exec_()
 
 if __name__ == "__main__":
     main()

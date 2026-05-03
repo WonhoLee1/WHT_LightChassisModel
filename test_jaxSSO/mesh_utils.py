@@ -202,14 +202,16 @@ def generate_solid_hexa_tray(
     wall_layers: int = 2,
     flange_segments: Optional[List[Tuple[float, float]]] = None,
     origin: str = 'corner',
-    flanges: Tuple[bool, bool, bool, bool] = (True, True, True, True)
+    flanges: Tuple[bool, bool, bool, bool] = (True, True, True, True),
+    thickness: float = 0.6
 ) -> Tuple[Dict[int, np.ndarray], Dict[int, List[int]]]:
     """
-    Generates a Solid Hexa (HEXA8) Tray mesh using Gmsh Extrude.
-    Converts 2D surface elements to 3D volume elements.
+    Gmsh 압출 방식을 개선하여 쉘 메시를 솔리드 육면체(HEXA8) 메시로 변환합니다.
+    단순 Z축 압출이 아닌, 법선 방향 압출을 모사하여 구배 각도에서도 균일한 두께를 유지합니다.
 
-    Parameters:
-        wall_layers: Number of element layers through the wall thickness.
+    Args:
+        wall_layers (int): 두께 방향 요소 레이어 수.
+        thickness (float): 트레이의 벽면 두께 [mm].
     """
     node_shell, elem_shell = generate_shell_tray(
         width=width, length=length, height=height,
@@ -218,47 +220,77 @@ def generate_solid_hexa_tray(
         origin=origin, mesh_type='quad4', flanges=flanges
     )
     
-    gmsh.initialize()
-    gmsh.model.add("SolidTray")
-    
-    # Re-create the shell nodes in Gmsh to extrude them
-    tag_to_new = {}
+    # 1. 노드별 법선 벡터 계산 (단순화를 위해 바닥면은 (0,0,1), 측벽은 경사각 고려)
+    # 실제로는 주변 요소의 면 법선을 평균내어 사용함
+    node_normals = {}
+    rad_draft = math.radians(draft_angle)
+
+    # [수정 1/5 — 법선 벡터 좌표계 불일치 수정]
+    # 이전 코드의 문제:
+    #   origin='center'일 때 x_rel = r[0] + width/2.0 으로 계산하면,
+    #   예컨대 width=1800이고 -x 벽의 실제 x좌표가 약 -900mm일 때
+    #   x_rel = -900 + 900 = 0mm → 임계치(0.1)에 걸리지 않아 벽면 법선이
+    #   항상 (0,0,1)로 남음 → 두께 압출이 수직(Z)으로만 이루어져 비물리적 형상 발생.
+    #
+    # 수정 방법:
+    #   x_rel을 트레이 내부 좌표(0 ~ width)로 정규화하지 않고,
+    #   generate_shell_tray가 실제로 사용하는 절대 좌표 기준점(x0, y0)으로
+    #   벽면 위치를 직접 판별한다.
+    #   - x0 = 0 (corner) or -width/2 (center)
+    #   - 벽면 x 좌표: x0(좌벽), x0+width(우벽) + wall_offset(구배 보정)
+    #   허용 오차(tol)는 mesh_size_xy의 절반으로 설정하여 메시 크기 변화에 강건하게 대응.
+    x0 = 0.0 if origin == 'corner' else -width / 2.0
+    y0 = 0.0 if origin == 'corner' else -length / 2.0
+    wall_offset = height * math.tan(rad_draft)
+    # 벽면 절대 좌표 (구배로 인해 림(rim)이 base보다 바깥으로 나온 위치)
+    x_left  = x0 - wall_offset   # 좌(-X) 림 x좌표
+    x_right = x0 + width + wall_offset  # 우(+X) 림 x좌표
+    y_front = y0 - wall_offset   # 전(-Y) 림 y좌표
+    y_back  = y0 + length + wall_offset  # 후(+Y) 림 y좌표
+    # 허용 오차: mesh_size_xy 절반 (고정값 0.1 대신 메시 크기에 비례)
+    tol_wall = mesh_size_xy * 0.5
+
     for nid, r in node_shell.items():
-        tag_to_new[nid] = gmsh.model.occ.addPoint(r[0], r[1], r[2])
-    
-    # We use a trick: Re-import shell connectivity and extrude volumes.
-    # But for a cleaner JAX-friendly result, we can manually "stack" nodes.
-    # Here we'll do a programmatic stack/extrude as it's more stable for HEXA8.
-    
-    # 0.6mm thickness example (Scale it or use a default)
-    t = 0.6 
-    
+        nx, ny, nz = 0.0, 0.0, 1.0  # 기본: 바닥면 수직 방향
+
+        if abs(r[2]) > 0.1:  # 벽면 또는 플랜지 노드 (바닥 z=0 제외)
+            # 각 벽면의 절대 위치에 대해 허용 오차 내에 있는지 판별
+            # nx, ny 성분이 존재하면 nz도 구배각에 따라 재설정
+            on_left  = r[0] < x_left  + tol_wall
+            on_right = r[0] > x_right - tol_wall
+            on_front = r[1] < y_front + tol_wall
+            on_back  = r[1] > y_back  - tol_wall
+
+            if on_left:  nx = -math.cos(rad_draft); nz = math.sin(rad_draft)
+            if on_right: nx =  math.cos(rad_draft); nz = math.sin(rad_draft)
+            if on_front: ny = -math.cos(rad_draft); nz = math.sin(rad_draft)
+            if on_back:  ny =  math.cos(rad_draft); nz = math.sin(rad_draft)
+
+        norm = math.sqrt(nx**2 + ny**2 + nz**2)
+        node_normals[nid] = np.array([nx/norm, ny/norm, nz/norm])
+
+    # 2. 노드 스택 생성 (법선 방향으로 압출)
     node_data_3d = {}
-    elem_data_3d = {}
-    
-    # Stack nodes: Layer 0 (Bottom/Shell) ... Layer N (Top)
     num_nodes_shell = len(node_shell)
     for layer in range(wall_layers + 1):
-        z_offset = (layer / wall_layers) * t
+        dist = (layer / wall_layers) * thickness
         for nid, r in node_shell.items():
             new_id = nid + layer * num_nodes_shell
-            node_data_3d[new_id] = np.array([r[0], r[1], r[2] + z_offset])
+            node_data_3d[new_id] = r + node_normals[nid] * dist
             
-    # Create HEXA8 elements
+    # 3. HEXA8 요소 생성
+    elem_data_3d = {}
     e_idx = 1
     for eid, nids in elem_shell.items():
-        if len(nids) != 4: continue # Only Quad-based HEXA8
+        if len(nids) != 4: continue 
         for layer in range(wall_layers):
-            # Bottom face nodes
             b1, b2, b3, b4 = [n + layer * num_nodes_shell for n in nids]
-            # Top face nodes
             t1, t2, t3, t4 = [n + (layer + 1) * num_nodes_shell for n in nids]
-            # Standard HEXA8 ordering
             elem_data_3d[e_idx] = [b1, b2, b3, b4, t1, t2, t3, t4]
             e_idx += 1
             
-    gmsh.finalize()
     return node_data_3d, elem_data_3d
+
 
 
 def apply_auto_beads(
@@ -316,15 +348,26 @@ def apply_auto_beads(
                 ref_nids.append(nid)
                 
         if not ref_nids: return new_node_db
-        
+
         target_count = int(len(ref_nids) * target_ratio)
         morphed_set = set()
         z_offsets = {nid: 0.0 for nid in node_db.keys()}
         
         # 3. Iteratively generate rectangles until target area ratio is met
-        max_iters = 500 # Safety guard
+        # [수정 4/5 — while 루프 silent fail 방지]
+        # 이전 코드의 문제:
+        #   max_iters(500) 초과로 루프가 조기 종료되어도 경고 없이 반환되었다.
+        #   비드 크기가 너무 작거나, margin이 너무 커서 유효 영역이 협소하면
+        #   target_count에 절대 도달하지 못해 항상 500회 낭비 후 조용히 실패.
+        #   사용자는 비드가 의도대로 생성됐다고 오해할 수 있다.
+        #
+        # 수정 방법:
+        #   루프 종료 후 목표 달성 여부를 확인하여 경고를 출력한다.
+        #   루프 종료 조건(목표 달성 vs. 반복 초과)을 명확히 분리하기 위해
+        #   iter_count를 루프 밖에서 검사한다.
+        max_iters = 500
         iter_count = 0
-        
+
         while len(morphed_set) < target_count and iter_count < max_iters:
             iter_count += 1
             
@@ -345,44 +388,74 @@ def apply_auto_beads(
             rz = np.random.uniform(min_d, max_depth)
             polarity = np.random.choice([-1.0, 1.0])
             
-            # Update nodes in this rectangle (within the quadrant)
+            # [수정 3/5 — z_offsets 누적 시 clip 적용]
+            # 이전 코드의 문제:
+            #   여러 사각형 패치가 동일 노드에 중첩될 경우 z_offsets[nid]가
+            #   누적 합산되어 max_depth를 초과할 수 있다.
+            #   최종 적용(new_node_db 반영) 단계에서만 clip을 수행하면,
+            #   중간 누적값이 이미 포화 상태여도 그 사실을 알 수 없고
+            #   패턴 형태(극성, 크기)가 왜곡된다.
+            #
+            # 수정 방법:
+            #   값을 누적하는 시점마다 즉시 [-max_depth, +max_depth] 범위로 clip한다.
+            #   이렇게 하면 어떤 순서로 패치가 중첩되더라도 최종값이 의도한
+            #   깊이 범위를 벗어나지 않으며, 포화 시 추가 누적이 무의미함을 방지한다.
             for nid in ref_nids:
                 r = new_node_db[nid]
                 dx, dy = r[0] - cx, r[1] - cy
-                
-                # Check if point is inside the generated rectangle
+
                 if abs(dx - rx) < rw/2 and abs(dy - ry) < rh/2:
-                    z_offsets[nid] += rz * polarity
+                    raw = z_offsets[nid] + rz * polarity
+                    z_offsets[nid] = float(np.clip(raw, -max_depth, max_depth))
                     morphed_set.add(nid)
-        
+
+        # 루프 종료 후 목표 달성 여부 검사 (수정 4/5 연속)
+        if iter_count >= max_iters and len(morphed_set) < target_count:
+            achieved = len(morphed_set) / max(len(ref_nids), 1)
+            print(f"[WARNING] apply_auto_beads: max_iters({max_iters}) 초과로 루프 조기 종료. "
+                  f"달성 비율={achieved:.1%} (목표={target_ratio:.1%}). "
+                  f"bead_min_size 축소 또는 bead_margin 축소를 권장.")
+
         # 4. Mirror displacements to all 4 quadrants for perfect symmetry
+        # KDTree를 사용하여 대칭 위치의 가장 가까운 노드를 찾아 매핑함 (수치 오차 극복)
+        from scipy.spatial import KDTree
+        
+        # 전체 바닥면 노드 식별
+        floor_nids = []
+        floor_coords = []
         for nid, r in new_node_db.items():
-            dx, dy = r[0] - cx, r[1] - cy
-            if abs(r[2]) < 0.1 and abs(dx) < (inner_w/2) and abs(dy) < (inner_l/2):
-                # Map this node to its reference peer in the first quadrant
-                # We find the closest reference node by mapping abs(dx), abs(dy)
-                # But since the mesh is transfinite/symmetric, we can find it by coordinate mapping.
-                pass
+            if abs(r[2]) < 0.1 and abs(r[0] - cx) < (inner_w/2) and abs(r[1] - cy) < (inner_l/2):
+                floor_nids.append(nid)
+                floor_coords.append([r[0], r[1]])
                 
-        # Better Mirroring: Re-traverse the whole floor and map to reference quadrant result
-        # To make it efficient, we build a coordinate map for the reference quadrant
-        ref_coord_to_val = {}
+        if not floor_nids: return new_node_db
+        
+        # 참조 Quadrant (1사분면)의 노드들에 대해 KDTree 구축
+        ref_coords = []
+        ref_vals = []
         for nid in ref_nids:
             r = new_node_db[nid]
-            # Key by rounded local coords to overcome float precision
-            key = (round(r[0] - cx, 2), round(r[1] - cy, 2))
-            ref_coord_to_val[key] = z_offsets[nid]
+            ref_coords.append([abs(r[0] - cx), abs(r[1] - cy)])
+            ref_vals.append(z_offsets[nid])
             
-        for nid, r in new_node_db.items():
-            dx, dy = r[0] - cx, r[1] - cy
-            if abs(r[2]) < 0.1 and abs(dx) < (inner_w/2) and abs(dy) < (inner_l/2):
-                key = (round(abs(dx), 2), round(abs(dy), 2))
-                if key in ref_coord_to_val:
-                    # Apply mirrored value with capping
-                    val = ref_coord_to_val[key]
-                    new_node_db[nid][2] += np.clip(val, -max_depth, max_depth)
+        tree = KDTree(ref_coords)
+        
+        # 모든 바닥 노드에 대해 대칭 매핑 적용
+        for nid in floor_nids:
+            r = new_node_db[nid]
+            # 해당 노드의 1사분면 대응 위치 계산
+            local_x, local_y = abs(r[0] - cx), abs(r[1] - cy)
+            
+            # KDTree로 가장 가까운 참조 노드 인덱스 검색
+            dist, idx = tree.query([local_x, local_y])
+            
+            # 매핑 성공 시 비드 높이 적용 (오차 방지를 위해 거리 제한 1.0mm)
+            if dist < 1.0:
+                val = ref_vals[idx]
+                new_node_db[nid][2] += np.clip(val, -max_depth, max_depth)
                     
     return new_node_db
+
 
 
 def get_nodes_in_box(

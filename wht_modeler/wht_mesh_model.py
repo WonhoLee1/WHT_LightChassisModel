@@ -16,7 +16,7 @@ import numpy as np
 
 from .wht_entities import (
     WHTNode, WHTElement, WHTNodeSet, WHTElemSet,
-    WHTRBE2, WHTProperty, WHTMaterial,
+    WHTRBE2, WHTRBE3, WHTProperty, WHTMaterial,
     WHTSPCEntry, WHTLoadEntry,
 )
 
@@ -45,6 +45,7 @@ class WHTMeshModel:
 
         # Rigid elements
         self.rbe2s: Dict[int, WHTRBE2] = {}
+        self.rbe3s: Dict[int, WHTRBE3] = {}
 
         # Properties / Materials
         self.properties: Dict[int, WHTProperty] = {}
@@ -145,6 +146,23 @@ class WHTMeshModel:
                 return es.elem_ids
         raise KeyError(f"Element set with name '{name}' not found.")
 
+    def get_nodes_from_elem_set(self, sid: int) -> List[int]:
+        """Returns unique node IDs belonging to all elements in the set."""
+        if sid not in self.elem_sets:
+            raise KeyError(f"Element set {sid} not found.")
+        nids = set()
+        for eid in self.elem_sets[sid].elem_ids:
+            if eid in self.elements:
+                nids.update(self.elements[eid].node_ids)
+        return sorted(list(nids))
+
+    def get_nodes_from_elem_set_name(self, name: str) -> List[int]:
+        """Returns unique node IDs belonging to all elements in the set by name."""
+        for sid, es in self.elem_sets.items():
+            if es.name == name:
+                return self.get_nodes_from_elem_set(sid)
+        raise KeyError(f"Element set name '{name}' not found.")
+
     # ------------------------------------------------------------------
     # RBE2
     # ------------------------------------------------------------------
@@ -166,6 +184,20 @@ class WHTMeshModel:
 
     def get_rbe2_masters(self) -> List[int]:
         return [r.master_nid for r in self.rbe2s.values()]
+
+    # ------------------------------------------------------------------
+    # RBE3
+    # ------------------------------------------------------------------
+
+    def add_rbe3(
+        self,
+        rbe3_id: int,
+        master_nid: int,
+        slave_nids: List[int],
+        dofs: Tuple[int, ...] = (0, 1, 2, 3, 4, 5),
+        weights: Optional[List[float]] = None,
+    ) -> None:
+        self.rbe3s[rbe3_id] = WHTRBE3(rbe3_id, master_nid, list(slave_nids), dofs, weights)
 
     # ------------------------------------------------------------------
     # Boundary Conditions
@@ -248,6 +280,19 @@ class WHTMeshModel:
     def node_id_to_index(self) -> Dict[int, int]:
         """Returns {nid: 0-based index} mapping for sorted node IDs."""
         return {nid: i for i, nid in enumerate(self.sorted_node_ids())}
+
+    def get_adjacency(self) -> Dict[int, List[int]]:
+        """Returns {nid: [neighbor_nids]} mapping based on element connectivity."""
+        adj = {nid: set() for nid in self.nodes.keys()}
+        for elem in self.elements.values():
+            nids = elem.node_ids
+            for i, nid in enumerate(nids):
+                # Add previous and next nodes in the element loop
+                prev_n = nids[i - 1]
+                next_n = nids[(i + 1) % len(nids)]
+                adj[nid].add(prev_n)
+                adj[nid].add(next_n)
+        return {nid: sorted(list(neighbors)) for nid, neighbors in adj.items()}
 
     @property
     def n_nodes(self) -> int:
@@ -381,30 +426,36 @@ class WHTMeshModel:
         """
         Exports the current mesh and sets to industrial solver formats.
         :param solver_type: 'lsdyna', 'radioss', or 'optistruct'
-        :param path: Destination file path
-        :param reorder: If True, reorders IDs sequentially (1..N)
         """
         from wht_converter.wht_exporters_industrial import LSDYNAExporter, RadiossExporter, OptistructExporter
-        
-        exporters = {
-            'lsdyna': LSDYNAExporter,
-            'radioss': RadiossExporter,
-            'optistruct': OptistructExporter,
-            'nastran': OptistructExporter,
-            'fem': OptistructExporter
-        }
-        
-        st_lower = solver_type.lower()
-        if st_lower not in exporters:
-            available = list(exporters.keys())
-            raise ValueError(f"Unsupported solver type: {solver_type}. Available: {available}")
-            
-        exporter = exporters[st_lower]()
-        exporter.export(self, path, reorder=reorder)
+        if solver_type.lower() == 'lsdyna':
+            LSDYNAExporter().export(self, path, reorder)
+        elif solver_type.lower() == 'radioss':
+            RadiossExporter().export(self, path, reorder)
+        elif solver_type.lower() == 'optistruct':
+            OptistructExporter().export(self, path, reorder)
+        else:
+            raise ValueError(f"Unknown solver type: {solver_type}")
+
+    @classmethod
+    def import_from_solver(cls, solver_type: str, path: str) -> "WHTMeshModel":
+        """
+        Imports mesh and sets from industrial solver formats.
+        :param solver_type: 'lsdyna', 'radioss', or 'optistruct'
+        """
+        from wht_converter.wht_importers_industrial import LSDYNAImporter, RadiossImporter, OptistructImporter
+        if solver_type.lower() == 'lsdyna':
+            return LSDYNAImporter().read(path)
+        elif solver_type.lower() == 'radioss':
+            return RadiossImporter().read(path)
+        elif solver_type.lower() == 'optistruct':
+            return OptistructImporter().read(path)
+        else:
+            raise ValueError(f"Unknown solver type: {solver_type}")
 
     def __repr__(self) -> str:
         return (
             f"WHTMeshModel(name='{self.name}', "
             f"nodes={self.n_nodes}, elements={self.n_elements}, "
-            f"sets={len(self.node_sets)}, rbe2s={len(self.rbe2s)})"
+            f"sets={len(self.node_sets)}, rbe2s={len(self.rbe2s)}, rbe3s={len(self.rbe3s)})"
         )

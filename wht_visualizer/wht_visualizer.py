@@ -237,7 +237,7 @@ class WHTVisualizer:
         pv.global_theme.font.color = 'white'
         pv.global_theme.font.size = 12
         pv.global_theme.show_edges = True
-        pv.global_theme.edge_color = 'grey'
+        pv.global_theme.edge_color = 'darkgray'
         
         # 2. Initialize BackgroundPlotter First
         # BackgroundPlotter automatically creates a QApplication if one doesn't exist.
@@ -1114,7 +1114,7 @@ class WHTVisualizer:
             name=name, 
             pickable=True,
             show_edges=True,
-            edge_color='grey',
+            edge_color='darkgray',
             smooth_shading=False, # Disabled by default for stability on large meshes
             cmap=self.combo_cmap.currentText(),
             n_colors=n_col,
@@ -1147,10 +1147,13 @@ class WHTVisualizer:
                 shadow=True,
                 fmt=fmt_str,
                 position_x=0.85,
-                width=0.12,
+                width=0.2, 
+                vertical=True, # 수직 방향 고정
                 title_font_size=self.cb_title_size,
                 label_font_size=self.cb_label_size
             )
+            # [WHT] 폭을 60px로 고정 (사용자 요청 사항)
+            self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
         
         # Trigger explicit update if Body Color
         if current_field == "Body Color":
@@ -1371,7 +1374,7 @@ class WHTVisualizer:
                 position_x=0.85, # Standard ParaView offset
                 position_y=0.1,
                 height=0.8,
-                width=0.12, # Elegant narrow bar
+                width=0.2, # Base width
                 title_font_size=self.cb_title_size,
                 label_font_size=self.cb_label_size,
                 font_family='arial',
@@ -1379,6 +1382,8 @@ class WHTVisualizer:
                 shadow=True,
                 n_labels=n_lbl
             )
+            # [WHT] 폭을 60px로 고정 (사용자 요청 사항)
+            self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
             self.plotter.update_scalar_bar_range(rng)
             
     def _calculate_robust_range(self, field_name: str, p_low: float = None, p_high: float = None) -> List[float]:
@@ -2028,12 +2033,14 @@ class WHTVisualizer:
                         position_x=0.85,
                         position_y=0.1,
                         height=0.8,
-                        width=0.12,
+                        width=0.2,
                         vertical=True,
                         font_family='arial',
                         title_font_size=self.cb_title_size,
                         label_font_size=self.cb_label_size
                     )
+                    # [WHT] 폭을 60px로 고정 (사용자 요청 사항)
+                    self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
             self.plotter.render()
 
     def _on_cb_style_changed(self, *_):
