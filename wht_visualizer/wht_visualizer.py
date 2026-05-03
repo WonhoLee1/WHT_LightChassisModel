@@ -80,7 +80,7 @@ class WHTRangeDialog(QtWidgets.QDialog):
             edit.setMinimumWidth(120)
             
             # Snap Button
-            btn_snap = QtWidgets.QPushButton("|<" if "Minimum" in label else ">|")
+            btn_snap = QtWidgets.QPushButton("⏮️" if "Minimum" in label else "⏭️")
             btn_snap.setFixedWidth(40)
             btn_snap.setToolTip(f"Snap to actual field {label.lower()}")
             
@@ -187,7 +187,7 @@ class WHTRangeDialog(QtWidgets.QDialog):
             self.vis.range_max = float(self.edit_max.text())
             
             # Force switch to Static mode so the manual values persist
-            self.vis.combo_range_mode.setCurrentText("Static (Fixed)")
+            self.vis.current_range_mode = "Static (Fixed)"
             self.vis._apply_colorbar_range()
         except ValueError: pass
 
@@ -452,14 +452,18 @@ class WHTVisualizer:
         vbox_contour = QtWidgets.QVBoxLayout()
         vbox_contour.setSpacing(2)
         
-        hbox_result = QtWidgets.QHBoxLayout()
-        hbox_result.setSpacing(2)
-        # Coloring label removed as per USER_REQUEST
-        
-        # Dual-Combo System: Category and Component
+        # Dual-Combo System: Category and Component (Split into separate rows for readability)
+        hbox_cat = QtWidgets.QHBoxLayout()
+        hbox_cat.setSpacing(5)
+        hbox_cat.addWidget(QtWidgets.QLabel("Category:"))
         self.combo_category = QtWidgets.QComboBox()
-        self.combo_component = QtWidgets.QComboBox()
         self.combo_category.currentTextChanged.connect(self._on_category_changed)
+        hbox_cat.addWidget(self.combo_category, 1)
+
+        hbox_comp = QtWidgets.QHBoxLayout()
+        hbox_comp.setSpacing(5)
+        hbox_comp.addWidget(QtWidgets.QLabel("Component:"))
+        self.combo_component = QtWidgets.QComboBox()
         self.combo_component.currentTextChanged.connect(self._on_component_changed)
         
         self.btn_adjust_range = QtWidgets.QPushButton("Adjust")
@@ -467,30 +471,14 @@ class WHTVisualizer:
         self.btn_adjust_range.clicked.connect(self._open_range_adjust_dialog)
         self.btn_adjust_range.setEnabled(False)
         
-        hbox_result.addWidget(self.combo_category, 2)
-        hbox_result.addWidget(self.combo_component, 1)
-        hbox_result.addWidget(self.btn_adjust_range)
+        hbox_comp.addWidget(self.combo_component, 1)
+        hbox_comp.addWidget(self.btn_adjust_range)
         
-        # Internal state for manual ranges (Replacing UI spinboxes)
+        # Internal state for manual ranges (Replacing UI widgets in main panel)
         self.range_min = 0.0
         self.range_max = 1.0
-        
-        self.combo_range_mode = QtWidgets.QComboBox()
-        self.combo_range_mode.addItems(["Dynamic (Auto)", "Robust (Auto)", "Static (Fixed)"])
-        self.combo_range_mode.currentTextChanged.connect(self._on_range_mode_changed)
-
-        # Robust Percentage Control (Main UI)
-        hbox_robust_main = QtWidgets.QHBoxLayout()
-        hbox_robust_main.setSpacing(2)
-        self.spin_robust_main = QtWidgets.QDoubleSpinBox()
-        self.spin_robust_main.setRange(50.0, 100.0)
-        self.spin_robust_main.setValue(98.0)
-        self.spin_robust_main.setSuffix(" %")
-        self.spin_robust_main.setToolTip("Statistical Outlier Rejection Threshold.\nDefault 98% ignores the top/bottom 1%.")
-        self.spin_robust_main.valueChanged.connect(self._apply_colorbar_range)
-        hbox_robust_main.addWidget(QtWidgets.QLabel("Robust %:"))
-        hbox_robust_main.addWidget(self.spin_robust_main)
-        # Hide it when not in Robust mode? No, keep it as reference.
+        self.current_range_mode = "Robust (Auto)"
+        self.robust_pct = 98.0
         
         # --- Colorbar Display Mode Group ---
         hbox_cb_mode = QtWidgets.QHBoxLayout()
@@ -532,10 +520,30 @@ class WHTVisualizer:
         self.btn_cb_font.clicked.connect(self._open_cb_font_dialog)
         hbox_cmap.addWidget(self.btn_cb_font)
         
+        # Shell Layer Selection (Through-Thickness Integration Point)
+        hbox_layer = QtWidgets.QHBoxLayout()
+        hbox_layer.setSpacing(2)
+        hbox_layer.addWidget(QtWidgets.QLabel("Shell Layer:"))
+        self.combo_shell_layer = QtWidgets.QComboBox()
+        self.combo_shell_layer.addItems([
+            "Upper (+t/2)", "Mid (0)", "Lower (-t/2)",
+            "Max Envelope", "Membrane", "Bending"
+        ])
+        self.combo_shell_layer.setCurrentText("Max Envelope")
+        self.combo_shell_layer.setToolTip(
+            "두께 방향 적분점 선택.\n"
+            "Upper: 상면 (+t/2), Mid: 중립면 (0), Lower: 하면 (-t/2)\n"
+            "Max Envelope: Upper/Lower 중 Von Mises 최대값\n"
+            "Membrane: 순수 면내, Bending: 순수 굽힘"
+        )
+        self.combo_shell_layer.currentTextChanged.connect(self._on_shell_layer_changed)
+        self.combo_shell_layer.setEnabled(False)  # Stress/Strain 카테고리에서만 활성화
+        hbox_layer.addWidget(self.combo_shell_layer)
+        
         # Assemble into Fields Main Layout in logical order
-        vbox_contour.addLayout(hbox_result)
-        vbox_contour.addWidget(self.combo_range_mode)
-        vbox_contour.addLayout(hbox_robust_main)
+        vbox_contour.addLayout(hbox_cat)
+        vbox_contour.addLayout(hbox_comp)
+        vbox_contour.addLayout(hbox_layer)
         vbox_contour.addLayout(hbox_cb_mode)
         vbox_contour.addLayout(hbox_cmap)
         
@@ -1316,28 +1324,20 @@ class WHTVisualizer:
         self.set_timestep(self.current_timestep)
 
     def _apply_colorbar_range(self):
-        """Applies global min-max range to the scalar bar across all parts."""
-        if not self.parts: return # Guard: Cannot add scalar bar without active mappers
+        """Applies global min-max range to the scalar bar across all parts.
+        [Optimization] Prevents flickering by only re-creating the scalar bar when the field changes.
+        """
+        if not self.parts: return
         
-        mode = self.combo_range_mode.currentText()
+        mode = self.current_range_mode
         field = self._get_active_field_name()
         if not field: return
         
         if mode == "Dynamic (Auto)":
-            total_rng = [float('inf'), float('-inf')]
-            for part in self.parts.values():
-                if field in part["mesh"].point_data or field in part["mesh"].cell_data:
-                    r = part["mesh"].get_data_range(field)
-                    total_rng[0] = min(total_rng[0], r[0])
-                    total_rng[1] = max(total_rng[1], r[1])
-            
-            if total_rng[0] == float('inf'): rng = [0, 1]
-            else: rng = total_rng
+            rng = self._get_field_global_range(field)
         elif mode == "Robust (Auto)":
             rng = self._calculate_robust_range(field)
-            # Sync internal state for consistency
-            self.range_min = rng[0]
-            self.range_max = rng[1]
+            self.range_min, self.range_max = rng
         else:
             # Static (Fixed) mode
             r_min, r_max = self.range_min, self.range_max
@@ -1345,11 +1345,11 @@ class WHTVisualizer:
             if r_min == r_max: r_max = r_min + 1e-6
             rng = [r_min, r_max]
             
-        # [Numerical Safety] Ensure range is always valid for VTK
+        # [Numerical Safety]
         if rng[0] > rng[1]: rng = [rng[1], rng[0]]
         if rng[0] == rng[1]: rng[1] = rng[0] + 1e-6
             
-        # Update all mappers to use this range
+        # Update all mappers
         for part in self.parts.values():
             part["actor"].mapper.scalar_range = rng
             
@@ -1358,38 +1358,43 @@ class WHTVisualizer:
             if self.plotter.scalar_bars:
                 self.plotter.remove_scalar_bar()
         else:
-            if self.plotter.scalar_bars:
-                self.plotter.remove_scalar_bar()
+            # [WHT Flicker Fix] Ensure scalar bar exists and is updated without jumping
+            if not self.plotter.scalar_bars:
+                # First time: Add scalar bar with fixed width
+                n_col = self.cb_levels if self.cb_mode == "Discrete" else 256
+                n_lbl = (self.cb_levels + 1) if self.cb_mode == "Discrete" else 11
+                fmt_str = f"%.{self.spin_cb_decimals.value()}e"
                 
-            n_lbl = (self.cb_levels + 1) if self.cb_mode == "Discrete" else 11
-            fmt_str = f"%.{self.cb_decimals}e"
-            
-            display_title = field.replace(" ", "\n").replace("_", "\n") if len(field) > 8 else field
-            active_mapper = list(self.parts.values())[0]["actor"].mapper if self.parts else None
-            
-            self.plotter.add_scalar_bar(
-                title=display_title,
-                mapper=active_mapper,
-                vertical=True,
-                position_x=0.85, # Standard ParaView offset
-                position_y=0.1,
-                height=0.8,
-                width=0.2, # Base width
-                title_font_size=self.cb_title_size,
-                label_font_size=self.cb_label_size,
-                font_family='arial',
-                fmt=fmt_str,
-                shadow=True,
-                n_labels=n_lbl
-            )
-            # [WHT] 폭을 60px로 고정 (사용자 요청 사항)
-            self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
+                # Use first actor's mapper as reference
+                ref_mapper = list(self.parts.values())[0]["actor"].mapper if self.parts else None
+                
+                self.plotter.add_scalar_bar(
+                    title="", # Will set below
+                    mapper=ref_mapper,
+                    n_labels=n_lbl,
+                    shadow=True,
+                    fmt=fmt_str,
+                    position_x=0.85,
+                    width=0.1, # Percent-based, but we override with pixels
+                    vertical=True,
+                    title_font_size=self.cb_title_size,
+                    label_font_size=self.cb_label_size
+                )
+                if self.plotter.scalar_bar:
+                    self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
+
+            # Update existing bar's range and title
             self.plotter.update_scalar_bar_range(rng)
+            if self.plotter.scalar_bar:
+                display_title = field.replace(" ", "\n").replace("_", "\n") if len(field) > 8 else field
+                self.plotter.scalar_bar.SetTitle(display_title)
+                # Re-enforce 60px to prevent jumping during range updates
+                self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
             
     def _calculate_robust_range(self, field_name: str, p_low: float = None, p_high: float = None) -> List[float]:
         """Ignores outliers based on percentiles."""
         if p_low is None or p_high is None:
-            pct = self.spin_robust_main.value()
+            pct = self.robust_pct
             p_low = (100.0 - pct) / 2.0
             p_high = 100.0 - p_low
             
@@ -1567,9 +1572,10 @@ class WHTVisualizer:
                                 mesh.cell_data[f"{sc_name}_XZ"] = s13
                                 mesh.cell_data[f"{sc_name}_YZ"] = s23
                                 
-                                # 2. Von Mises (Stress) vs Equivalent Strain (Engineering)
+                                # 2. Equivalent Value (Stress: Von Mises, Strain: Equivalent Strain)
                                 is_strain = ("Strain" in sc_name)
                                 if is_strain:
+                                    # Equivalent Strain (Standard Plasticity formula)
                                     diff_sq = (s11-s22)**2 + (s22-s33)**2 + (s33-s11)**2
                                     shear_sq = 1.5 * (s12**2 + s13**2 + s23**2)
                                     vm = (np.sqrt(2.0)/3.0) * np.sqrt(diff_sq + shear_sq)
@@ -1579,18 +1585,74 @@ class WHTVisualizer:
                                     vm = np.sqrt(0.5 * (diff_sq + shear_sq))
                                 mesh.cell_data[f"{sc_name}_VonMises"] = vm
                                 
-                                # 3. Principal Stresses (Simplified 2D for shell models)
-                                avg    = (s11 + s22) / 2.0
-                                radius = np.sqrt(((s11 - s22) / 2.0)**2 + s12**2)
-                                mesh.cell_data[f"{sc_name}_Max_Principal"] = avg + radius
-                                mesh.cell_data[f"{sc_name}_Min_Principal"] = avg - radius
+                                # 3. Principal Stresses/Strains (Shell-Aware Filtering)
+                                tensors = np.zeros((len(c_data), 3, 3))
+                                tensors[:, 0, 0] = s11
+                                tensors[:, 1, 1] = s22
+                                tensors[:, 2, 2] = s33
+                                if is_strain:
+                                    tensors[:, 0, 1] = tensors[:, 1, 0] = s12 / 2.0
+                                    tensors[:, 0, 2] = tensors[:, 2, 0] = s13 / 2.0
+                                    tensors[:, 1, 2] = tensors[:, 2, 1] = s23 / 2.0
+                                else:
+                                    tensors[:, 0, 1] = tensors[:, 1, 0] = s12
+                                    tensors[:, 0, 2] = tensors[:, 2, 0] = s13
+                                    tensors[:, 1, 2] = tensors[:, 2, 1] = s23
+                                
+                                principal_vals = np.linalg.eigvalsh(tensors)
+                                N = len(c_data)
+                                
+                                # Identify In-Plane Components for Shells
+                                if is_strain:
+                                    # For Shell Strain, one eigenvalue is eps_zz = -nu/(1-nu)*(e1+e2)
+                                    # We find the one that most closely matches the Poisson ratio (default 0.3)
+                                    nu = 0.3
+                                    f = -nu / (1.0 - nu)
+                                    e = principal_vals
+                                    errs = np.stack([
+                                        np.abs(e[:,0] - f*(e[:,1]+e[:,2])),
+                                        np.abs(e[:,1] - f*(e[:,0]+e[:,2])),
+                                        np.abs(e[:,2] - f*(e[:,0]+e[:,1]))
+                                    ], axis=1)
+                                    idx_out = np.argmin(errs, axis=1)
+                                else:
+                                    # For Shell Stress, one eigenvalue is sig_zz = 0
+                                    idx_out = np.argmin(np.abs(principal_vals), axis=1)
+                                
+                                mask_in = np.ones((N, 3), dtype=bool)
+                                mask_in[np.arange(N), idx_out] = False
+                                in_plane = principal_vals[mask_in].reshape(N, 2)
+                                
+                                # Store In-Plane Principals
+                                mesh.cell_data[f"{sc_name}_Max_Principal"] = in_plane[:, 1]
+                                mesh.cell_data[f"{sc_name}_Min_Principal"] = in_plane[:, 0]
+                                
+                                # 4. Signed Von Mises (Unified Shell Logic)
+                                # For shells, Trace(Stress) and Trace(Strain) are proportional and share the same sign.
+                                # This ensures perfect distribution consistency between Stress and Strain views.
+                                trace = s11 + s22 + s33
+                                sign_mask = np.where(np.abs(trace) > 1e-12, np.sign(trace), 1.0)
+                                
+                                # Fallback for pure shear (Trace=0)
+                                shear_mask = (np.abs(trace) <= 1e-12)
+                                if np.any(shear_mask):
+                                    # For pure shear, use the sign of the larger in-plane principal
+                                    ip_max = in_plane[:, 1]
+                                    ip_min = in_plane[:, 0]
+                                    shear_sign = np.where(np.abs(ip_max) >= np.abs(ip_min), np.sign(ip_max), np.sign(ip_min))
+                                    sign_mask[shear_mask] = shear_sign[shear_mask]
+                                
+                                sign_mask[sign_mask == 0] = 1.0
+                                mesh.cell_data[f"{sc_name}_Signed_VonMises"] = vm * sign_mask
                                 
                                 # [WHT KEY FIX] Cell → Point Data 절점 평균화
                                 # cell_data_to_point_data()로 연속 색상 표시 구현
                                 try:
                                     converted = mesh.cell_data_to_point_data()
                                     for suffix in ["_XX", "_YY", "_ZZ", "_XY", "_XZ", "_YZ",
-                                                   "_VonMises", "_Max_Principal", "_Min_Principal"]:
+                                                   "_VonMises", "_Signed_VonMises", 
+                                                   "_Max_Principal", "_Min_Principal",
+                                                   "_Max_3D_Principal", "_Mid_3D_Principal", "_Min_3D_Principal"]:
                                         field_key = f"{sc_name}{suffix}"
                                         if field_key in converted.point_data:
                                             mesh.point_data[field_key] = converted.point_data[field_key]
@@ -1606,7 +1668,7 @@ class WHTVisualizer:
                         
                         # [WHT] Robust Outlier Handling: If mode is Robust, set above-range color to grey
                         # This "removes" them visually by making them neutral.
-                        if self.combo_range_mode.currentText() == "Robust (Auto)":
+                        if self.current_range_mode == "Robust (Auto)":
                              part["actor"].mapper.lookup_table.above_range_color = 'grey'
                         else:
                              part["actor"].mapper.lookup_table.above_range_color = 'magenta'
@@ -1701,6 +1763,7 @@ class WHTVisualizer:
         
         if category == "Body Color":
             self.combo_component.setEnabled(False)
+            self.combo_shell_layer.setEnabled(False)
             self.btn_adjust_range.setEnabled(False)
             self.combo_component.blockSignals(False)
             self._update_active_result()
@@ -1708,6 +1771,10 @@ class WHTVisualizer:
             
         self.combo_component.setEnabled(True)
         self.btn_adjust_range.setEnabled(True)
+        
+        # Shell Layer 활성화: Stress 또는 Strain 카테고리일 때만
+        is_tensor = ("Stress" in category or "Strain" in category)
+        self.combo_shell_layer.setEnabled(is_tensor)
         
         # Find all fields belonging to this category
         comps = []
@@ -1741,14 +1808,14 @@ class WHTVisualizer:
         # [User Request] Ensure user feels the change: 
         # Trigger a range reset if switching categories to a meaningful new field
         if category != "Body Color":
-            self.combo_range_mode.setCurrentText("Robust (Auto)")
+            self.current_range_mode = "Robust (Auto)"
             print(f" -> [Visualizer] Category changed to '{category}'. Auto-resetting range for visibility.")
             
         self._update_active_result()
 
     def _on_component_changed(self, component):
         # [WHT FIX] Field change should ensure visibility by fitting range if in Static mode
-        if self.combo_range_mode.currentText() == "Static (Fixed)":
+        if self.current_range_mode == "Static (Fixed)":
              # Stay in Static mode, but 'Fit' the range to the new field's global limits
              cat = self.combo_category.currentText()
              field_key = self._get_full_field_key(cat, component)
@@ -1757,6 +1824,15 @@ class WHTVisualizer:
              print(f" -> [Visualizer] Field component changed to {component}. Fitting Static range to {rng}")
              
         self._update_active_result()
+
+    def _on_shell_layer_changed(self, layer_text):
+        """Shell Layer(두께 방향 적분점) 변경 시 결과를 갱신합니다."""
+        cat = self.combo_category.currentText()
+        if cat and ("Stress" in cat or "Strain" in cat):
+            # Robust 모드로 자동 전환하여 새 레이어 범위를 즉시 반영
+            self.current_range_mode = "Robust (Auto)"
+            print(f" -> [Visualizer] Shell layer changed to '{layer_text}'.")
+            self._update_active_result()
 
     def _get_field_global_range(self, field_name: str) -> Tuple[float, float]:
         """Calculates absolute min/max for a field across all parts."""
@@ -1770,15 +1846,54 @@ class WHTVisualizer:
         if rng[0] == float('inf'): return 0.0, 1.0
         return float(rng[0]), float(rng[1])
 
+    def _resolve_shell_layer_category(self, base_category: str) -> str:
+        """Shell Layer 콤보 선택에 따라 실제 cell_data 키를 결정합니다.
+        
+        Parameters
+        ----------
+        base_category : str
+            기본 카테고리 (예: "Stress", "Strain").
+        
+        Returns
+        -------
+        str
+            실제 cell_data 키 (예: "Stress", "Stress (Mid)", "Stress (Max Envelope)").
+        """
+        if not hasattr(self, 'combo_shell_layer'):
+            return base_category
+        if not self.combo_shell_layer.isEnabled():
+            return base_category
+        
+        layer = self.combo_shell_layer.currentText()
+        # Mapping: UI text -> cell_data key suffix
+        layer_map = {
+            "Upper (+t/2)": "",              # Default: "Stress", "Strain"
+            "Mid (0)": " (Mid)",
+            "Lower (-t/2)": " (Lower)",
+            "Max Envelope": " (Max Envelope)",
+            "Membrane": " (Membrane)",
+            "Bending": " (Bending)",
+        }
+        suffix = layer_map.get(layer, "")
+        return base_category + suffix
+
     def _get_full_field_key(self, category, component):
         """Helper to resolve full field key used in mesh data."""
         if category == "Body Color": return None
-        if component == "Magnitude": return f"{category}_Magnitude"
-        if component in ["X", "Y", "Z"]: return f"{category}_{component}"
+        
+        # Shell Layer 적용 (Stress/Strain 카테고리에서만)
+        resolved_cat = category
+        if "Stress" in category or "Strain" in category:
+            # 기본 카테고리 추출 (예: "Stress" from "Stress_XX")
+            base = category.split("_")[0] if "_" in category else category
+            resolved_cat = self._resolve_shell_layer_category(base)
+        
+        if component == "Magnitude": return f"{resolved_cat}_Magnitude"
+        if component in ["X", "Y", "Z"]: return f"{resolved_cat}_{component}"
         # Stress/Strain components like VonMises, XX, etc.
-        if component in ["VonMises", "XX", "YY", "ZZ", "XY", "YZ", "ZX", "Max_Principal", "Min_Principal"]:
-            return f"{category}_{component}"
-        return category
+        if component in ["VonMises", "Signed_VonMises", "XX", "YY", "ZZ", "XY", "YZ", "ZX", "Max_Principal", "Min_Principal", "Max_3D_Principal", "Mid_3D_Principal", "Min_3D_Principal"]:
+            return f"{resolved_cat}_{component}"
+        return resolved_cat
 
     def _on_range_mode_changed(self, mode):
         """[User Request] Handles transition between Auto, Robust, and Fixed ranges."""
@@ -1815,15 +1930,14 @@ class WHTVisualizer:
         class DummyGroup:
             def __init__(self, vis):
                 self.vis = vis
-                self.cmb_mode = vis.combo_range_mode
+                # Use internal state since main UI widgets are removed
             def get_range(self): return self.vis.range_min, self.vis.range_max
-            def get_robust_pct(self): 
-                if hasattr(self.vis, 'spin_robust_main'): return self.vis.spin_robust_main.value()
-                return 98.0
+            def get_mode(self): return self.vis.current_range_mode
+            def set_mode(self, mode): self.vis.current_range_mode = mode
+            def get_robust_pct(self): return self.vis.robust_pct
+            def set_robust_pct(self, pct): self.vis.robust_pct = pct
             def set_range(self, v_min, v_max):
                 self.vis.range_min, self.vis.range_max = v_min, v_max
-                if hasattr(self.vis, 'spin_min'): self.vis.spin_min.setValue(v_min)
-                if hasattr(self.vis, 'spin_max'): self.vis.spin_max.setValue(v_max)
                 self.vis._apply_colorbar_range()
 
         self._range_dialog = WHTRangeDialog(self, field, DummyGroup(self), get_limits, get_robust)
@@ -1831,18 +1945,27 @@ class WHTVisualizer:
         self._range_dialog.show()
 
     def _update_active_result(self):
-        """Synthesizes the full result name and applies it."""
+        """Synthesizes the full result name and applies it, ensuring data is bound."""
+        # [WHT-FIX] Ensure mesh has all derived fields (VonMises, etc.) for the current selection
+        self._bind_data_to_mesh(self.current_timestep)
+        
         full_name = self._get_active_field_name()
         self._on_result_type_changed(full_name)
 
     def _get_active_field_name(self) -> str:
-        """Synthesizes the full result name from dual combos."""
+        """Synthesizes the full result name from dual combos + shell layer."""
         if not hasattr(self, 'combo_category'): return ""
         cat = self.combo_category.currentText()
         comp = self.combo_component.currentText()
         if cat == "Body Color": return "Body Color"
-        if comp == "Value": return cat
-        return f"{cat}_{comp}"
+        
+        # Shell Layer 적용
+        resolved_cat = cat
+        if "Stress" in cat or "Strain" in cat:
+            resolved_cat = self._resolve_shell_layer_category(cat)
+        
+        if comp == "Value": return resolved_cat
+        return f"{resolved_cat}_{comp}"
 
     def _on_result_type_changed(self, name):
         """Switches active scalar across all parts with Auto Body Color support."""
@@ -2094,7 +2217,8 @@ class WHTVisualizer:
         # Safely get cell_data keys
         cell_data = getattr(self.result_data, 'cell_data', {})
         _tensor_suffixes = ["_XX", "_YY", "_ZZ", "_XY", "_XZ", "_YZ",
-                            "_VonMises", "_Max_Principal", "_Min_Principal"]
+                            "_VonMises", "_Signed_VonMises", "_Max_Principal", "_Min_Principal",
+                            "_Max_3D_Principal", "_Mid_3D_Principal", "_Min_3D_Principal"]
         for name in cell_data.keys():
             avail.add(name)
             if "Stress" in name or "Strain" in name:
@@ -2106,7 +2230,10 @@ class WHTVisualizer:
         
         # Categorize: Filter out redundant suffixed fields from the main Category list
         categories = set()
-        suffixes = ["_Magnitude", "_X", "_Y", "_Z", "_XX", "_YY", "_ZZ", "_XY", "_YZ", "_XZ", "_VonMises", "_Max_Principal", "_Min_Principal"]
+        suffixes = ["_Magnitude", "_X", "_Y", "_Z", "_XX", "_YY", "_ZZ", "_XY", "_YZ", "_XZ", "_VonMises", "_Signed_VonMises", "_Max_Principal", "_Min_Principal", "_Max_3D_Principal", "_Mid_3D_Principal", "_Min_3D_Principal"]
+        
+        # Shell Layer 접미사: 카테고리 목록에서 제외 (Shell Layer 콤보로 전환)
+        _shell_layer_suffixes = [" (Mid)", " (Lower)", " (Max Envelope)", " (Membrane)", " (Bending)"]
         
         for f in avail:
             is_redundant = False
@@ -2116,7 +2243,14 @@ class WHTVisualizer:
                     break
             
             if not is_redundant:
-                categories.add(f)
+                # Shell Layer 변형 카테고리 필터링
+                is_layer_variant = False
+                for ls in _shell_layer_suffixes:
+                    if ls in f:
+                        is_layer_variant = True
+                        break
+                if not is_layer_variant:
+                    categories.add(f)
         
         cats = sorted(list(categories))
         cats.insert(0, "Body Color")

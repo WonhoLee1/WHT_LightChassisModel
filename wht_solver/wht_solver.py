@@ -259,17 +259,18 @@ class WHTSolver:
         res.mode_shapes = mode_shapes
         res.solver_info = {'method': method, 'ndof': jm_ndof, 'ndof_free': ndof_free}
         
-        # --- [WHT] Element Stress & Strain Recovery ---
+        # --- [WHT] Element Stress & Strain Recovery (v2: dict-based API) ---
         n_cells = len(self.model.elements)
+        # Modal analysis: Upper surface 기본 (단일 레이어)
         stresses = np.zeros((actual_modes, n_cells, 6))
         strains  = np.zeros((actual_modes, n_cells, 6))
         seds     = np.zeros((actual_modes, n_cells, 1))
         
         for m in range(actual_modes):
-            s_q, e_q, *_ = ElementStressRecovery.recover_quad4(self.model, mode_shapes[m], sorted_nids)
-            s_t, e_t, *_ = ElementStressRecovery.recover_tria3(self.model, mode_shapes[m], sorted_nids)
-            stresses[m] = s_q + s_t
-            strains[m]  = e_q + e_t
+            rd_q = ElementStressRecovery.recover_quad4(self.model, mode_shapes[m], sorted_nids)
+            rd_t = ElementStressRecovery.recover_tria3(self.model, mode_shapes[m], sorted_nids)
+            stresses[m] = rd_q["Stress"] + rd_t["Stress"]
+            strains[m]  = rd_q["Strain"] + rd_t["Strain"]
             seds[m, :, 0] = 0.5 * np.sum(stresses[m] * strains[m], axis=1)
             
         res.cell_data = {"Stress": stresses, "Strain": strains, 
@@ -326,18 +327,24 @@ class WHTSolver:
         idx_to_nid  = {i: nid for i, nid in enumerate(sorted_nids)}
         bc_node_original = np.array([idx_to_nid[i] for i in bc_node_ids])
 
-        # --- [WHT] Element Stress & Strain Recovery ---
-        # Catching 4 outputs: (Stresses, Strain_Total, Strain_Membrane, Strain_Bending)
-        s_q, e_q_t, e_q_m, e_q_b = ElementStressRecovery.recover_quad4(self.model, displacement, sorted_nids)
-        s_t, e_t_t, e_t_m, e_t_b = ElementStressRecovery.recover_tria3(self.model, displacement, sorted_nids)
+        # --- [WHT] Element Stress & Strain Recovery (v2: dict-based API) ---
+        rd_q = ElementStressRecovery.recover_quad4(self.model, displacement, sorted_nids)
+        rd_t = ElementStressRecovery.recover_tria3(self.model, displacement, sorted_nids)
         
-        s_static = s_q + s_t
-        e_static_total = e_q_t + e_t_t
-        e_static_membrane = e_q_m + e_t_m
-        e_static_bending = e_q_b + e_t_b
+        # Merge QUAD4 + TRIA3 results (non-overlapping rows, so simple addition works)
+        cell_data = {}
+        for key in rd_q:
+            merged = rd_q[key] + rd_t[key]
+            cell_data[key] = merged[np.newaxis, :, :]  # (1, M, 6) for time axis
         
-        # Calculate Max Von-Mises for diagnostic summary
-        vm_static = np.sqrt(0.5 * ((s_static[:,0]-s_static[:,1])**2 + (s_static[:,1]-s_static[:,2])**2 + (s_static[:,2]-s_static[:,0])**2 + 6*(s_static[:,3]**2 + s_static[:,4]**2 + s_static[:,5]**2)))
+        # Calculate Max Von-Mises for diagnostic summary (Upper surface)
+        s_upper = cell_data["Stress"][0]  # (M, 6)
+        vm_static = np.sqrt(0.5 * (
+            (s_upper[:, 0] - s_upper[:, 1]) ** 2 +
+            (s_upper[:, 1] - s_upper[:, 2]) ** 2 +
+            (s_upper[:, 2] - s_upper[:, 0]) ** 2 +
+            6.0 * (s_upper[:, 3] ** 2 + s_upper[:, 4] ** 2 + s_upper[:, 5] ** 2)
+        ))
         max_vm = np.max(vm_static)
         p95_vm = np.percentile(vm_static, 95)
         median_vm = np.median(vm_static)
@@ -361,12 +368,7 @@ class WHTSolver:
 
         result = WHTSolverResult("static", sorted_nids)
         result.displacement  = displacement
-        result.cell_data     = {
-            "Stress": s_static[np.newaxis, :, :], 
-            "Strain": e_static_total[np.newaxis, :, :],
-            "Strain (Membrane)": e_static_membrane[np.newaxis, :, :],
-            "Strain (Bending)": e_static_bending[np.newaxis, :, :]
-        }
+        result.cell_data     = cell_data
         result._max_vm_diagnostic = max_vm 
         result._u_aug        = u_aug_np
         result._ndof         = ndof
