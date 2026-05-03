@@ -995,48 +995,68 @@ class WHTVisualizer:
             self.plotter.screenshot(file_path)
             print(f" -> Screenshot saved to {file_path}")
 
-    def show_result(self, result: "WHTResultData"):
-        """Main entry point to display WHTResultData IR objects with integrity guards."""
+    def show_result(self, result: "WHTResultData", group_name: Optional[str] = None, clear: bool = True):
+        """
+        Main entry point to display WHTResultData IR objects.
+        
+        Parameters
+        ----------
+        result : WHTResultData
+            The result object to visualize.
+        group_name : str, optional
+            Prefix for part names to distinguish between multiple results.
+        clear : bool, default True
+            If True, clears the plotter before adding new data.
+        """
         if not result or result.nodes is None:
             print(" -> [Visualizer Warning] Attempted to load empty result data.")
             return
 
         self._is_ready = False
+        
+        # Always update result_data to the latest loaded one
         self.result_data = result
         self.current_timestep = 0
         
-        # 1. Rigorous Resource Cleanup
-        self.anim_timer.stop()
-        self.is_playing = False
-        self.btn_play.setText("▶")
-        
-        # Clear all previous actors and cached meshes
-        self.plotter.clear()
-        for p in self.parts.values():
-            if "outline" in p: p["outline"] = None
-            if "feature" in p: p["feature"] = None
-        self.parts.clear()
+        if clear:
+            # 1. Rigorous Resource Cleanup
+            self.anim_timer.stop()
+            self.is_playing = False
+            self.btn_play.setText("▶")
+            
+            # Clear all previous actors and cached meshes
+            self.plotter.clear()
+            for p in self.parts.values():
+                if "outline" in p: p["outline"] = None
+                if "feature" in p: p["feature"] = None
+            self.parts.clear()
 
-        self.list_parts.blockSignals(True)
-        self.list_parts.clear()
+            self.list_parts.blockSignals(True)
+            self.list_parts.clear()
+            self.list_parts.blockSignals(False)
+            
+            self.result_data = result
+            self.current_timestep = 0
+            self.base_coords = result.nodes.copy()
+            n_steps = max(1, result.n_timesteps)
+            self.slider_time.setMaximum(n_steps - 1)
+            
+            # 2. Populate UI based on results
+            self._populate_combo_box()
         
-        # 2. Populate UI based on results (Before adding parts!)
-        self._populate_combo_box()
-        
-        # 3. Rebuild Assembly (Shared Pointer Oriented)
+        # 3. Rebuild Assembly
         shared_base = self._make_pv_grid(result.nodes, result.connectivity, result.offsets, result.cell_types)
         
-        # Determine Parts from element_sets
+        prefix = f"{group_name}_" if group_name else ""
+        
+        self.list_parts.blockSignals(True)
         if result.element_sets:
             for part_name, elem_indices in result.element_sets.items():
                 if len(elem_indices) == 0: continue
-                # Use shared_base to extract submesh directly
                 part_mesh = shared_base.extract_cells(elem_indices)
-                self._add_part(part_name, part_mesh)
+                self._add_part(f"{prefix}{part_name}", part_mesh)
         else:
-            # Fallback: Single Default Part
-            self._add_part("Mesh_Model", shared_base)
-            
+            self._add_part(f"{prefix}Mesh_Model", shared_base)
         self.list_parts.blockSignals(False)
             
         # UI State Init with Guard
@@ -1083,15 +1103,26 @@ class WHTVisualizer:
         
         return pv.UnstructuredGrid(cells, cell_types, nodes)
 
-    def load_results(self, result: "WHTResultData", **kwargs):
-        """Compatibility alias for show_result."""
+    def load_results(self, result: "WHTResultData", group_name: Optional[str] = None, clear: bool = True, **kwargs):
+        """
+        Comprehensive result loader with comparison support.
+        
+        Parameters
+        ----------
+        result : WHTResultData
+            The result data to load.
+        group_name : str, optional
+            A label for this result set (shown in part list).
+        clear : bool, default True
+            Whether to clear existing results.
+        """
         try:
-            self.show_result(result)
+            self.show_result(result, group_name=group_name, clear=clear)
             # Apply visual hints from kwargs if provided
             if 'color' in kwargs:
+                # If background color requested
                 self.plotter.set_background(kwargs['color'])
             if 'label' in kwargs:
-                # Overwrite or add a floating label
                 self.plotter.add_text(kwargs['label'], position='upper_left', font_size=10, name='main_label', color='grey')
         except Exception as e:
             print(f" -> [Visualizer ERROR] Failed to load results: {e}")
@@ -1173,7 +1204,8 @@ class WHTVisualizer:
             "mesh": mesh, 
             "actor": actor, 
             "orig_pts": mesh.points.copy(),
-            "active_mesh": mesh
+            "active_mesh": mesh,
+            "result_data": self.result_data  # Store result data reference in part
         }
         
         item = QtWidgets.QListWidgetItem(name)
