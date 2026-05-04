@@ -175,9 +175,7 @@ def generate_shell_tray(
     # --- 8. Export Node & Element Data ---
     node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
     nodes_xyz = node_coords.reshape(-1, 3)
-    tag_to_idx = {int(tag): i for i, tag in enumerate(node_tags)}
-    
-    node_data = {tag_to_idx[int(tag)]: nodes_xyz[i] for i, tag in enumerate(node_tags)}
+    node_data = {int(tag): nodes_xyz[i] for i, tag in enumerate(node_tags)}
     
     elem_data = {}
     dim_elem = 2
@@ -186,7 +184,7 @@ def generate_shell_tray(
         num_v = 3 if etype == 2 else 4
         nodes_flat = enodes.reshape(-1, num_v)
         for i, tag in enumerate(etags):
-            elem_data[int(tag)] = [tag_to_idx[int(n)] for n in nodes_flat[i]]
+            elem_data[int(tag)] = [int(n) for n in nodes_flat[i]]
             
     gmsh.finalize()
     return node_data, elem_data
@@ -302,13 +300,16 @@ def apply_auto_beads(
     max_depth: float = 10.0,
     origin: str = 'center',
     mode: str = 'grid',
+    bead_direction: float = 0.0, # 1.0: Up, -1.0: Down, 0.0: Both
     **kwargs
 ) -> Dict[int, np.ndarray]:
     """
     Applies topography bead patterns to the tray floor.
     
     Modes:
-        'grid': Symmetric sinusoidal patterns (design intent).
+        'grid': Symmetric local rectangular patches (structured).
+        'rib': Continuous intersecting stiffening ribs (X & Y directions).
+        'network': Randomly branched interconnected rib network (organic feel).
         'random': Symmetric random rectangular patches (topography optimization feel).
     """
     new_node_db = {nid: np.copy(coords) for nid, coords in node_db.items()}
@@ -322,19 +323,136 @@ def apply_auto_beads(
     inner_l = length - 2 * margin
     
     if mode == 'grid':
-        freq_x, freq_y = 2.0, 2.0 
+        # --- Structured Rectangular Patches (Topography Style) ---
+        freq_x, freq_y = 2.0, 3.0  # Number of beads per quadrant
+        bead_w = (inner_w / 2.0) / (freq_x + 0.5)
+        bead_h = (inner_l / 2.0) / (freq_y + 0.5)
+        
         for nid, r in new_node_db.items():
             if abs(r[2]) < 0.1 and abs(r[0] - cx) < (inner_w/2) and abs(r[1] - cy) < (inner_l/2):
                 nx = (r[0] - cx) / (inner_w/2)
                 ny = (r[1] - cy) / (inner_l/2)
-                val_x = math.cos(math.pi * nx * freq_x)
-                val_y = math.cos(math.pi * ny * freq_y)
-                surface = val_x * val_y
-                threshold = 1.0 - target_ratio
-                if abs(surface) > threshold:
-                    smooth = (abs(surface) - threshold) / (1.0 - threshold)
-                    new_node_db[nid][2] += max_depth * np.sign(surface) * (smooth ** 1.5)
+                
+                # Create a grid of points
+                # Use absolute coordinates for local patches
+                lx, ly = abs(r[0] - cx), abs(r[1] - cy)
+                
+                # Determine which "cell" we are in
+                ix = int(lx / (bead_w * 1.5))
+                iy = int(ly / (bead_h * 1.5))
+                
+                # Center of the nearest bead
+                target_x = (ix + 0.5) * bead_w * 1.5
+                target_y = (iy + 0.5) * bead_h * 1.5
+                
+                # Distance to bead center
+                dx = abs(lx - target_x)
+                dy = abs(ly - target_y)
+                
+                # Trapezoidal profile (Flat top with ramps)
+                ramp = 10.0 # 10mm ramp
+                wx = max(0, min(1, (bead_w/2 - dx) / ramp))
+                wy = max(0, min(1, (bead_h/2 - dy) / ramp))
+                
+                shape = wx * wy
+                if shape > 0:
+                    # Pattern polarity (checkerboard feel or fixed)
+                    if bead_direction != 0.0:
+                        polarity = np.sign(bead_direction)
+                    else:
+                        polarity = 1.0 if (ix + iy) % 2 == 0 else -1.0
+                    new_node_db[nid][2] += max_depth * polarity * (shape ** 1.2)
                     
+    elif mode == 'rib':
+        # --- Continuous Intersecting Ribs ---
+        # freq_x/y defines how many ribs in each direction
+        freq_x, freq_y = 4, 3 
+        pitch_x = (inner_w / 2.0) / (freq_x + 0.5)
+        pitch_y = (inner_l / 2.0) / (freq_y + 0.5)
+        rib_width = 30.0 # 30mm width
+        ramp = 10.0      # 10mm ramp
+        
+        for nid, r in new_node_db.items():
+            if abs(r[2]) < 0.1 and abs(r[0] - cx) < (inner_w/2) and abs(r[1] - cy) < (inner_l/2):
+                lx, ly = abs(r[0] - cx), abs(r[1] - cy)
+                
+                # Closest X-rib and Y-rib indices
+                ix = round(lx / pitch_x)
+                iy = round(ly / pitch_y)
+                
+                # Distance to rib center lines
+                dx = abs(lx - ix * pitch_x)
+                dy = abs(ly - iy * pitch_y)
+                
+                # Rib profiles
+                wx = max(0, min(1, (rib_width/2 - dx) / ramp))
+                wy = max(0, min(1, (rib_width/2 - dy) / ramp))
+                
+                # Connection logic: UNION of X and Y ribs
+                shape = max(wx, wy)
+                
+                if shape > 0:
+                    if bead_direction != 0.0:
+                        polarity = np.sign(bead_direction)
+                    else:
+                        # Fixed polarity for ribs usually looks better than alternating
+                        polarity = 1.0
+                    new_node_db[nid][2] += max_depth * polarity * (shape ** 1.1)
+                    
+    elif mode == 'network':
+        # --- Randomly Branched Interconnected Network ---
+        np.random.seed(42)
+        num_seeds = 12
+        k_neighbors = 2
+        rib_width = 25.0
+        ramp = 10.0
+        
+        # 1. Generate random seeds in the FIRST quadrant
+        seeds = []
+        for _ in range(num_seeds):
+            sx = np.random.uniform(0, inner_w/2)
+            sy = np.random.uniform(0, inner_l/2)
+            seeds.append(np.array([sx, sy]))
+        
+        # 2. Build edges (connect each seed to k nearest neighbors)
+        edges = []
+        for i, p1 in enumerate(seeds):
+            dists = [np.linalg.norm(p1 - p2) for p2 in seeds]
+            nearest_indices = np.argsort(dists)[1:k_neighbors+1]
+            for idx in nearest_indices:
+                if i < idx: # Avoid duplicates
+                    edges.append((p1, seeds[idx]))
+        
+        # 3. Add some boundary connections to ensure global connectivity if needed
+        # (Optional: connect seeds to center/edges)
+        
+        # 4. Calculate distance to nearest edge for each node
+        def dist_to_segment(p, a, b):
+            ap = p - a
+            ab = b - a
+            t = np.clip(np.dot(ap, ab) / np.dot(ab, ab), 0.0, 1.0)
+            nearest = a + t * ab
+            return np.linalg.norm(p - nearest)
+
+        for nid, r in new_node_db.items():
+            if abs(r[2]) < 0.1 and abs(r[0] - cx) < (inner_w/2) and abs(r[1] - cy) < (inner_l/2):
+                lx, ly = abs(r[0] - cx), abs(r[1] - cy)
+                p = np.array([lx, ly])
+                
+                min_d = 1e9
+                for a, b in edges:
+                    min_d = min(min_d, dist_to_segment(p, a, b))
+                
+                # Trapezoidal profile
+                shape = max(0, min(1, (rib_width/2 - min_d) / ramp))
+                
+                if shape > 0:
+                    if bead_direction != 0.0:
+                        polarity = np.sign(bead_direction)
+                    else:
+                        polarity = 1.0
+                    new_node_db[nid][2] += max_depth * polarity * (shape ** 1.1)
+
     elif mode == 'random':
         # 1. Setup Random Seed for Reproducibility
         np.random.seed(42)
@@ -386,7 +504,11 @@ def apply_auto_beads(
             # Random Height/Depth
             min_d = kwargs.get('min_depth', max_depth * 0.3)
             rz = np.random.uniform(min_d, max_depth)
-            polarity = np.random.choice([-1.0, 1.0])
+            
+            if bead_direction != 0.0:
+                polarity = np.sign(bead_direction)
+            else:
+                polarity = np.random.choice([-1.0, 1.0])
             
             # [수정 3/5 — z_offsets 누적 시 clip 적용]
             # 이전 코드의 문제:
@@ -402,10 +524,16 @@ def apply_auto_beads(
             #   깊이 범위를 벗어나지 않으며, 포화 시 추가 누적이 무의미함을 방지한다.
             for nid in ref_nids:
                 r = new_node_db[nid]
-                dx, dy = r[0] - cx, r[1] - cy
+                dx, dy = abs(r[0] - cx - rx), abs(r[1] - cy - ry)
 
-                if abs(dx - rx) < rw/2 and abs(dy - ry) < rh/2:
-                    raw = z_offsets[nid] + rz * polarity
+                # Trapezoidal profile (Flat top with ramps)
+                ramp = 10.0 # 10mm ramp
+                wx = max(0, min(1, (rw/2 - dx) / ramp))
+                wy = max(0, min(1, (rh/2 - dy) / ramp))
+                shape = wx * wy
+
+                if shape > 0:
+                    raw = z_offsets[nid] + rz * polarity * (shape ** 1.2)
                     z_offsets[nid] = float(np.clip(raw, -max_depth, max_depth))
                     morphed_set.add(nid)
 

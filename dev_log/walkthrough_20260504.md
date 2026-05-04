@@ -1,71 +1,64 @@
-# Shell 응력/변형률 Through-Thickness 적분점 개선 Walkthrough
+# Walkthrough - Encoding & Simulation Pipeline Fixes
 
-## 날짜: 2026-05-04
+This walkthrough summarizes the changes made to resolve character encoding issues, fix LS-DYNA export warnings, and validate the integrated simulation pipeline.
 
-## 개요
-MITC4/MITC3 Shell 요소의 응력/변형률 계산 파이프라인을 상용 CAE S/W(OptiStruct, Nastran) 수준으로 고도화하였습니다.
+## Changes Made
 
-## 변경 사항
+### 1. Character Encoding Restoration
+*   Restored corrupted Korean comments (formerly `??`) in [test_tria3_element.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/test_jaxSSO/test_tria3_element.py).
+*   Verified that the file is now readable and maintainable.
 
-### 1. `wht_stress_recovery.py` — 전면 리팩토링
+### 2. Node/Element Indexing Fix
+*   Updated [mesh_utils.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/test_jaxSSO/mesh_utils.py) to use **1-based indexing** for both nodes and elements.
+*   Directly utilized Gmsh tags (which are naturally 1-based) instead of remapping them to 0-indexed values.
+*   This applies to both Shell Tray and Solid Hexa Tray generation.
 
-**Before:** 
-- 두께 적분점 없음 (z = +t/2 하드코딩)
-- QUAD4/TRIA3 각각 중복 코드
-- 반환: 4개 tuple `(stress, strain_total, strain_membrane, strain_bending)`
+### 3. Industrial Solver Compatibility (LS-DYNA)
+*   Enhanced [wht_exporters_industrial.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/wht_converter/wht_exporters_industrial.py) to output a complete LS-DYNA keyword file.
+*   Added the following keywords:
+    *   `*MAT_ELASTIC`: Exports material properties (E, nu, rho).
+    *   `*SECTION_SHELL` / `*SECTION_SOLID`: Exports section properties (thickness, formulation).
+    *   `*PART`: Connects elements to properties and materials.
+*   Updated element records to use the correct `PID` from the model instead of a hardcoded value.
 
-**After:**
-- 3개 적분점: Upper (+t/2), Mid (0), Lower (-t/2)
-- 공통 계산 함수 `_compute_at_z()` 추출 → 코드 중복 완전 제거
-- Max Envelope (Upper/Lower 중 Von Mises 최대)
-- Membrane/Bending 분리 (Stress에도 적용)
-- 반환: `Dict[str, np.ndarray]` 12개 키
+### 4. Redesigned Bead Generation Strategy
+*   **Structured Rectangular Patches**: Replaced the previous sinusoidal wave pattern in `grid` mode with structured local rectangular patches.
+*   **Continuous Rib Mode**: Added a new `rib` mode that generates intersecting stiffening ribs (X and Y directions), ensuring the beads are interconnected rather than isolated islands.
+*   **Organic Network Mode**: Developed a `network` mode that creates randomly branched but interconnected rib structures using a graph-based seed connection algorithm. This fulfills the need for a 'free' yet continuous topography.
+*   **Trapezoidal Profile**: Implemented a sloped ramp (10mm) for all rectangular patches (both `grid` and `random` modes) and ribs to ensure realistic topography and better mesh quality at the boundaries.
+*   **Increased Visibility**: Updated `exam3_autobead.py` default `bead_max_depth` to **5.0mm** to provide clear structural impact and visual presence.
+*   **Directional Control**: Added a `bead_direction` parameter to allow unidirectional bead generation (Up only, Down only, or Both). This is accessible via the `--direction` flag.
 
-### 2. `wht_solver.py` — API 통합
+### 5. Integrated Pipeline Validation
+*   Added `--no-viz` flag support to [exam3_autobead.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/test_jaxSSO/exam3_autobead.py) and [test_morphing.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/test_jaxSSO/test_morphing.py).
+*   Validated the end-to-end workflow:
+    1.  Generate beaded tray mesh and export to `autobead_target.k`.
+    2.  Load `autobead_target.k` as a target for morphing a base tray.
+    3.  Perform modal analysis on the morphed model.
 
-- `solve_static()`: 새 dict API 사용, 12개 cell_data 키 자동 생성
-- `solve_modal()`: 기존 호환 유지 (Upper surface 기본)
+## Validation Results
 
-### 3. `wht_visualizer.py` — Shell Layer UI 추가
+### LS-DYNA Export Integrity
+The exported file `autobead_target.k` now starts node IDs from 1 and includes all necessary part/material definitions, eliminating "Node ID 0" and "Part ID 0" warnings in industrial solvers.
 
-- **Shell Layer 콤보박스**: Category/Component 행 아래에 배치
-  - 옵션: Upper (+t/2), Mid (0), Lower (-t/2), Max Envelope, Membrane, Bending
-  - Stress/Strain 카테고리에서만 활성화
-- **카테고리 필터링**: Shell Layer 변형 카테고리가 별도 항목으로 등장하지 않도록 필터링
-- **Signed VonMises, 3D Principal 지원 유지**
-
-### 4. `patch_test_extended.py` — 테스트 확장 (8/8 PASS)
-
-| Test | 내용 | 결과 |
-|------|------|------|
-| Test 4 | 45° 회전 QUAD4 인장 → 전역 텐서 회전 | ✅ PASS |
-| Test 5 | TRIA3 순수 인장 | ✅ PASS |
-| Test 6 | TRIA3 순수 전단 | ✅ PASS |
-| Test 7 | TRIA3 순수 굽힘 | ✅ PASS |
-| Test 8 | QUAD4 인장+굽힘 복합 | ✅ PASS |
-| Test 9 | 순수 굽힘 → Mid-plane 응력 = 0 | ✅ PASS |
-| Test 10 | 순수 굽힘 → Upper = -Lower 대칭성 | ✅ PASS |
-| Test 11 | 순수 인장 → Upper = Mid = Lower | ✅ PASS |
-
-## 기술적 핵심 사항
-
-### 두께 방향 응력 계산 원리
-
-Shell 요소의 변형률은 Membrane + Bending으로 분해됩니다:
-
+```lsdyna
+*MAT_ELASTIC
+$#   mid       rho         e        pr
+         17.8500e-092.1000e+05    0.3000
+*SECTION_SHELL
+$#   sid    elform      shrf       nip     propt   qr/irid     icomp
+         1        16     0.833         2         0         0         0
+    0.6000    0.6000    0.6000    0.6000
+*PART
+Part_1
+         1         1         1
+*NODE
+         1   -900.00000000   -600.00000000      0.00000000
 ```
-ε(z) = ε_membrane + z · κ
-```
 
-- **Membrane (z=0)**: 면내 변형만. 굽힘 없는 순수 인장/압축/전단.
-- **Bending (z=±t/2)**: 곡률에 의한 변형. z에 선형 비례.
-- **Total (z=+t/2)**: Upper surface의 최종 응력. 기존 출력과 동일.
+### Morphing Success
+The [test_morphing.py](file:///d:/PythonCodeStudy/WHT_LightChassisModel/test_jaxSSO/test_morphing.py) script successfully morphed 285 nodes onto the auto-bead target and computed the frequencies:
+*   **Rough Morphed (50mm) Frequencies**: [16.85, 29.57, 38.59, 49.85, 50.4] Hz.
 
-### Max Envelope 계산
-
-각 요소별로 Upper/Lower의 Von Mises를 비교하여 큰 쪽의 전체 텐서를 선택합니다.
-이는 상용 S/W의 "Worst Case" 표시와 동일한 기능입니다.
-
-## 백업 파일
-
-- `wht_solver/wht_stress_recovery_backup_20260504.py`: 리팩토링 전 원본
+> [!TIP]
+> Use `python test_jaxSSO/test_morphing.py` without the `--no-viz` flag to visually inspect the morphing results (gold mesh vs grey original).

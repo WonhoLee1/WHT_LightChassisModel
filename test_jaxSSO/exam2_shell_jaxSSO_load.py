@@ -143,9 +143,20 @@ def evaluate_static_response_twist(model: WHTMeshModel, cfg: PipelineConfig):
                         .expand_by_face(angle_limit_deg=30.0, z_min=z_flange_min)
                         .get_ids())
     
-    print(f"    [선택] Selector 체이닝 결과: 좌측 {len(left_slave_nids)}개, 우측 {len(right_slave_nids)}개 선택됨.")
+    # [Fallback] 만약 고급 선택 기능으로 노드를 찾지 못한 경우, 단순 영역 선택으로 대체 (강건성 확보)
+    if not left_slave_nids:
+        print("    <!> 좌측 플랜지 선택 실패. 단순 영역 선택(X-min)으로 전환합니다.")
+        left_slave_nids = WHTSelector(model).by_box(x=(xmin-0.1, xmin+1.0), y=y_range).get_ids()
+    if not right_slave_nids:
+        print("    <!> 우측 플랜지 선택 실패. 단순 영역 선택(X-max)으로 전환합니다.")
+        right_slave_nids = WHTSelector(model).by_box(x=(xmax-1.0, xmax+0.1), y=y_range).get_ids()
+
+    print(f"    [선택] 최종 결과: 좌측 {len(left_slave_nids)}개, 우측 {len(right_slave_nids)}개 선택됨.")
     
     # 마스터 노드 추가 및 RBE3 설정
+    if not left_slave_nids or not right_slave_nids:
+        raise ValueError("비틀림 테스트를 위한 노드 선택에 실패했습니다. 모델의 기하구조를 확인하십시오.")
+
     l_mid = np.mean([model.nodes[n].coords() for n in left_slave_nids], axis=0)
     r_mid = np.mean([model.nodes[n].coords() for n in right_slave_nids], axis=0)
     
@@ -201,14 +212,21 @@ def main():
 
     print_result_table(all_summary)
     
-    # 비틀림 시나리오 실행
-    cfg_t = test_suite[0]
+    # 비틀림 시나리오 실행 (모든 변에 플랜지가 있는 설정으로 테스트)
+    cfg_t = PipelineConfig(mesh_type='quad4', mesh_size_xy=60.0, flanges=(True, True, True, True))
     model_t, _ = build_structural_model(cfg_t)
     result_t = evaluate_static_response_twist(model_t, cfg_t)
     
     # 시각화
     viz = WHTVisualizer(title="WHTSelector 기반 비틀림 해석 결과", show=True)
-    meta = WHTMetadata(solver_name="JaxSSO", analysis_type="static", unit_length="mm", unit_force="N")
+    meta = WHTMetadata(
+        solver_name="JaxSSO", 
+        solver_version="2.1.0",
+        analysis_type="static", 
+        coordinate_system="cartesian",
+        unit_length="mm", 
+        unit_force="N"
+    )
     viz.load_results(result_t.to_wht_result_data(meta, model_t))
     if hasattr(viz.plotter, 'app'): viz.plotter.app.exec_()
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TRIA3 element K ?? ??? (??? ?? ??)."""
+"""TRIA3 element K 행렬 검증 (강성 행렬 단위 테스트)."""
 import sys
 from pathlib import Path
 import numpy as np
@@ -12,7 +12,7 @@ from wht_solver.wht_tria3_element import (
     M_tria3_lumped,
 )
 
-# ---------- ?? stub ----------
+# ---------- 모델 stub ----------
 class Node:
     def __init__(self, x, y, z): self.x, self.y, self.z = x, y, z
 class Elem:
@@ -34,7 +34,7 @@ def check(label, cond, detail=''):
     return cond
 
 # ==========================================================================
-# Test 1: K ??? + ?? ??(6) + ????
+# Test 1: K 행렬 특성 + 강체 모드(6) + 양의 정부호
 # ==========================================================================
 def test_K_properties():
     print("\n--- Test 1: K matrix properties (symmetry, rank, PSD) ---")
@@ -45,17 +45,17 @@ def test_K_properties():
     ok &= check("K is 18x18",        K.shape == (18,18))
     ok &= check("K is symmetric",    np.allclose(K, K.T, atol=1e-8))
 
-    # ?? ?? 6?: rank = 18-6 = 12
+    # 강체 모드 6개: rank = 18-6 = 12
     rank = np.linalg.matrix_rank(K, tol=1e-4)
     ok &= check("rank(K) == 12",     rank == 12, f"got {rank}")
 
-    # ?? ??? >= 0 (????)
+    # 모든 고유값 >= 0 (양의 정부호)
     eigs = np.linalg.eigvalsh(K)
     ok &= check("K is PSD (min eig >= -1e-6)", eigs.min() >= -1e-6, f"min={eigs.min():.3e}")
     return ok
 
 # ==========================================================================
-# Test 2: ?? ???? ? K*u = 0
+# Test 2: 강체 변위 시 K*u = 0
 # ==========================================================================
 def test_rigid_body():
     print("\n--- Test 2: Rigid body translation -> K*u = 0 ---")
@@ -71,10 +71,10 @@ def test_rigid_body():
     return ok
 
 # ==========================================================================
-# Test 3: ?? ?? ? ?? ???? ??
+# Test 3: 평면 인장 시 단위 하중 검증
 # ==========================================================================
 def test_plane_tension():
-    print("\n--- Test 3: K_tria3_scipy ? in-plane tension ---")
+    print("\n--- Test 3: K_tria3_scipy 및 in-plane tension ---")
     E, nu, t, e0 = 210000., 0.3, 1., 0.001
     coords = [[0,0,0],[2,0,0],[0,2,0]]
     elems  = [Elem("TRIA3",[1,2,3])]
@@ -85,7 +85,7 @@ def test_plane_tension():
     K = K_tria3_scipy(model, sorted_nids, nid_to_idx).toarray()
     ok = check("K assembled (18x18)", K.shape == (18,18))
 
-    # u_x = e0*x: ??1=(0), ??2=(2*e0), ??3=(0)
+    # u_x = e0*x: 노드1=(0), 노드2=(2*e0), 노드3=(0)
     u = np.zeros(18)
     u[6] = 2.*e0          # node2 u_x (DOF index = 1*6+0)
     f = K @ u
@@ -93,10 +93,10 @@ def test_plane_tension():
     return ok
 
 # ==========================================================================
-# Test 4: ?? ?? ? ?? ?? ??
+# Test 4: 질량 행렬 및 전체 질량 체크
 # ==========================================================================
 def test_lumped_mass():
-    print("\n--- Test 4: M_tria3_lumped ? total mass check ---")
+    print("\n--- Test 4: M_tria3_lumped 및 total mass check ---")
     E, nu, t, rho = 210000., 0.3, 2., 7.85e-6
     coords = [[0,0,0],[2,0,0],[0,2,0]]
     elems  = [Elem("TRIA3",[1,2,3])]
@@ -110,17 +110,17 @@ def test_lumped_mass():
     area = 0.5*2.*2.
     expected_mass = area * t * rho
     ok = check("M vector length == ndof", len(M) == ndof)
-    # ? ??? ??? total_mass? ??? ?
+    # 각 자유도 합이 total_mass와 같은지 확인
     ok &= check("Total X-mass correct",
                 abs(M[0::6].sum() - expected_mass) < 1e-10,
                 f"got={M[0::6].sum():.4e}, exp={expected_mass:.4e}")
     return ok
 
 # ==========================================================================
-# Test 5: ?? ?? (QUAD4 + TRIA3) ? K_tria3_scipy ? QUAD4 ???
+# Test 5: 혼합 메쉬 (QUAD4 + TRIA3) 시 K_tria3_scipy 내 QUAD4 무시
 # ==========================================================================
 def test_mixed_mesh():
-    print("\n--- Test 5: Mixed QUAD4+TRIA3 ? only TRIA3 assembled ---")
+    print("\n--- Test 5: Mixed QUAD4+TRIA3 및 only TRIA3 assembled ---")
     coords = [[0,0,0],[1,0,0],[1,1,0],[0,1,0],[2,0,0]]
     elems  = [Elem("QUAD4",[1,2,3,4]), Elem("TRIA3",[2,5,3])]
     model  = Model(coords, elems)
@@ -131,7 +131,7 @@ def test_mixed_mesh():
     ndof = 5*6
     ok = check("shape correct", K.shape == (ndof, ndof))
 
-    # QUAD4 ??(1,4)? ? TRIA3? ?? ? ? ? ?? DOF ?? 0
+    # QUAD4 전용 노드(1,4)는 TRIA3 행렬에서 해당 DOF 값이 0이어야 함
     row_node1 = K[0:6, :].toarray()
     ok &= check("Node 1 (QUAD-only) rows are zero", np.allclose(row_node1, 0))
     return ok

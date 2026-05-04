@@ -110,10 +110,18 @@ def solve_modal(model: WHTMeshModel, title: str):
     return result.to_wht_result_data(meta, model)
 
 def main():
-    target_file = "bead_model.k"
-    # Target Mesh (Mesh B) - Fine
+    import argparse
+    parser = argparse.ArgumentParser(description="WHT Morphing Test")
+    parser.add_argument("--no-viz", action="store_true", help="Skip visualization")
+    args = parser.parse_args()
+
+    target_file = "autobead_target.k"
+    # Target Mesh (Mesh B) - Auto-Bead model from exam3
     if not os.path.exists(target_file):
-        generate_mock_bead_model_k(target_file)
+        print(f" -> [Info] {target_file} not found. Generating mock target instead...")
+        target_file = "bead_model.k"
+        if not os.path.exists(target_file):
+            generate_mock_bead_model_k(target_file)
         
     # 1. Original Reference (Fine - 8mm)
     res_orig = solve_modal(build_base_model(8.0), "Fine Original (8mm)")
@@ -138,6 +146,10 @@ def main():
     # 4. Solve Morphed Rough Model
     res_morphed = solve_modal(rough_model, "Rough Morphed (50mm)")
     
+    if args.no_viz:
+        print(" -> [Info] --no-viz option detected. Skipping visualization.")
+        return
+
     # 5. Visualize
     print(" -> Launching Visualizer (Fine Original vs Rough Morphed)...")
     app = WHTVisualizer()

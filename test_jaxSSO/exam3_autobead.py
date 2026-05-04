@@ -93,7 +93,7 @@ class PipelineConfig:
     
     # 2. 메시 제어 (Mesh Control)
     solve_mode: str = 'shell' 
-    mesh_size_xy: float = 40.0
+    mesh_size_xy: float = 20.0
     mesh_size_z:  float = 10.0
     draft_angle:  float = 25.0
     wall_layers:  int = 2
@@ -106,10 +106,12 @@ class PipelineConfig:
     bead_mode: str = 'random'
     bead_margin: float = 50.0
     bead_target_ratio: float = 0.4
-    bead_min_depth: float = 0.00
-    bead_max_depth: float = 0.05
-    bead_min_size: float = 50.0
+    bead_min_depth: float = 10.0
+    bead_max_depth: float = 20.0
+    bead_min_size: float = 150.0
     bead_max_size: float = 200.0
+    
+    bead_direction: float = 0.0 # 1.0: Up, -1.0: Down, 0.0: Both
     
     # 5. 솔버 및 해석 설정 (Solver & Analysis Settings)
     num_modes: int = 10
@@ -170,7 +172,8 @@ class ModalAnalysisPipeline:
             min_size=self.cfg.bead_min_size,
             max_size=self.cfg.bead_max_size,
             origin='center',
-            mode=self.cfg.bead_mode
+            mode=self.cfg.bead_mode,
+            bead_direction=self.cfg.bead_direction
         )
 
     def assemble_model(self):
@@ -376,13 +379,22 @@ def inject_bead_metadata(wht_data: WHTResultData, model: WHTMeshModel, n_orig: D
 def main():
     parser = argparse.ArgumentParser(description="토포그래피 자동 비드 생성 및 통합 모드 해석 (개선판)")
     parser.add_argument("--solve", type=str, choices=['shell', 'solid'], default='shell')
-    parser.add_argument("--mode", type=str, choices=['grid', 'random'], default='random')
+    parser.add_argument("--mode", type=str, choices=['grid', 'random', 'rib', 'network'], default='network')
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--export", type=str, help="메시를 저장할 파일 경로 (예: model.k)")
+    parser.add_argument("--no-viz", action="store_true", help="시각화 창을 띄우지 않습니다.")
+    parser.add_argument("--direction", type=str, choices=['up', 'down', 'both'], default='down', help="비드 생성 방향")
     args = parser.parse_args()
 
+    dir_map = {'up': 1.0, 'down': -1.0, 'both': 0.0}
+    
     hook_sequence = [(0.0, 12.0), (-5.0, 0.0), (0.0, -10.0), (-10.0, 0.0)]
-    cfg = PipelineConfig(solve_mode=args.solve, bead_mode=args.mode, flange_segments=hook_sequence)
+    cfg = PipelineConfig(
+        solve_mode=args.solve, 
+        bead_mode=args.mode, 
+        flange_segments=hook_sequence,
+        bead_direction=dir_map[args.direction]
+    )
 
     print("\n" + "="*80)
     print(f" [시스템] {cfg.solve_mode.upper()} 파이프라인 가동 시작")
@@ -402,7 +414,10 @@ def main():
         else:
             pipeline.solve()
         
-        pipeline.visualize()
+        if not args.no_viz:
+            pipeline.visualize()
+        else:
+            print(" -> [알림] --no-viz 옵션에 의해 시각화를 건너뜁니다.")
             
     except Exception:
         print("\n" + "!"*80)
