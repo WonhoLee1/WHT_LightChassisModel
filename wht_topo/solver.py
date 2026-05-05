@@ -123,6 +123,7 @@ class WHTopographySolver:
         sym_x: bool = False,
         bead_connect: bool = False,
         connect_gap: float = 80.0,
+        bead_steps: int = 0,
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -134,6 +135,7 @@ class WHTopographySolver:
         self.sym_x          = sym_x
         self.bead_connect   = bead_connect
         self.connect_gap    = connect_gap  # mm, 버드 연결 시 채울 최대 간격
+        self.bead_steps     = bead_steps   # 0 = 연속, N >= 1 = N단계 이산 높이
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
 
         # 비드 돌출 방향 정규화
@@ -735,26 +737,33 @@ class WHTopographySolver:
         self.heights = x * self.h_max
         return self.heights
 
-    def apply_final_shape(self):
+    def apply_final_shape(self, skip_filter: bool = False):
         """
         최적화 결과(self.heights)를 모델 노드 좌표에 영구 적용합니다.
         solve() 완료 후 export 전에 반드시 호출하십시오.
-        """
-        h_filtered = self._H @ self.heights
-        self._apply_heights(h_filtered)
-        print(f" -> [Solver] 최종 비드 형상 적용 완료 "
-              f"(Max: {np.max(h_filtered):.2f}mm, "
-              f"Avg: {np.mean(h_filtered):.2f}mm)")
 
-    def get_full_heights(self) -> np.ndarray:
+        Parameters
+        ----------
+        skip_filter : bool
+            True이면 공간 필터(_H)를 재적용하지 않습니다.
+            이산화(--height-steps) 후 호출 시 반드시 True로 설정해야
+            양자화된 높이값이 블러링되지 않습니다.
+        """
+        h = self.heights if skip_filter else self._H @ self.heights
+        self._apply_heights(h)
+        print(f" -> [Solver] 최종 비드 형상 적용 완료 "
+              f"(Max: {np.max(h):.2f}mm, "
+              f"Avg: {np.mean(h):.2f}mm)")
+
+    def get_full_heights(self, skip_filter: bool = False) -> np.ndarray:
         """
         시각화용 전체 노드(sorted_nids 기준) 비드 높이 배열을 반환합니다.
         """
         h_full = np.zeros(len(self.sorted_nids))
-        h_filtered = self._H @ self.heights
+        h = self.heights if skip_filter else self._H @ self.heights
         for i, nid in enumerate(self._design_nids):
             idx = self.nid_to_idx[nid]
-            h_full[idx] = h_filtered[i]
+            h_full[idx] = h[i]
         return h_full
 
 

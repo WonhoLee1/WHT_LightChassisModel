@@ -160,10 +160,22 @@ def run_industrial_topo(args):
         # 여기서는 비동기적으로 두기 위해 STOP 신호만 보냄
         queue.put("STOP")
 
-    # 4. 최종 형상을 모델 노드 좌표에 영구 적용
-    solver.apply_final_shape()
-    
-    # 5. 익스포트
+    # 4. 비드 높이 이산화 (--height-steps N 지정 시)
+    discrete_height = args.height_steps >= 2
+    if discrete_height:
+        n = args.height_steps
+        step = solver.h_max / n
+        # 각 높이값을 가장 가까운 step 배수로 반올림 (0 포함 n+1개 레벨)
+        solver.heights = np.round(solver.heights / step) * step
+        solver.heights = np.clip(solver.heights, 0.0, solver.h_max)
+        levels = np.unique(np.round(solver.heights, 4))
+        print(f" -> [이산화] {n}단계 높이 양자화 완료: {levels} mm")
+
+    # 5. 최종 형상을 모델 노드 좌표에 영구 적용
+    # 이산화 후에는 필터 재적용 시 양자화값이 블러링되므로 skip_filter=True
+    solver.apply_final_shape(skip_filter=discrete_height)
+
+    # 6. 익스포트
     if args.export:
         model.export_to_solver('lsdyna', args.export, reorder=True)
         print(f" -> [성공] 결과 저장 완료: {args.export}")
@@ -175,7 +187,7 @@ def run_industrial_topo(args):
         result_data = model.to_wht_result_data()
         
         # 비드 높이 데이터 추가 (0~1 비율로 정규화하여 레전드와 일치시킴)
-        heights_full = solver.get_full_heights()
+        heights_full = solver.get_full_heights(skip_filter=discrete_height)
         # heights_full은 0~h_max 범위이므로 h_max로 나누어 0~1 범위를 만듦
         bead_ratio = (heights_full / (solver.h_max + 1e-12)).reshape(1, -1, 1)
         result_data.point_data["Bead_Height"] = bead_ratio
@@ -219,6 +231,8 @@ def main():
 
     6. 대칭 + 연결 조합 (최고 품질 설계):
        python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --gui
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --bead-area 0.25 --gui       
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap  100.0 --bead-area 0.25 --height-steps 2 --gui   
 
     7. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
        python wht_topo/run_topo.py --iters 50 --no-viz --export final_bead_pattern.k
@@ -274,6 +288,8 @@ def main():
                         help="비드 연결 시 채울 최대 간격 (mm, 기본: 80.0 ≈ 메시 간격×2)")
     parser.add_argument("--draw-dir",     type=float, nargs=3, default=[0.0, 0.0, 1.0],
                         help="비드 돌출 방향 벡터 (X Y Z, 기본: 0 0 1)")
+    parser.add_argument("--height-steps", type=int, default=0,
+                        help="비드 높이 이산화 단계 수 (예: 3 → 0/h*1/3/h*2/3/h_max, 기본: 0 = 연속)")
 
     # ── 하중 케이스 가중치 (Weighted Sum Method) ─────────────────────────────
     parser.add_argument("--w-bending",   type=float, default=1.0, help="중앙 굽힘 하중 가중치 (기본: 1.0)")
