@@ -198,53 +198,98 @@ def run_industrial_topo(args):
 def main():
     """
     [WHT] Industrial Topography Optimization CLI
-    
-    다양한 실행 시나리오 예시:
+    ============================================================
+
+    ■ 실행 시나리오 예시 (Usage Examples)
     ------------------------------------------------------------------------------------------------
     1. 기본 실행 (GUI 모니터링 + 결과 저장):
        python wht_topo/run_topo.py --iters 30 --gui --export chassis_result.k
 
-    2. 강건 설계 (4개 코너 리프팅 하중 가중치 강화 + 좌우 대칭 조건):
-       python wht_topo/run_topo.py --iters 40 --w-lifting 2.0 --sym-x --gui
+    2. 강건 설계 (좌우 대칭 + 리프팅 가중치 강화):
+       python wht_topo/run_topo.py --iters 40 --sym-x --w-lifting 2.0 --gui
 
     3. 제조 제약 강화 (비드 영역 25% 제한 + 최소 폭 100mm):
        python wht_topo/run_topo.py --bead-area 0.25 --min-width 100.0 --gui
 
-    4. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
+    4. 비드 연결 활성화 (단절된 비드 자동 연결, 기본 갭 80mm):
+       python wht_topo/run_topo.py --iters 30 --bead-connect --gui
+
+    5. 비드 연결 + 갭 크기 조정 (120mm 이하 갭까지 채움):
+       python wht_topo/run_topo.py --iters 30 --bead-connect --connect-gap 120.0 --gui
+
+    6. 대칭 + 연결 조합 (최고 품질 설계):
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --gui
+
+    7. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
        python wht_topo/run_topo.py --iters 50 --no-viz --export final_bead_pattern.k
-
-       python wht_topo/run_topo.py --iters 30 --bead-area 0.3 --sym-x --gui
-
     ------------------------------------------------------------------------------------------------
+
+    ■ 전체 옵션 레퍼런스
+    ─────────────────────────────────────────────────────────────────────────────
+    [기본 최적화]
+      --iters N          최대 반복 횟수 (기본: 30)
+      --bead-height F    최대 비드 높이 mm (기본: 10.0)
+      --min-width F      최소 비드 폭 / 공간 필터 반경 mm (기본: 80.0)
+      --bead-area F      비드 점유 면적 비율 0.0~1.0 (기본: 0.3 = 30%)
+
+    [비드 형상 제어]
+      --sym-x            Y-Z 평면 기준 좌우 대칭 제약 강제
+                         → KDTree로 대칭 노드 쌍을 매핑, 설계변수/민감도 평균화
+      --bead-connect     단절된 비드 영역을 Morphological Closing으로 자동 연결
+                         → Dilation(팽창) → Erosion(수축)으로 갭을 채움
+      --connect-gap F    비드 연결 시 채울 최대 갭 크기 mm (기본: 80.0)
+                         → 메시 간격(40mm)의 2~3배 권장. 너무 크면 면적 제약 느슨해짐
+      --draw-dir X Y Z   비드 돌출 방향 벡터 (기본: 0 0 1 = +Z 방향)
+
+    [하중 케이스 가중치]
+      --w-bending F      중앙 굽힘 하중 가중치 (기본: 1.0)
+      --w-twisting F     대각 비틀림 하중 가중치 (기본: 1.5)
+      --w-lifting F      4코너 개별 리프팅 하중 전체 가중치 (기본: 1.2)
+                         → 4개 케이스로 분할되므로 케이스당 실효 가중치 = F/4
+      --target-freq F    목표 고유 진동수 제약 Hz (기본: 0.0 = 미사용)
+
+    [시각화 및 출력]
+      --gui              실시간 모니터링 GUI (PySide6) 실행
+      --no-viz           최적화 완료 후 최종 3D 시각화 생략
+      --export PATH      최종 결과 파일 저장 경로 LS-DYNA .k (기본: industrial_bead.k)
+    ─────────────────────────────────────────────────────────────────────────────
     """
-    parser = argparse.ArgumentParser(description="WHT 산업용 섀시 비드 최적화(Topography) 도구")
-    
-    # 기본 최적화 설정
-    parser.add_argument("--iters", type=int, default=30, help="최대 반복 횟수 (기본: 30)")
+    parser = argparse.ArgumentParser(
+        description="WHT 산업용 섀시 비드 최적화(Topography) 도구",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # ── 기본 최적화 설정 ─────────────────────────────────────────────────────
+    parser.add_argument("--iters",       type=int,   default=30,   help="최대 반복 횟수 (기본: 30)")
     parser.add_argument("--bead-height", type=float, default=10.0, help="최대 비드 높이 (mm, 기본: 10.0)")
-    parser.add_argument("--min-width", type=float, default=80.0, help="최소 비드 폭/필터 반경 (mm, 기본: 80.0)")
-    parser.add_argument("--bead-area", type=float, default=0.3, help="비드 점유 면적 비율 (0.0~1.0, 기본: 0.3)")
-    
-    # 제약 조건 및 시각화
-    parser.add_argument("--sym-x", action="store_true", help="Y-Z 평면 기준 좌우 대칭 제약 조건 활성화")
-    parser.add_argument("--bead-connect", action="store_true", help="모폴로지 클로징으로 단절된 비드 자동 연결")
-    parser.add_argument("--connect-gap", type=float, default=80.0, help="비드 연결 시 채울 최대 간격 (mm, 기본: 80.0)")
-    parser.add_argument("--gui", action="store_true", help="실시간 모니터링 GUI(PySide6) 실행")
-    parser.add_argument("--no-viz", action="store_true", help="최적화 완료 후 최종 3D 시각화 생략")
-    parser.add_argument("--export", type=str, default="industrial_bead.k", help="최종 결과 파일 저장 경로 (LS-DYNA .k)")
-    
-    # 하중 케이스 가중치 (Weighted Sum Method)
-    parser.add_argument("--w-bending", type=float, default=1.0, help="중앙 굽힘 하중 가중치 (기본: 1.0)")
-    parser.add_argument("--w-twisting", type=float, default=1.5, help="대각 비틀림 하중 가중치 (기본: 1.5)")
-    parser.add_argument("--w-lifting", type=float, default=1.2, help="4코너 리프팅 하중 전체 가중치 (기본: 1.2)")
-    parser.add_argument("--target-freq", type=float, default=0.0, help="목표 고유 진동수 제약 (Hz, 기본: 0.0)")
-    
-    # 고급 설정
-    parser.add_argument("--draw-dir", type=float, nargs=3, default=[0.0, 0.0, 1.0], help="비드 돌출 방향 벡터 (X Y Z)")
-    parser.add_argument("--mesh-size", type=float, default=10.0, help="BC 탐색을 위한 기준 메시 크기 (mm)")
+    parser.add_argument("--min-width",   type=float, default=80.0, help="최소 비드 폭 / 필터 반경 (mm, 기본: 80.0)")
+    parser.add_argument("--bead-area",   type=float, default=0.3,  help="비드 점유 면적 비율 (0.0~1.0, 기본: 0.3)")
+
+    # ── 비드 형상 제어 ───────────────────────────────────────────────────────
+    parser.add_argument("--sym-x",        action="store_true",
+                        help="Y-Z 평면 기준 좌우 대칭 제약 조건 활성화 (KDTree 대칭 노드 쌍 매핑)")
+    parser.add_argument("--bead-connect", action="store_true",
+                        help="Morphological Closing으로 단절된 비드 자동 연결")
+    parser.add_argument("--connect-gap",  type=float, default=80.0,
+                        help="비드 연결 시 채울 최대 간격 (mm, 기본: 80.0 ≈ 메시 간격×2)")
+    parser.add_argument("--draw-dir",     type=float, nargs=3, default=[0.0, 0.0, 1.0],
+                        help="비드 돌출 방향 벡터 (X Y Z, 기본: 0 0 1)")
+
+    # ── 하중 케이스 가중치 (Weighted Sum Method) ─────────────────────────────
+    parser.add_argument("--w-bending",   type=float, default=1.0, help="중앙 굽힘 하중 가중치 (기본: 1.0)")
+    parser.add_argument("--w-twisting",  type=float, default=1.5, help="대각 비틀림 하중 가중치 (기본: 1.5)")
+    parser.add_argument("--w-lifting",   type=float, default=1.2, help="4코너 리프팅 하중 전체 가중치 / 4개 케이스 분할 (기본: 1.2)")
+    parser.add_argument("--target-freq", type=float, default=0.0, help="목표 고유 진동수 제약 (Hz, 기본: 0.0 = 미사용)")
+
+    # ── 시각화 및 출력 ───────────────────────────────────────────────────────
+    parser.add_argument("--gui",      action="store_true",         help="실시간 모니터링 GUI(PySide6) 실행")
+    parser.add_argument("--no-viz",   action="store_true",         help="최적화 완료 후 최종 3D 시각화 생략")
+    parser.add_argument("--export",   type=str, default="industrial_bead.k",
+                        help="최종 결과 파일 저장 경로 (LS-DYNA .k, 기본: industrial_bead.k)")
+    parser.add_argument("--mesh-size", type=float, default=10.0,  help="BC 탐색을 위한 기준 메시 크기 (mm)")
 
     args = parser.parse_args()
-    
+
     # 최적화 파이프라인 실행
     run_industrial_topo(args)
 
