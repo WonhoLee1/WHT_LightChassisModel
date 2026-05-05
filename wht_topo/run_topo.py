@@ -10,6 +10,7 @@ import argparse
 import numpy as np
 import sys
 import io
+import multiprocessing
 from pathlib import Path
 
 # Force UTF-8 encoding
@@ -124,18 +125,38 @@ def run_industrial_topo(args):
 
     # 3. 최적화 실행 — WHTopographySolver (설계 변수: 노드별 비드 높이)
     print(f" -> [최적화] 최소 비드 폭: {args.min_width}mm | 최대 비드 높이: {args.bead_height}mm")
+    print(f" -> [제약] 비드 생성 영역 제한 (Bead Area Constraint): {args.bead_area * 100:.1f}%")
     weights = {"bending": args.w_bending, "twisting": args.w_twisting, "lifting": args.w_lifting}
 
     solver = WHTopographySolver(
         model, load_manager, constraints,
         bead_height_max=args.bead_height,
-        bead_height_ratio=args.vol_frac,    # 비드 면적 비율 (0~1)
+        bead_height_ratio=args.bead_area,    # 비드 면적 비율 (0~1)
         min_width=args.min_width,
         draw_dir=args.draw_dir,
         weights=weights,
         mesh_size_z=10.0,
+        sym_x=args.sym_x,
     )
-    final_heights = solver.solve(max_iter=args.iters)
+    
+    # 모니터링 GUI 실행
+    ui_process = None
+    callback = None
+    if args.gui:
+        from wht_topo.monitor_ui import start_monitor_ui
+        queue = multiprocessing.Queue()
+        ui_process = multiprocessing.Process(target=start_monitor_ui, args=(queue,))
+        ui_process.daemon = True # 메인 프로세스 종료 시 함께 종료
+        ui_process.start()
+        callback = queue.put
+
+    final_heights = solver.solve(max_iter=args.iters, callback=callback)
+
+    if ui_process and ui_process.is_alive():
+        print(" -> [GUI] 최적화 완료. 모니터링 창을 닫으면 시각화로 넘어갑니다.")
+        # UI 종료를 기다리거나 계속 진행할 수 있음. 
+        # 여기서는 비동기적으로 두기 위해 STOP 신호만 보냄
+        queue.put("STOP")
 
     # 4. 최종 형상을 모델 노드 좌표에 영구 적용
     solver.apply_final_shape()
@@ -151,9 +172,11 @@ def run_industrial_topo(args):
         # WHTMeshModel을 WHTResultData로 변환 (시각화 모듈 호환성)
         result_data = model.to_wht_result_data()
         
-        # 비드 높이 데이터 추가 (스칼라 필드)
+        # 비드 높이 데이터 추가 (0~1 비율로 정규화하여 레전드와 일치시킴)
         heights_full = solver.get_full_heights()
-        result_data.add_scalar_field("Bead_Height", heights_full)
+        # heights_full은 0~h_max 범위이므로 h_max로 나누어 0~1 범위를 만듦
+        bead_ratio = (heights_full / (solver.h_max + 1e-12)).reshape(1, -1, 1)
+        result_data.point_data["Bead_Height"] = bead_ratio
         
         # 메타데이터 업데이트 (필수 필드 포함)
         result_data.metadata = WHTMetadata(
@@ -171,23 +194,54 @@ def run_industrial_topo(args):
         viz.show()
 
 def main():
-    parser = argparse.ArgumentParser(description="Industrial Topography Optimization Tool")
-    parser.add_argument("--iters", type=int, default=30)
-    parser.add_argument("--bead-height", type=float, default=10.0)
-    parser.add_argument("--min-width", type=float, default=80.0, help="최소 비드 폭 (mm)")
-    parser.add_argument("--vol-frac", type=float, default=0.3)
-    parser.add_argument("--discrete", action="store_true", help="이산적(0 or Max) 비드 생성")
-    parser.add_argument("--export", type=str, default="industrial_bead.k")
-    parser.add_argument("--no-viz", action="store_true", help="시각화 창 띄우지 않음")
+    """
+    [WHT] Industrial Topography Optimization CLI
     
-    # 하중 가중치 인자 추가
-    parser.add_argument("--w-bending", type=float, default=1.0, help="벤딩 강성 가중치")
-    parser.add_argument("--w-twisting", type=float, default=1.5, help="비틀림 강성 가중치")
-    parser.add_argument("--w-lifting", type=float, default=1.2, help="리프팅 강성 가중치")
-    parser.add_argument("--target-freq", type=float, default=0.0, help="목표 고유 진동수 (Hz)")
-    parser.add_argument("--draw-dir", type=float, nargs=3, default=[0.0, 0.0, 1.0], help="비드 돌출 방향 (X Y Z)")
+    다양한 실행 시나리오 예시:
+    ------------------------------------------------------------------------------------------------
+    1. 기본 실행 (GUI 모니터링 + 결과 저장):
+       python wht_topo/run_topo.py --iters 30 --gui --export chassis_result.k
+
+    2. 강건 설계 (4개 코너 리프팅 하중 가중치 강화 + 좌우 대칭 조건):
+       python wht_topo/run_topo.py --iters 40 --w-lifting 2.0 --sym-x --gui
+
+    3. 제조 제약 강화 (비드 영역 25% 제한 + 최소 폭 100mm):
+       python wht_topo/run_topo.py --bead-area 0.25 --min-width 100.0 --gui
+
+    4. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
+       python wht_topo/run_topo.py --iters 50 --no-viz --export final_bead_pattern.k
+
+       python wht_topo/run_topo.py --iters 30 --bead-area 0.3 --sym-x --gui
+
+    ------------------------------------------------------------------------------------------------
+    """
+    parser = argparse.ArgumentParser(description="WHT 산업용 섀시 비드 최적화(Topography) 도구")
     
+    # 기본 최적화 설정
+    parser.add_argument("--iters", type=int, default=30, help="최대 반복 횟수 (기본: 30)")
+    parser.add_argument("--bead-height", type=float, default=10.0, help="최대 비드 높이 (mm, 기본: 10.0)")
+    parser.add_argument("--min-width", type=float, default=80.0, help="최소 비드 폭/필터 반경 (mm, 기본: 80.0)")
+    parser.add_argument("--bead-area", type=float, default=0.3, help="비드 점유 면적 비율 (0.0~1.0, 기본: 0.3)")
+    
+    # 제약 조건 및 시각화
+    parser.add_argument("--sym-x", action="store_true", help="Y-Z 평면 기준 좌우 대칭 제약 조건 활성화")
+    parser.add_argument("--gui", action="store_true", help="실시간 모니터링 GUI(PySide6) 실행")
+    parser.add_argument("--no-viz", action="store_true", help="최적화 완료 후 최종 3D 시각화 생략")
+    parser.add_argument("--export", type=str, default="industrial_bead.k", help="최종 결과 파일 저장 경로 (LS-DYNA .k)")
+    
+    # 하중 케이스 가중치 (Weighted Sum Method)
+    parser.add_argument("--w-bending", type=float, default=1.0, help="중앙 굽힘 하중 가중치 (기본: 1.0)")
+    parser.add_argument("--w-twisting", type=float, default=1.5, help="대각 비틀림 하중 가중치 (기본: 1.5)")
+    parser.add_argument("--w-lifting", type=float, default=1.2, help="4코너 리프팅 하중 전체 가중치 (기본: 1.2)")
+    parser.add_argument("--target-freq", type=float, default=0.0, help="목표 고유 진동수 제약 (Hz, 기본: 0.0)")
+    
+    # 고급 설정
+    parser.add_argument("--draw-dir", type=float, nargs=3, default=[0.0, 0.0, 1.0], help="비드 돌출 방향 벡터 (X Y Z)")
+    parser.add_argument("--mesh-size", type=float, default=10.0, help="BC 탐색을 위한 기준 메시 크기 (mm)")
+
     args = parser.parse_args()
+    
+    # 최적화 파이프라인 실행
     run_industrial_topo(args)
 
 if __name__ == "__main__":

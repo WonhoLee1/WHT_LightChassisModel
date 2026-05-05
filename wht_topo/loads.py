@@ -205,17 +205,32 @@ class StochasticLoadManager:
               f"반대 2코너에 ±{abs(twisting_load_z):.0f}N 비틀림 하중")
         load_cases.append((lc_twisting, weights["twisting"]))
 
-        # ── Case 3: Lifting (코너 리프팅) ───────────────────────────────────
-        # BC: 3개 코너 (0, 1, 2번) 에 Translation 고정 (회전 자유)
-        # LOAD: 나머지 1개 코너 (3번, 우상)에 상향 하중
-        lc_lifting = WHTLoadCase(name="lifting")
-        lc_lifting.add_bc(corner0 + corner1 + corner2, dofs=(0, 1, 2))
-        if corner3:
-            lc_lifting.add_force(corner3, dofs=(2,),
-                                 values=(lifting_load_z,), distribute=True)
-        print(f" -> [LoadCase] Lifting: 3코너 Translation 고정, "
-              f"1코너에 +{lifting_load_z:.0f}N 리프팅 하중")
-        load_cases.append((lc_lifting, weights["lifting"]))
+        # ── Case 3~6: Lifting (4개 코너 개별 리프팅) ──────────────────────────
+        # 각 코너에 대해 3개 코너 고정 + 1개 코너 리프팅을 개별 케이스로 생성
+        corners = [corner0, corner1, corner2, corner3]
+        for i in range(4):
+            lc_name = f"lifting_c{i}"
+            lc_lift = WHTLoadCase(name=lc_name)
+            
+            # 리프팅 지점을 제외한 나머지 3개 코너 고정
+            fixed_corners = []
+            for j in range(4):
+                if i == j: continue
+                fixed_corners += corners[j]
+            
+            if fixed_corners:
+                lc_lift.add_bc(fixed_corners, dofs=(0, 1, 2)) # Translation 고정
+            
+            # 대상 코너 리프팅 하중 인가
+            target_corner = corners[i]
+            if target_corner:
+                lc_lift.add_force(target_corner, dofs=(2,), 
+                                  values=(lifting_load_z,), distribute=True)
+                
+            print(f" -> [LoadCase] {lc_name}: {len(fixed_corners)}개 노드 고정, "
+                  f"코너 {i}에 +{lifting_load_z:.0f}N 리프팅 하중")
+            # 리프팅 가중치를 4개 케이스로 나누어 적용 (전체 비중 유지)
+            load_cases.append((lc_lift, weights["lifting"] / 4.0))
 
         return load_cases
 

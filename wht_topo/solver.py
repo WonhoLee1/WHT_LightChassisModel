@@ -52,6 +52,26 @@ element_grad_jax = jax.grad(element_energy_jax, argnums=(0, 1, 2, 3))
 vmap_element_grad_jax = jax.jit(jax.vmap(element_grad_jax, in_axes=(0,0,0,0,0,0,0,0)))
 
 
+def _von_mises_max(stress_arr: np.ndarray) -> float:
+    """
+    요소별 응력 배열에서 최대 Von-Mises 응력을 계산합니다.
+
+    Parameters
+    ----------
+    stress_arr : (M, 6) ndarray
+        [σx, σy, σz, τxy, τxz, τyz] 순서의 요소 응력 배열
+
+    Returns
+    -------
+    float : 최대 Von-Mises 응력 [MPa]
+    """
+    sx  = stress_arr[:, 0]; sy  = stress_arr[:, 1]; sz  = stress_arr[:, 2]
+    txy = stress_arr[:, 3]; txz = stress_arr[:, 4]; tyz = stress_arr[:, 5]
+    vm = np.sqrt(0.5 * ((sx - sy)**2 + (sy - sz)**2 + (sz - sx)**2)
+                 + 3.0 * (txy**2 + txz**2 + tyz**2))
+    return float(np.max(vm))
+
+
 class WHTopographySolver:
     """
     물리적으로 올바른 Topography Optimization 엔진.
@@ -79,6 +99,8 @@ class WHTopographySolver:
         플랜지 노드 탐색 허용 오차 계산에 사용되는 메시 크기 [mm].
     fd_dz : float
         민감도 계산 시 Z 방향 중앙차분 섭동량 [mm]. 기본값 0.5.
+    sym_x : bool
+        좌우 대칭 제약 조건 활성화 여부. 기본값 False.
     """
 
     # wht_solver와 동일한 쉘 요소 타입 집합
@@ -98,6 +120,7 @@ class WHTopographySolver:
         weights: Optional[Dict[str, float]] = None,
         mesh_size_z: float = 10.0,
         fd_dz: float = 0.5,
+        sym_x: bool = False,
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -106,6 +129,7 @@ class WHTopographySolver:
         self.rmin           = min_width
         self.mesh_size_z    = mesh_size_z
         self.fd_dz          = fd_dz
+        self.sym_x          = sym_x
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
 
         # 비드 돌출 방향 정규화
@@ -145,6 +169,11 @@ class WHTopographySolver:
             mesh_size_z=mesh_size_z,
             weights=self.weights,
         )
+
+        # 좌우 대칭 매핑 (X-mid plane 기준)
+        self._sym_map = None
+        if self.sym_x:
+            self._sym_map = self._build_symmetry_map()
 
         # 초기 비드 높이 (0 = 평탄)
         self.heights = np.zeros(self._n_design)
@@ -187,6 +216,29 @@ class WHTopographySolver:
             if self.model.nodes[nid].z <= z_threshold and nid not in flange_nids
         ]
         return design_nids
+
+    def _build_symmetry_map(self) -> np.ndarray:
+        """
+        X-mid plane을 기준으로 대칭 노드 인덱스 맵을 생성합니다.
+        """
+        print(" -> [Solver] 좌우 대칭(Sym-X) 노드 매핑 중...")
+        coords = np.array([self._coords_orig[nid] for nid in self._design_nids])
+        x_mid = (coords[:, 0].min() + coords[:, 0].max()) / 2.0
+        
+        from scipy.spatial import KDTree
+        tree = KDTree(coords)
+        
+        sym_map = np.arange(self._n_design)
+        for i in range(self._n_design):
+            # 대칭 점 계산: (x, y, z) -> (2*x_mid - x, y, z)
+            target = coords[i].copy()
+            target[0] = 2.0 * x_mid - target[0]
+            
+            dist, idx = tree.query(target)
+            if dist < 1.0: # 1mm 이내이면 대칭점으로 인정
+                sym_map[i] = idx
+        
+        return sym_map
 
     def _build_node_elem_adjacency(self) -> Dict[int, List[int]]:
         """
@@ -310,26 +362,27 @@ class WHTopographySolver:
 
     # ─────────────── 컴플라이언스 및 민감도 ───────────────
 
-    def _compute_total_compliance(self) -> Tuple[float, np.ndarray]:
+    def _compute_total_compliance(self, solver) -> Tuple[float, dict, np.ndarray]:
         """
-        현재 형상에서 모든 하중 케이스의 가중 컴플라이언스와
-        설계 노드별 민감도를 계산합니다.
+        현재 비드 형상에서의 총 컴플라이언스 및 설계 변수별 민감도를 계산합니다.
 
-        WHTSolver.solve_static()을 각 하중 케이스에 직접 활용합니다.
-        민감도는 Adjoint 공식으로 계산합니다:
-            ∂C/∂h_n = Σ_{e∈N(n)} u_e^T (∂K_e/∂z_n) u_e
+        Parameters
+        ----------
+        solver : WHTSolver
+            FEA 연산을 수행할 솔버 인스턴스
 
         Returns
         -------
         total_C : float
             가중 합산 컴플라이언스
+        case_responses : dict
+            하중별 응답 데이터 (C, max_disp, max_stress)
         total_sens : (n_design,) 설계 노드별 민감도
         """
         ndof = len(self.sorted_nids) * 6
         total_C    = 0.0
+        case_responses = {} # {name: {"C": float, "max_disp": float, "max_stress": float}}
         total_sens = np.zeros(self._n_design)
-
-        solver = WHTSolver(self.model)
 
         # JAX Vectorization용 데이터 컨테이너 (QUAD4)
         n_quad = sum(1 for eid in self.elem_ids if self.model.elements[eid].type.upper() in self._QUAD_TYPES)
@@ -339,21 +392,19 @@ class WHTopographySolver:
         quad_t = np.zeros(n_quad); quad_E = np.zeros(n_quad); quad_nu = np.zeros(n_quad)
         quad_nids = np.zeros((n_quad, 4), dtype=int)
         
-        # TRIA3 요소용 컨테이너 (병렬화 없이 루프로 처리하되 설계 노드 인접성 활용)
+        # TRIA3 요소용 컨테이너
         n_tria = sum(1 for eid in self.elem_ids if self.model.elements[eid].type.upper() in self._TRIA_TYPES)
         tria_eidxs = [i for i, eid in enumerate(self.elem_ids) if self.model.elements[eid].type.upper() in self._TRIA_TYPES]
 
         for load_case, weight in self._load_cases:
-            # ── 1. WHTSolver.solve_static()으로 실제 FEA 수행 ──────────────
+            # ── 1. FEA 수행 ──────────────
             result = solver.solve_static(load_case)
-
-            # 변위를 전체 DOF 벡터로 전환 (N,6) → (N*6,)
             u_full = np.zeros(ndof)
             for i, nid in enumerate(self.sorted_nids):
                 idx = self.nid_to_idx[nid]
                 u_full[idx * 6: idx * 6 + 6] = result.displacement[i, :]
 
-            # ── 2. 컴플라이언스 계산: C = F^T u ─────────────────────────────
+            # ── 2. 컴플라이언스 및 응답 ─────────────────────────────
             f_full = np.zeros(ndof)
             for force in load_case.forces:
                 idx = self.nid_to_idx.get(force.node_id)
@@ -364,87 +415,82 @@ class WHTopographySolver:
 
             C_i = float(np.dot(f_full, u_full))
             total_C += weight * C_i
+            
+            # 물리적 응답 추출 (최대 변위, 최대 응력)
+            # result.displacement shape: (N, 6)
+            # result.cell_data["Stress"] shape: (1, M, 6)
+            disp_vals = result.displacement
+            stress_vals = result.cell_data["Stress"][0]
+            
+            case_responses[load_case.name] = {
+                "C": C_i,
+                "max_disp": float(np.max(np.linalg.norm(disp_vals[:, :3], axis=1))),
+                "max_stress": _von_mises_max(stress_vals)
+            }
 
-            # ── 3. JAX 기반 초고속 자동 미분(Auto-Diff) ─────────────────────
+            # ── 3. QUAD4 민감도 (JAX) ─────────────────────
             q_idx = 0
             for eidx, eid in enumerate(self.elem_ids):
                 elem = self.model.elements[eid]
-                etype = elem.type.upper()
-                if etype in self._QUAD_TYPES:
+                if elem.type.upper() in self._QUAD_TYPES:
                     nids = elem.node_ids
                     quad_c1[q_idx] = [self.model.nodes[nids[0]].x, self.model.nodes[nids[0]].y, self.model.nodes[nids[0]].z]
                     quad_c2[q_idx] = [self.model.nodes[nids[1]].x, self.model.nodes[nids[1]].y, self.model.nodes[nids[1]].z]
                     quad_c3[q_idx] = [self.model.nodes[nids[2]].x, self.model.nodes[nids[2]].y, self.model.nodes[nids[2]].z]
                     quad_c4[q_idx] = [self.model.nodes[nids[3]].x, self.model.nodes[nids[3]].y, self.model.nodes[nids[3]].z]
-                    
                     prop = self.model.properties[elem.pid]
                     mat = self.model.materials[prop.mid]
                     quad_t[q_idx] = prop.t
                     quad_E[q_idx] = mat.E
                     quad_nu[q_idx] = mat.nu
-                    
                     e_dofs = [self.nid_to_idx[n]*6+d for n in nids for d in range(6)]
                     quad_ue[q_idx] = u_full[e_dofs]
                     quad_nids[q_idx] = nids
                     q_idx += 1
 
             if q_idx > 0:
-                # JAX 병렬 처리 (수천 개의 요소를 단 한 번의 호출로 처리)
                 grads = vmap_element_grad_jax(
                     jnp.array(quad_c1), jnp.array(quad_c2), jnp.array(quad_c3), jnp.array(quad_c4),
                     jnp.array(quad_ue), jnp.array(quad_t), jnp.array(quad_E), jnp.array(quad_nu)
                 )
-                
-                grad_c1_np = np.array(grads[0])
-                grad_c2_np = np.array(grads[1])
-                grad_c3_np = np.array(grads[2])
-                grad_c4_np = np.array(grads[3])
-
-                # 계산된 그래디언트를 각 설계 노드에 분배 (컴플라이언스 최소화: - 부호 적용)
-                # 3D 그래디언트 벡터와 bead_dir의 내적(Dot product)을 통해 정확한 방향 민감도 산출
                 for q in range(q_idx):
                     nids = quad_nids[q]
-                    for i_local, grad_vec in enumerate([grad_c1_np[q], grad_c2_np[q], grad_c3_np[q], grad_c4_np[q]]):
+                    for i_local, grad_vec in enumerate([grads[0][q], grads[1][q], grads[2][q], grads[3][q]]):
                         idx = self._design_nid_to_idx.get(nids[i_local])
                         if idx is not None:
-                            total_sens[idx] -= weight * np.dot(grad_vec, self.bead_dir)
+                            total_sens[idx] -= weight * float(np.dot(np.array(grad_vec), self.bead_dir))
 
-            # ── 4. TRIA3 요소 민감도 (중앙차분 루프) ────────────────────────
-            # JAX화되지 않은 삼각형 요소도 빠짐없이 처리하여 메시 정합성 유지
+            # ── 4. TRIA3 민감도 (3D 중앙차분) ────────────────────────
             for eidx in tria_eidxs:
                 eid = self.elem_ids[eidx]
                 elem = self.model.elements[eid]
                 nids = elem.node_ids
-                
-                # 설계 노드가 포함된 경우만 계산
                 if not any(nid in self._design_nid_to_idx for nid in nids): continue
                 
-                # 각 노드별 중앙차분
                 for nid in nids:
                     idx = self._design_nid_to_idx.get(nid)
                     if idx is None: continue
                     
                     node = self.model.nodes[nid]
-                    z0 = node.z
+                    orig_xyz = np.array([node.x, node.y, node.z])
+                    move = self.fd_dz * self.bead_dir
                     
-                    node.z = z0 + self.fd_dz
+                    node.x, node.y, node.z = orig_xyz + move
                     Ke_p = self._compute_element_K(eidx)
-                    node.z = z0 - self.fd_dz
+                    node.x, node.y, node.z = orig_xyz - move
                     Ke_m = self._compute_element_K(eidx)
-                    node.z = z0 # 복구
+                    node.x, node.y, node.z = orig_xyz # 복구
                     
-                    dKe_dz = (Ke_p - Ke_m) / (2.0 * self.fd_dz)
+                    dKe_dh = (Ke_p - Ke_m) / (2.0 * self.fd_dz)
                     e_dofs = [self.nid_to_idx[n]*6+d for n in nids for d in range(6)]
                     ue = u_full[e_dofs]
-                    
-                    # 삼각형 요소는 현재 Z방향 변위 기준 민감도로 근사 (향후 3D 확장 가능)
-                    total_sens[idx] -= weight * float(ue @ dKe_dz @ ue) * self.bead_dir[2]
+                    total_sens[idx] -= weight * float(ue @ dKe_dh @ ue)
 
-        return total_C, total_sens
+        return total_C, case_responses, total_sens
 
     # ─────────────── 메인 최적화 루프 ───────────────
 
-    def solve(self, max_iter: int = 30, tol: float = 1e-4) -> np.ndarray:
+    def solve(self, max_iter: int = 30, tol: float = 1e-4, callback=None) -> np.ndarray:
         """
         MMA 기반 Topography Optimization을 실행합니다.
 
@@ -454,6 +500,8 @@ class WHTopographySolver:
             최대 반복 수
         tol : float
             수렴 판정 기준 (비드 높이 변화 최대값)
+        callback : Callable[[dict], None], optional
+            각 반복마다 호출될 콜백 함수. 실시간 모니터링용.
 
         Returns
         -------
@@ -467,12 +515,21 @@ class WHTopographySolver:
             print(f"     * {lc.name}: weight={w:.2f}, BC={len(lc.bcs)}개, F={len(lc.forces)}개")
 
         # MMA용 정규화 변수 x [0, 1]
-        # 초기값으로 아주 작은 값(0.01)을 주어 최적화 초기 방향성 확보
         x = self.heights.copy() / (self.h_max + 1e-12)
         if np.max(x) < 1e-6:
             x = np.full_like(x, 0.01)
 
+        # FEA 솔버 인스턴스 생성
+        from wht_solver.wht_solver import WHTSolver
+        fea_solver = WHTSolver(self.model)
+        
+        C_0 = None 
+
         for i in range(max_iter):
+            # 좌우 대칭 강제 (변수 동기화)
+            if self.sym_x:
+                x = 0.5 * (x + x[self._sym_map])
+
             x_old = x.copy()
 
             # 현재 비드 높이 (물리량) 계산 및 적용
@@ -480,32 +537,84 @@ class WHTopographySolver:
             h_filtered = self._H @ h_phys
             self._apply_heights(h_filtered)
 
-            # 컴플라이언스 및 민감도 계산
-            C, dC_dh = self._compute_total_compliance()
+            # 컴플라이언스 및 민감도 계산 (솔버 인스턴스 공유)
+            C_total, C_responses, dC_dh = self._compute_total_compliance(fea_solver)
+            
+            # 초기값 저장 및 정규화 (수렴 안정성 강화)
+            if C_0 is None:
+                C_0 = float(C_total) if float(C_total) > 1e-6 else 1.0
 
-            # 필터 역전파 및 정규화 체인룰 적용: ∂C/∂x = (H^T * ∂C/∂h_filtered) * h_max
+            # ── 고유진동수 해석 (10차 모드) ──
+            modal_results = fea_solver.solve_modal(num_modes=10, exclude_rigid_body=False)
+            freqs = modal_results.frequencies  # Hz
+
+            # 목적 함수 및 민감도 정규화 (MMA 엔진이 제약 조건을 더 잘 인식하도록 함)
+            f0val = float(C_total) / C_0
+            
+            # 필터 역전파 및 정규화 체인룰 적용
             dC_dx = (self._H.T @ dC_dh) * self.h_max
+            df0dx = (dC_dx / C_0).flatten()
+            
+            # 좌우 대칭 강제 (민감도 동기화)
+            if self.sym_x:
+                df0dx = 0.5 * (df0dx + df0dx[self._sym_map])
 
-            # 제약 조건: Σ x_n / n_vars ≤ h_ratio
-            vol_constraint = float(np.mean(x)) - self.h_ratio
-            dv_dx = np.ones(self._n_design) / self._n_design
+            # 제약 조건: Σ x_n / n_vars ≤ h_ratio  (1D 벡터, MMA 내부 브로드캐스트 요구)
+            fval = np.array([float(np.mean(x)) - self.h_ratio])
+            dfdx = np.full(self._n_design, 1.0 / self._n_design)  # (N,) — Bug #3 수정
 
-            # MMA 업데이트 (내부적으로 [0, 1] 범위 최적화)
+            # MMA 업데이트
             x = self.mma.update(
-                x, C, dC_dx,
-                np.array([vol_constraint]),
-                dv_dx,
+                x, f0val, df0dx,
+                fval,
+                dfdx,
                 i + 1,
             )
             x = np.clip(x, 0.0, 1.0)
 
             # 수렴 판정
             change = float(np.abs(x - x_old).max())
+            
+            # 모니터링 콜백 호출
+            if callback:
+                # 설계 노드 좌표 추출 (2D 시각화용)
+                coords = np.array([
+                    [self.model.nodes[nid].x, self.model.nodes[nid].y, self.model.nodes[nid].z]
+                    for nid in self._design_nids
+                ])
+                # 변형 에너지는 컴플라이언스의 절반 (U = 0.5 * C)
+                case_data = {}
+                for name, res in C_responses.items():
+                    case_data[name] = {
+                        "U": 0.5 * res["C"],
+                        "max_disp": res["max_disp"],
+                        "max_stress": res["max_stress"]
+                    }
+                    
+                data = {
+                    "iter": i,
+                    "compliance": float(C_total),
+                    "cases": case_data,
+                    "frequencies": freqs.tolist(),
+                    "avg_h": float(np.mean(x * self.h_max)),
+                    "max_h": float(np.max(x * self.h_max)),
+                    "dx": change,
+                    "coords": coords,
+                    "heights": (x * self.h_max).copy()
+                }
+                callback(data)
+
             if i % 5 == 0:
-                print(f"  Iter {i:3d}: C={C:.4e}  "
-                      f"Avg_h={np.mean(x*self.h_max):.3f}mm  "
-                      f"Max_h={np.max(x*self.h_max):.3f}mm  "
-                      f"dx={change:.4f}")
+                print(f"  Iter {i:3d}: C_total={C_total:.4e}  ", end="")
+                # 대표 진동수 출력
+                elastic_freqs = [f for f in freqs if f > 0.1]
+                if elastic_freqs:
+                    print(f"F1={elastic_freqs[0]:.1f}Hz ", end="")
+                
+                for name, res in C_responses.items():
+                    # 에너지(J), 최대 변위(mm), 최대 응력(MPa) 순차 출력
+                    print(f"[{name}: {0.5*res['C']:.1e}J, {res['max_disp']:.1f}mm, {res['max_stress']:.0f}MPa] ", end="")
+                print(f"Avg_h={np.mean(x*self.h_max):.2f}mm dx={change:.4f}")
             if change < tol:
                 print(f"  -> 수렴 달성 (Iter {i})")
                 break
