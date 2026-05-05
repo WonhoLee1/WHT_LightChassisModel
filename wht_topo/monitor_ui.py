@@ -2,22 +2,33 @@
 """
 monitor_ui.py
 =============
-최적화 프로세스 실시간 모니터링을 위한 PySide6 기반 UI 모듈 (V2.1 - 안정성 강화 버전).
-초기화 순서 보강 및 데이터 수신 타이밍 문제를 해결했습니다.
+최적화 프로세스 실시간 모니터링을 위한 PySide6 기반 UI 모듈 (V2.2).
+
+변경사항:
+- Area Ratio 지표 추가 (테이블, 수렴 커브)
+- Height Distribution 모든 이터레이션 스냅샷 저장
+- 이터레이션 선택 드롭다운으로 과거 Height Distribution 열람 가능
+- 노드 간격 기반 사각형 마커(marker='s') 크기 자동 계산
 """
 
 import sys
 import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTableWidget, QTableWidgetItem, QTabWidget, QHeaderView, QComboBox, QLabel
+    QTableWidget, QTableWidgetItem, QTabWidget, QHeaderView,
+    QComboBox, QLabel
 )
-from PySide6.QtCore import Qt, Signal, QObject, QThread
+from PySide6.QtCore import Signal, QObject, QThread
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 import koreanize_matplotlib
 
 plt.rcParams['font.size'] = 9
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Matplotlib Canvas Helper
+# ────────────────────────────────────────────────────────────────────────────
 
 class PlotCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
@@ -26,95 +37,162 @@ class PlotCanvas(FigureCanvas):
         self.setParent(parent)
         self.fig.tight_layout()
 
+
+def _estimate_node_spacing(coords: np.ndarray) -> float:
+    """
+    노드 좌표 배열로부터 평균 이웃 노드 간격을 추정합니다.
+
+    Parameters
+    ----------
+    coords : (N, 3) ndarray
+        노드 좌표 배열 (XYZ)
+
+    Returns
+    -------
+    float : 추정 평균 노드 간격 [mm]
+    """
+    if len(coords) < 2:
+        return 40.0
+    # X, Y 방향 최솟값을 간격의 근사치로 사용 (정렬된 메시 가정)
+    xs = np.sort(np.unique(np.round(coords[:, 0], 1)))
+    ys = np.sort(np.unique(np.round(coords[:, 1], 1)))
+    dx = float(np.median(np.diff(xs))) if len(xs) > 1 else 40.0
+    dy = float(np.median(np.diff(ys))) if len(ys) > 1 else 40.0
+    return min(dx, dy)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Main Monitor Window
+# ────────────────────────────────────────────────────────────────────────────
+
 class WHTMonitorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WHT Topography Optimization Monitor (V2.1)")
-        self.resize(1100, 800)
+        self.setWindowTitle("WHT Topography Optimization Monitor (V2.2)")
+        self.resize(1200, 860)
 
-        # 1. 속성 초기 선언 (AttributeError 방지)
+        # ── 1. 속성 초기 선언 (AttributeError 방지) ──
         self.history = {
-            "iter": [], "compliance": [], "avg_h": [], "max_h": [], "dx": [],
-            "frequencies": [], "cases": {}
+            "iter": [],
+            "compliance": [],
+            "avg_h": [],
+            "max_h": [],
+            "dx": [],
+            "area_ratio": [],       # 비드 점유 면적 비율
+            "frequencies": [],
+            "cases": {},
         }
+        # Height Distribution 히스토리: 이터레이션별 스냅샷 저장
+        self.height_snapshots = []  # list of {"iter": int, "coords": ndarray, "heights": ndarray}
+
         self.ref_freqs = None
         self.coords = None
         self.current_h = None
         self.case_names = []
+
+        # UI 위젯 참조 (초기화 전 None)
         self.height_canvas = None
         self.curve_canvas = None
         self.table = None
         self.modal_table = None
         self.metric_combo = None
+        self.height_iter_combo = None
+        self._height_colorbar = None
 
-        # 2. UI 초기화
+        # ── 2. UI 초기화 ──
         self._init_ui()
 
+    # ────────────────────────────────────────────────────────────────────────
+    # UI 구성
+    # ────────────────────────────────────────────────────────────────────────
+
     def _init_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
         self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        root_layout.addWidget(self.tabs)
 
-        # Tab 1: Summary Table
-        self.table_tab = QWidget()
-        self.table_layout = QVBoxLayout(self.table_tab)
+        # Tab 1: Summary Table ──────────────────────────────────────────────
+        tab1 = QWidget()
+        lay1 = QVBoxLayout(tab1)
         self.table = QTableWidget(0, 0)
-        self.table_layout.addWidget(self.table)
-        self.tabs.addTab(self.table_tab, "Summary Table")
+        lay1.addWidget(self.table)
+        self.tabs.addTab(tab1, "Summary Table")
 
-        # Tab 2: Convergence Curve
-        self.curve_tab = QWidget()
-        self.curve_layout = QVBoxLayout(self.curve_tab)
-        ctrl_layout = QHBoxLayout()
+        # Tab 2: Convergence Curve ──────────────────────────────────────────
+        tab2 = QWidget()
+        lay2 = QVBoxLayout(tab2)
+        ctrl2 = QHBoxLayout()
         self.metric_combo = QComboBox()
-        self.metric_combo.addItems(["Compliance", "Avg_h", "Max_h", "dx", "Natural Frequencies"])
+        self.metric_combo.addItems([
+            "Compliance", "Avg_h", "Max_h", "dx",
+            "Area_Ratio",               # ← 신규
+            "Natural Frequencies",
+        ])
         self.metric_combo.currentTextChanged.connect(self._update_curves)
-        ctrl_layout.addWidget(QLabel("Select Metric:"))
-        ctrl_layout.addWidget(self.metric_combo)
-        ctrl_layout.addStretch()
-        self.curve_layout.addLayout(ctrl_layout)
-        self.curve_canvas = PlotCanvas(self.curve_tab)
-        self.curve_layout.addWidget(self.curve_canvas)
-        self.tabs.addTab(self.curve_tab, "Convergence Curve")
+        ctrl2.addWidget(QLabel("Select Metric:"))
+        ctrl2.addWidget(self.metric_combo)
+        ctrl2.addStretch()
+        lay2.addLayout(ctrl2)
+        self.curve_canvas = PlotCanvas(tab2)
+        lay2.addWidget(self.curve_canvas)
+        self.tabs.addTab(tab2, "Convergence Curve")
 
-        # Tab 3: Height Distribution
-        self.height_tab = QWidget()
-        self.height_layout = QVBoxLayout(self.height_tab)
-        self.height_canvas = PlotCanvas(self.height_tab)
-        self.height_layout.addWidget(self.height_canvas)
-        self.tabs.addTab(self.height_tab, "Height Distribution")
+        # Tab 3: Height Distribution ────────────────────────────────────────
+        tab3 = QWidget()
+        lay3 = QVBoxLayout(tab3)
+        ctrl3 = QHBoxLayout()
+        self.height_iter_combo = QComboBox()
+        self.height_iter_combo.addItem("Latest")
+        self.height_iter_combo.currentIndexChanged.connect(self._update_height_plot)
+        ctrl3.addWidget(QLabel("Iteration:"))
+        ctrl3.addWidget(self.height_iter_combo)
+        ctrl3.addStretch()
+        lay3.addLayout(ctrl3)
+        self.height_canvas = PlotCanvas(tab3)
+        lay3.addWidget(self.height_canvas)
+        self.tabs.addTab(tab3, "Height Distribution")
 
-        # Tab 4: Modal Analysis
-        self.modal_tab = QWidget()
-        self.modal_layout = QVBoxLayout(self.modal_tab)
+        # Tab 4: Modal Analysis ─────────────────────────────────────────────
+        tab4 = QWidget()
+        lay4 = QVBoxLayout(tab4)
         self.modal_table = QTableWidget(10, 3)
         self.modal_table.setHorizontalHeaderLabels(["Mode", "Ref. (Hz)", "Current (Hz)"])
         self.modal_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         for i in range(10):
-            self.modal_table.setItem(i, 0, QTableWidgetItem(f"Mode {i+1}"))
-        self.modal_layout.addWidget(self.modal_table)
-        self.tabs.addTab(self.modal_tab, "Modal Analysis")
+            self.modal_table.setItem(i, 0, QTableWidgetItem(f"Mode {i + 1}"))
+        lay4.addWidget(self.modal_table)
+        self.tabs.addTab(tab4, "Modal Analysis")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 데이터 수신 및 UI 갱신
+    # ────────────────────────────────────────────────────────────────────────
 
     def update_data(self, data: dict):
         try:
             it = data["iter"]
+
+            # ── 히스토리 축적 ──
             self.history["iter"].append(it)
             self.history["compliance"].append(data["compliance"])
             self.history["avg_h"].append(data["avg_h"])
             self.history["max_h"].append(data["max_h"])
             self.history["dx"].append(data["dx"])
-            
+            self.history["area_ratio"].append(data.get("area_ratio", 0.0))
+
             freqs = data.get("frequencies", [])
             self.history["frequencies"].append(freqs)
-            
+
+            # Modal Ref. 초기화 (첫 이터레이션)
             if it == 0 and self.ref_freqs is None:
                 self.ref_freqs = freqs
                 if self.modal_table:
                     for i, f in enumerate(freqs):
-                        if i < 10: self.modal_table.setItem(i, 1, QTableWidgetItem(f"{f:.2f}"))
+                        if i < 10:
+                            self.modal_table.setItem(i, 1, QTableWidgetItem(f"{f:.2f}"))
 
+            # 하중 케이스 초기 설정 (첫 수신 시)
             cases_data = data.get("cases", {})
             if not self.case_names and cases_data:
                 self.case_names = sorted(cases_data.keys())
@@ -124,9 +202,9 @@ class WHTMonitorWindow(QMainWindow):
                         self.metric_combo.addItem(f"Disp_{name}")
                         self.metric_combo.addItem(f"Stress_{name}")
                     self.history["cases"][name] = {"U": [], "max_disp": [], "max_stress": []}
-                
+
                 if self.table:
-                    headers = ["Iter", "C_total", "Avg_h", "Max_h", "dx"]
+                    headers = ["Iter", "C_total", "Avg_h", "Max_h", "dx", "Area_Ratio"]
                     for name in self.case_names:
                         headers += [f"U_{name}", f"D_{name}", f"S_{name}"]
                     self.table.setColumnCount(len(headers))
@@ -137,49 +215,80 @@ class WHTMonitorWindow(QMainWindow):
                 self.history["cases"][name]["max_disp"].append(res["max_disp"])
                 self.history["cases"][name]["max_stress"].append(res["max_stress"])
 
-            self.coords = data.get("coords")
-            self.current_h = data.get("heights")
+            # ── Height Distribution 스냅샷 저장 ──
+            coords = data.get("coords")
+            heights = data.get("heights")
+            if coords is not None and heights is not None:
+                self.coords = coords
+                self.current_h = heights
+                self.height_snapshots.append({
+                    "iter": it,
+                    "coords": coords.copy(),
+                    "heights": heights.copy(),
+                })
+                # 드롭다운에 이터레이션 항목 추가 (최신이 맨 위)
+                if self.height_iter_combo:
+                    self.height_iter_combo.blockSignals(True)
+                    self.height_iter_combo.insertItem(1, f"Iter {it:03d}")
+                    self.height_iter_combo.blockSignals(False)
 
-            # ── UI 업데이트 (객체 존재 여부 체크) ──
-            if self.table:
+            # ── 테이블 행 추가 ──
+            if self.table and self.table.columnCount() > 0:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
-                self.table.setItem(row, 0, QTableWidgetItem(str(it)))
-                self.table.setItem(row, 1, QTableWidgetItem(f"{data['compliance']:.3e}"))
-                self.table.setItem(row, 2, QTableWidgetItem(f"{data['avg_h']:.2f}"))
-                self.table.setItem(row, 3, QTableWidgetItem(f"{data['max_h']:.2f}"))
-                self.table.setItem(row, 4, QTableWidgetItem(f"{data['dx']:.4f}"))
-                c_off = 5
+                ar = data.get("area_ratio", 0.0)
+                vals = [str(it), f"{data['compliance']:.3e}", f"{data['avg_h']:.2f}",
+                        f"{data['max_h']:.2f}", f"{data['dx']:.4f}", f"{ar:.3f}"]
+                for col, v in enumerate(vals):
+                    self.table.setItem(row, col, QTableWidgetItem(v))
+                c_off = len(vals)
                 for name in self.case_names:
                     res = cases_data.get(name, {"U": 0, "max_disp": 0, "max_stress": 0})
-                    self.table.setItem(row, c_off, QTableWidgetItem(f"{res['U']:.2e}"))
+                    self.table.setItem(row, c_off,   QTableWidgetItem(f"{res['U']:.2e}"))
                     self.table.setItem(row, c_off+1, QTableWidgetItem(f"{res['max_disp']:.2f}"))
                     self.table.setItem(row, c_off+2, QTableWidgetItem(f"{res['max_stress']:.1f}"))
                     c_off += 3
                 self.table.scrollToBottom()
 
+            # ── Modal 테이블 갱신 ──
             if self.modal_table:
                 for i, f in enumerate(freqs):
-                    if i < 10: self.modal_table.setItem(i, 2, QTableWidgetItem(f"{f:.2f}"))
+                    if i < 10:
+                        self.modal_table.setItem(i, 2, QTableWidgetItem(f"{f:.2f}"))
 
+            # ── 그래프 갱신 ──
             self._update_curves()
             self._update_height_plot()
+
         except Exception as e:
             print(f" -> [Monitor Error] {e}")
 
+    # ────────────────────────────────────────────────────────────────────────
+    # 수렴 커브 탭
+    # ────────────────────────────────────────────────────────────────────────
+
     def _update_curves(self):
-        if not self.curve_canvas or not self.history["iter"]: return
+        if not self.curve_canvas or not self.history["iter"]:
+            return
         metric = self.metric_combo.currentText()
         ax = self.curve_canvas.ax
         ax.clear()
         iters = self.history["iter"]
-        
+
         if metric == "Natural Frequencies":
-            freq_history = np.array(self.history["frequencies"])
-            if freq_history.ndim == 2:
-                for i in range(min(10, freq_history.shape[1])):
-                    ax.plot(iters, freq_history[:, i], label=f"M{i+1}")
-                ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+            freq_arr = np.array(self.history["frequencies"])
+            if freq_arr.ndim == 2 and freq_arr.shape[1] > 0:
+                for i in range(min(10, freq_arr.shape[1])):
+                    ax.plot(iters, freq_arr[:, i], label=f"M{i+1}")
+                ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1, 1))
+            ax.set_ylabel("Frequency (Hz)")
+        elif metric == "Area_Ratio":
+            ax.plot(iters, self.history["area_ratio"], 'D-', color='darkorange', label="Area Ratio")
+            ax.set_ylabel("Bead Area Ratio")
+            ax.set_ylim(0, 1.05)
+            ax.axhline(y=self.history["area_ratio"][0] if self.history["area_ratio"] else 0.3,
+                       color='gray', linestyle='--', alpha=0.5, label="Target")
+            ax.legend()
         elif metric in ["Compliance", "Avg_h", "Max_h", "dx"]:
             ax.plot(iters, self.history[metric.lower()], 'o-', label=metric)
         else:
@@ -189,44 +298,113 @@ class WHTMonitorWindow(QMainWindow):
                     key = "U" if m_type == "U" else ("max_disp" if m_type == "Disp" else "max_stress")
                     ax.plot(iters, self.history["cases"][name][key], 's-', label=metric)
                     break
+
         ax.set_title(f"Optimization Trend: {metric}")
+        ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
         self.curve_canvas.fig.tight_layout()
         self.curve_canvas.draw()
 
+    # ────────────────────────────────────────────────────────────────────────
+    # Height Distribution 탭
+    # ────────────────────────────────────────────────────────────────────────
+
     def _update_height_plot(self):
-        if not self.height_canvas or self.coords is None or self.current_h is None: return
+        if not self.height_canvas or not self.height_snapshots:
+            return
+
+        # 드롭다운 선택에 따른 스냅샷 결정
+        combo_idx = self.height_iter_combo.currentIndex() if self.height_iter_combo else 0
+        if combo_idx == 0:
+            # "Latest" 선택
+            snap = self.height_snapshots[-1]
+        else:
+            # "Iter NNN" 선택: combo_idx=1 이 가장 최신, 높은 인덱스일수록 과거
+            snap_idx = len(self.height_snapshots) - combo_idx
+            snap_idx = max(0, min(snap_idx, len(self.height_snapshots) - 1))
+            snap = self.height_snapshots[snap_idx]
+
+        coords  = snap["coords"]
+        heights = snap["heights"]
+        it_label = snap["iter"]
+
+        # 노드 간격 기반 마커 크기 계산 (사각형, data 좌표 기준)
+        spacing = _estimate_node_spacing(coords)
+
         ax = self.height_canvas.ax
         ax.clear()
-        sc = ax.scatter(self.coords[:, 0], self.coords[:, 1], c=self.current_h, cmap='viridis', s=10)
-        if not hasattr(self, 'colorbar'):
-            self.colorbar = self.height_canvas.fig.colorbar(sc, ax=ax)
-            self.colorbar.set_label("Bead Height (mm)")
+
+        # scatter 마커 크기(s)는 포인트^2 단위 → 데이터 좌표 spacing을 포인트로 변환
+        # 피규어 DPI와 좌표 범위를 이용한 변환
+        fig = self.height_canvas.fig
+        fig_w_inch = fig.get_figwidth()
+        data_range_x = coords[:, 0].max() - coords[:, 0].min() + spacing
+        pts_per_data = (fig_w_inch * fig.dpi) / data_range_x if data_range_x > 0 else 1.0
+        marker_pts = spacing * pts_per_data * 0.85  # 85%로 약간 여백
+        marker_size_sq = marker_pts ** 2
+
+        sc = ax.scatter(
+            coords[:, 0], coords[:, 1],
+            c=heights, cmap='jet',
+            marker='s',
+            s=marker_size_sq,
+            linewidths=0,
+            vmin=0.0,
+        )
+
+        # 컬러바 관리 (중복 생성 방지)
+        if self._height_colorbar is None:
+            self._height_colorbar = fig.colorbar(sc, ax=ax)
+            self._height_colorbar.set_label("Bead Height (mm)")
         else:
-            self.colorbar.update_normal(sc)
+            self._height_colorbar.update_normal(sc)
+
         ax.set_aspect('equal')
-        self.height_canvas.fig.tight_layout()
+        ax.set_title(f"Height Distribution — Iter {it_label}")
+        ax.set_xlabel("X (mm)")
+        ax.set_ylabel("Y (mm)")
+        fig.tight_layout()
         self.height_canvas.draw()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# IPC: Queue → Signal 브리지
+# ────────────────────────────────────────────────────────────────────────────
 
 class MonitorDataHandler(QObject):
     data_received = Signal(dict)
 
+
 def start_monitor_ui(queue):
+    """
+    별도 프로세스에서 PySide6 UI를 실행합니다.
+
+    Parameters
+    ----------
+    queue : multiprocessing.Queue
+        솔버로부터 이터레이션 데이터를 수신하는 큐.
+        데이터는 dict 형식이며, "STOP" 문자열 수신 시 종료합니다.
+    """
     app = QApplication(sys.argv)
     window = WHTMonitorWindow()
     window.show()
+
     class Receiver(QThread):
         def __init__(self, q):
             super().__init__()
             self.q = q
             self.handler = MonitorDataHandler()
+
         def run(self):
             while True:
                 try:
                     data = self.q.get()
-                    if data == "STOP": break
+                    if data == "STOP":
+                        break
                     self.handler.data_received.emit(data)
-                except: break
+                except Exception:
+                    break
+
     receiver = Receiver(queue)
     receiver.handler.data_received.connect(window.update_data)
     receiver.start()

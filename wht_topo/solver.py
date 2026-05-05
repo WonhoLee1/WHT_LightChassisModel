@@ -582,6 +582,9 @@ class WHTopographySolver:
                     [self.model.nodes[nid].x, self.model.nodes[nid].y, self.model.nodes[nid].z]
                     for nid in self._design_nids
                 ])
+                # 비드 점유 면적 비율: 정규화 변수 x > 0.1 인 노드 비율
+                area_ratio = float(np.mean(x > 0.1))
+                
                 # 변형 에너지는 컴플라이언스의 절반 (U = 0.5 * C)
                 case_data = {}
                 for name, res in C_responses.items():
@@ -594,6 +597,7 @@ class WHTopographySolver:
                 data = {
                     "iter": i,
                     "compliance": float(C_total),
+                    "area_ratio": area_ratio,
                     "cases": case_data,
                     "frequencies": freqs.tolist(),
                     "avg_h": float(np.mean(x * self.h_max)),
