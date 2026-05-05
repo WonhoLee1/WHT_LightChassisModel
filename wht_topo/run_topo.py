@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wht_modeler.wht_mesh_model import WHTMeshModel
 from wht_topo.loads import StochasticLoadManager
 from wht_topo.constraints import DynamicConstraint, StressConstraint
-from wht_topo.solver import JaxTopoSolver
+from wht_topo.solver import WHTopographySolver, JaxTopoSolver  # JaxTopoSolver = 별칭
 from wht_visualizer.wht_visualizer import WHTVisualizer
 from wht_converter.wht_models import WHTMetadata
 from test_jaxSSO.mesh_utils import generate_shell_tray
@@ -110,33 +110,35 @@ def run_industrial_topo(args):
     )
     model = WHTMeshModel.from_node_elem_db(node_db, elem_db)
     
-    # 2. 하중 및 제약
+    # 2. 하중 관리자 생성
     load_manager = StochasticLoadManager(model)
-    model.apply_spc(load_manager.get_boundary_nodes(), (0, 1, 2, 3, 4, 5))
-    
-    # 제약 조건 리스트 구성
+    # [설계 원칙] 하중 케이스별 개별 BC는 solver 내부에서 자동으로 설정됩니다.
+    # (Bending=플랜지 전체 고정, Twisting=대각 코너 고정, Lifting=3코너 고정)
+    # 모델 수준의 전역 SPC는 설정하지 않습니다.
+
+    # 제약 조건 리스트 구성 (향후 확장용)
     constraints = []
     if args.target_freq > 0.1:
         print(f" -> [제약] 목표 진동수 설정: {args.target_freq}Hz")
         constraints.append(DynamicConstraint(target_freq=args.target_freq))
-    
-    # 3. 최적화 실행 (상용 옵션 포함)
-    print(f" -> [최적화] 최소 비드 폭: {args.min_width}mm")
+
+    # 3. 최적화 실행 — WHTopographySolver (설계 변수: 노드별 비드 높이)
+    print(f" -> [최적화] 최소 비드 폭: {args.min_width}mm | 최대 비드 높이: {args.bead_height}mm")
     weights = {"bending": args.w_bending, "twisting": args.w_twisting, "lifting": args.w_lifting}
-    
-    solver = JaxTopoSolver(model, load_manager, constraints, 
-                           vol_frac=args.vol_frac, 
-                           min_width=args.min_width,
-                           draw_dir=args.draw_dir,
-                           weights=weights)
-    final_density = solver.solve(max_iter=args.iters)
-    
-    # 4. 산업용 모핑 적용
-    apply_industrial_morphing(model, final_density, 
-                              max_height=args.bead_height, 
-                              vol_frac=args.vol_frac,
-                              discrete=args.discrete,
-                              draw_dir=args.draw_dir)
+
+    solver = WHTopographySolver(
+        model, load_manager, constraints,
+        bead_height_max=args.bead_height,
+        bead_height_ratio=args.vol_frac,    # 비드 면적 비율 (0~1)
+        min_width=args.min_width,
+        draw_dir=args.draw_dir,
+        weights=weights,
+        mesh_size_z=10.0,
+    )
+    final_heights = solver.solve(max_iter=args.iters)
+
+    # 4. 최종 형상을 모델 노드 좌표에 영구 적용
+    solver.apply_final_shape()
     
     # 5. 익스포트
     if args.export:
@@ -149,10 +151,14 @@ def run_industrial_topo(args):
         # WHTMeshModel을 WHTResultData로 변환 (시각화 모듈 호환성)
         result_data = model.to_wht_result_data()
         
+        # 비드 높이 데이터 추가 (스칼라 필드)
+        heights_full = solver.get_full_heights()
+        result_data.add_scalar_field("Bead_Height", heights_full)
+        
         # 메타데이터 업데이트 (필수 필드 포함)
         result_data.metadata = WHTMetadata(
-            solver_name="JaxTopoSolver",
-            solver_version="1.0.0",
+            solver_name="WHTopographySolver",
+            solver_version="2.0.0",
             analysis_type="static",
             coordinate_system="cartesian",
             unit_length="mm",

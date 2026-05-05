@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from typing import Dict, Tuple, List
 from wht_modeler.wht_selector import WHTSelector
 from wht_modeler.wht_mesh_model import WHTMeshModel
+from wht_solver.load_cases import WHTLoadCase, LoadCaseLibrary
 
 class StochasticLoadManager:
     """
@@ -58,38 +59,45 @@ class StochasticLoadManager:
                 print(f"    - [LOAD] 하중 영역 '{nset.name}' 식별됨.")
                 # 최적화 시 이 영역을 우선적으로 고려하도록 설정 가능
 
-    def get_boundary_nodes(self) -> List[int]:
+    def get_boundary_nodes(self, mesh_size_z: float = 10.0) -> List[int]:
         """
-        WHTSelector를 활용하여 상단 플랜지(고정부) 노드 ID 리스트를 강건하게 식별합니다.
-        exam2_shell_jaxSSO_load.py의 로직(box + curvature)을 참고합니다.
+        최상단 플랜지(Flange/Rim) 노드 ID 리스트를 식별합니다. (exam3_autobead.py 로직 반영)
+        모델의 실제 최대 높이와 메시 크기에 따른 가변 허용 오차를 사용하여 강건하게 선택합니다.
         """
+        # 1. 실제 모델의 최대 높이 추출
+        all_z = [node.z for node in self.model.nodes.values()]
+        if not all_z: return []
+        actual_max_z = max(all_z)
+        
+        # 2. 메시 크기에 비례하는 허용 오차 설정 (exam3_autobead.py 참고)
+        # 메시 한 칸의 10% 정도를 오차 범위로 설정하여 수치적 오차에 대응
+        bc_tol = max(0.01, mesh_size_z * 0.1)
+        
         selector = WHTSelector(self.model)
         
-        # 1. Bounding Box 기반 최상단 림 선택 (오차범위 0.1mm)
-        rim_nids = selector.by_box(z=(self.z_max - 0.1, self.z_max + 0.1)).get_ids()
+        # 3. Z-Level 기반 최상단 영역 선택
+        top_nids = selector.by_box(z=(actual_max_z - bc_tol, actual_max_z + bc_tol)).get_ids()
         
-        # 2. 만약 림 노드가 있다면, 인접한 플랜지 면으로 확장 (Curvature 기반)
-        if rim_nids:
-            # 최상단 노드 중 하나를 시드로 하여 곡률 기반 확장
-            # 35.0도 이내의 각도를 가진 인접면 노드들을 선택
+        # 4. 선택된 노드들이 플랜지의 일부분일 경우, 곡률 기반으로 전체 플랜지 면 확장
+        if top_nids:
+            # 35도 이내의 각도를 가진 인접면 노드들을 선택하여 플랜지 전체를 커버
             flange_nids = (WHTSelector(self.model)
-                           .by_ids(rim_nids)
-                           .expand_by_face(angle_limit_deg=35.0, z_min=self.z_max - 5.0)
+                           .by_ids(top_nids)
+                           .expand_by_face(angle_limit_deg=35.0, z_min=actual_max_z - 5.0)
                            .get_ids())
-            return flange_nids
+            return list(flange_nids)
         
-        return rim_nids
+        return list(top_nids)
 
     def get_load_nodes(self) -> List[int]:
         """
         하중이 주로 인가되는 노드(바닥면 센터 및 코너 등)를 식별하여 반환합니다.
         민감도 해석의 가이드라인으로 활용됩니다.
         """
-        # 바닥면(Base Plate) 중앙부 노드 선택
         cx, cy = (self.x_min + self.x_max)/2, (self.y_min + self.y_max)/2
         selector = WHTSelector(self.model)
         
-        # 중앙 근처 300mm 반경 노드
+        # 중앙 근처 300mm 반경 노드 (바닥면 기준)
         center_nids = selector.by_box(
             x=(cx - 150, cx + 150),
             y=(cy - 150, cy + 150),
@@ -97,6 +105,119 @@ class StochasticLoadManager:
         ).get_ids()
         
         return list(center_nids)
+
+    def get_corner_nodes(self, corner_idx: int, radius: float = 80.0) -> List[int]:
+        """
+        바닥면의 특정 코너 근처 노드 리스트를 반환합니다.
+
+        Parameters
+        ----------
+        corner_idx : int
+            0=좌하(-x,-y), 1=우하(+x,-y), 2=좌상(-x,+y), 3=우상(+x,+y)
+        radius : float
+            코너 중심으로부터의 탐색 반경 [mm]
+
+        Returns
+        -------
+        List[int]
+            코너 근처의 노드 ID 리스트
+        """
+        cx = self.x_min if corner_idx in [0, 2] else self.x_max
+        cy = self.y_min if corner_idx in [0, 1] else self.y_max
+        selector = WHTSelector(self.model)
+        corner_nids = selector.by_box(
+            x=(cx - radius, cx + radius),
+            y=(cy - radius, cy + radius),
+            z=(self.z_min - 0.1, self.z_min + 5.0)
+        ).get_ids()
+        return list(corner_nids)
+
+    def get_load_cases(
+        self,
+        mesh_size_z: float = 10.0,
+        bending_load_z: float = -5000.0,
+        twisting_load_z: float = -3000.0,
+        lifting_load_z: float = 3000.0,
+        weights: Dict[str, float] = None,
+    ) -> List[Tuple[WHTLoadCase, float]]:
+        """
+        Bending, Twisting, Lifting 하중 케이스를 각각의 물리적으로 타당한
+        경계 조건(BC)과 함께 WHTLoadCase 리스트로 반환합니다.
+
+        각 하중 케이스는 wht_solver.WHTSolver.solve_static()으로 직접 해석 가능합니다.
+
+        Parameters
+        ----------
+        mesh_size_z : float
+            메시 크기(Z방향), 플랜지 노드 탐색 허용 오차 계산에 사용 [mm]
+        bending_load_z : float
+            굽힘 하중 (중앙 바닥면, 하향) [N]
+        twisting_load_z : float
+            비틀림 하중 (대각선 코너, 하향) [N]
+        lifting_load_z : float
+            리프팅 하중 (코너 리프팅, 상향) [N]
+        weights : Dict[str, float]
+            각 하중 케이스의 목적 함수 가중치 {"bending", "twisting", "lifting"}
+
+        Returns
+        -------
+        List[Tuple[WHTLoadCase, float]]
+            (WHTLoadCase, weight) 튜플 리스트
+        """
+        if weights is None:
+            weights = {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
+
+        flange_nids = self.get_boundary_nodes(mesh_size_z=mesh_size_z)
+        center_nids = self.get_load_nodes()
+        corner0 = self.get_corner_nodes(0)  # 좌하 (-x, -y)
+        corner1 = self.get_corner_nodes(1)  # 우하 (+x, -y)
+        corner2 = self.get_corner_nodes(2)  # 좌상 (-x, +y)
+        corner3 = self.get_corner_nodes(3)  # 우상 (+x, +y)
+
+        load_cases = []
+
+        # ── Case 1: Bending (굽힘) ──────────────────────────────────────────
+        # BC: 플랜지 전체 고정 (모든 DOF)
+        # LOAD: 바닥 중앙부에 하향 균등 분포 하중
+        lc_bending = WHTLoadCase(name="bending")
+        lc_bending.add_bc(flange_nids, dofs=(0, 1, 2, 3, 4, 5))
+        if center_nids:
+            lc_bending.add_force(
+                center_nids, dofs=(2,),
+                values=(bending_load_z,), distribute=True
+            )
+        print(f" -> [LoadCase] Bending: {len(flange_nids)}개 플랜지 고정, "
+              f"{len(center_nids)}개 중앙 노드에 {bending_load_z:.0f}N 하중")
+        load_cases.append((lc_bending, weights["bending"]))
+
+        # ── Case 2: Twisting (비틀림) ───────────────────────────────────────
+        # BC: 대각선 방향 두 코너(0번, 3번) 완전 고정
+        # LOAD: 반대쪽 대각선 두 코너(1번, 2번)에 서로 반대 방향 Z 하중
+        lc_twisting = WHTLoadCase(name="twisting")
+        lc_twisting.add_bc(corner0 + corner3, dofs=(0, 1, 2, 3, 4, 5))
+        if corner1:
+            lc_twisting.add_force(corner1, dofs=(2,),
+                                  values=(-twisting_load_z,), distribute=True)
+        if corner2:
+            lc_twisting.add_force(corner2, dofs=(2,),
+                                  values=(twisting_load_z,), distribute=True)
+        print(f" -> [LoadCase] Twisting: 대각 2코너 고정, "
+              f"반대 2코너에 ±{abs(twisting_load_z):.0f}N 비틀림 하중")
+        load_cases.append((lc_twisting, weights["twisting"]))
+
+        # ── Case 3: Lifting (코너 리프팅) ───────────────────────────────────
+        # BC: 3개 코너 (0, 1, 2번) 에 Translation 고정 (회전 자유)
+        # LOAD: 나머지 1개 코너 (3번, 우상)에 상향 하중
+        lc_lifting = WHTLoadCase(name="lifting")
+        lc_lifting.add_bc(corner0 + corner1 + corner2, dofs=(0, 1, 2))
+        if corner3:
+            lc_lifting.add_force(corner3, dofs=(2,),
+                                 values=(lifting_load_z,), distribute=True)
+        print(f" -> [LoadCase] Lifting: 3코너 Translation 고정, "
+              f"1코너에 +{lifting_load_z:.0f}N 리프팅 하중")
+        load_cases.append((lc_lifting, weights["lifting"]))
+
+        return load_cases
 
 
     def generate_random_load_case(self, 

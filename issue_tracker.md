@@ -8,6 +8,9 @@
 - [x] **[코드 가독성]** `exam2_shell_jaxSSO_load.py`의 Docstring 상세화 및 한글화 (완료)
 - [x] **[솔버]** RBE3 보간 요소(Interpolation Element) 구현 및 응력 집중 문제 완화 (2026-05-03)
 - [x] **[모델링]** 경로 추적(Path Tracing) 및 플러드 필(Flood Fill) 기반 고급 플랜지 노드 선택 로직 구현 (2026-05-03)
+- [x] **[최적화]** 정밀 FEA 기반 멀티 케이스(하중별 BC 분리) 토포그래피 최적화 솔버 구현 (2026-05-05)
+- [x] **[설계 수정]** Topology(SIMP 밀도) → Topography(노드 비드 높이) 설계 변수 전환: `WHTopographySolver` 재설계 (2026-05-05)
+
 
 ## ✅ 완료된 이슈 (Completed Issues)
 
