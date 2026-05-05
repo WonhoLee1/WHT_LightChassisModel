@@ -137,6 +137,8 @@ def run_industrial_topo(args):
         weights=weights,
         mesh_size_z=10.0,
         sym_x=args.sym_x,
+        bead_connect=args.bead_connect,
+        connect_gap=args.connect_gap,
     )
     
     # 모니터링 GUI 실행
@@ -225,6 +227,8 @@ def main():
     
     # 제약 조건 및 시각화
     parser.add_argument("--sym-x", action="store_true", help="Y-Z 평면 기준 좌우 대칭 제약 조건 활성화")
+    parser.add_argument("--bead-connect", action="store_true", help="모폴로지 클로징으로 단절된 비드 자동 연결")
+    parser.add_argument("--connect-gap", type=float, default=80.0, help="비드 연결 시 채울 최대 간격 (mm, 기본: 80.0)")
     parser.add_argument("--gui", action="store_true", help="실시간 모니터링 GUI(PySide6) 실행")
     parser.add_argument("--no-viz", action="store_true", help="최적화 완료 후 최종 3D 시각화 생략")
     parser.add_argument("--export", type=str, default="industrial_bead.k", help="최종 결과 파일 저장 경로 (LS-DYNA .k)")

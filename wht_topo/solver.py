@@ -121,6 +121,8 @@ class WHTopographySolver:
         mesh_size_z: float = 10.0,
         fd_dz: float = 0.5,
         sym_x: bool = False,
+        bead_connect: bool = False,
+        connect_gap: float = 80.0,
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -130,6 +132,8 @@ class WHTopographySolver:
         self.mesh_size_z    = mesh_size_z
         self.fd_dz          = fd_dz
         self.sym_x          = sym_x
+        self.bead_connect   = bead_connect
+        self.connect_gap    = connect_gap  # mm, 버드 연결 시 채울 최대 간격
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
 
         # 비드 돌출 방향 정규화
@@ -174,6 +178,12 @@ class WHTopographySolver:
         self._sym_map = None
         if self.sym_x:
             self._sym_map = self._build_symmetry_map()
+
+        # 비드 연결 그리드 (Morphological Closing용)
+        self._connect_grid = None
+        if self.bead_connect:
+            self._connect_grid = self._build_connect_grid()
+            print(f" -> [Solver] 비드 연결(Bead Connect) 활성화: 간격 {self.connect_gap:.0f}mm 이연 갈라진 비드 연결함")
 
         # 초기 비드 높이 (0 = 평탄)
         self.heights = np.zeros(self._n_design)
@@ -239,6 +249,99 @@ class WHTopographySolver:
                 sym_map[i] = idx
         
         return sym_map
+
+    def _build_connect_grid(self) -> dict:
+        """
+        Morphological Closing 연산을 위한 2D 그리드 인덱스를 사전 구축합니다.
+
+        설계 노드의 X, Y 좌표를 정규 격자에 매핑하여, 클로징 연산 시
+        반복적인 좌표 변환 없이 O(1)으로 접근할 수 있게 합니다.
+
+        Returns
+        -------
+        dict : {"gi": ndarray, "gj": ndarray, "nx": int, "ny": int, "spacing": float}
+        """
+        coords = np.array([self._coords_orig[nid] for nid in self._design_nids])
+
+        xs = np.sort(np.unique(np.round(coords[:, 0], 0)))
+        ys = np.sort(np.unique(np.round(coords[:, 1], 0)))
+        dx = float(np.median(np.diff(xs))) if len(xs) > 1 else self.rmin
+        dy = float(np.median(np.diff(ys))) if len(ys) > 1 else self.rmin
+        spacing = min(dx, dy)
+
+        x_min, y_min = coords[:, 0].min(), coords[:, 1].min()
+        x_max, y_max = coords[:, 0].max(), coords[:, 1].max()
+        nx = int(np.ceil((x_max - x_min) / spacing)) + 2
+        ny = int(np.ceil((y_max - y_min) / spacing)) + 2
+
+        gi = np.clip(((coords[:, 0] - x_min) / spacing).astype(int), 0, nx - 1)
+        gj = np.clip(((coords[:, 1] - y_min) / spacing).astype(int), 0, ny - 1)
+
+        # 그리드 인덱스 → 설계 노드 인덱스 역매핑 (빠른 lookup용)
+        grid_to_node = {}
+        for k in range(self._n_design):
+            grid_to_node[(gj[k], gi[k])] = k
+
+        return {
+            "gi": gi, "gj": gj, "nx": nx, "ny": ny,
+            "spacing": spacing, "grid_to_node": grid_to_node,
+        }
+
+    def _apply_bead_connect(self, x: np.ndarray, threshold: float = 0.1) -> np.ndarray:
+        """
+        Morphological Closing으로 단절된 비드 노드를 연결합니다.
+
+        Parameters
+        ----------
+        x : (n_design,) 설계 변수 벡터 [0, 1]
+        threshold : float
+            활성 비드 판단 임계값 (기본 0.1)
+
+        Returns
+        -------
+        x_new : (n_design,) 연결이 적용된 설계 변수 벡터
+        """
+        from scipy.ndimage import binary_dilation, binary_erosion
+
+        cg  = self._connect_grid
+        gi, gj   = cg["gi"], cg["gj"]
+        nx, ny   = cg["nx"], cg["ny"]
+        spacing  = cg["spacing"]
+        g2n      = cg["grid_to_node"]
+
+        # 1. 설계 변수를 2D 그리드에 래스터화
+        grid = np.zeros((ny, nx), dtype=bool)
+        for k in range(self._n_design):
+            if x[k] > threshold:
+                grid[gj[k], gi[k]] = True
+
+        # 2. Morphological Closing: Dilation → Erosion
+        #    n_iter = connect_gap / spacing 만큼 팽창 후 수축 → 갭 메움
+        n_iter = max(1, int(np.ceil(self.connect_gap / spacing)))
+        dilated = grid.copy()
+        for _ in range(n_iter):
+            dilated = binary_dilation(dilated)
+        closed = dilated.copy()
+        for _ in range(n_iter):
+            closed = binary_erosion(closed)
+
+        # 3. 클로징으로 새로 채워진 셀(브릿지 노드)을 최소 활성값으로 승격
+        bridge_mask = closed & ~grid  # 원래 비활성이었으나 채워진 셀
+        x_new = x.copy()
+        for k in range(self._n_design):
+            if bridge_mask[gj[k], gi[k]]:
+                # 주변 활성 노드 평균값으로 승격 (부드러운 전환)
+                row, col = gj[k], gi[k]
+                neighbor_vals = []
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nb = g2n.get((row + dr, col + dc))
+                    if nb is not None and x[nb] > threshold:
+                        neighbor_vals.append(x[nb])
+                if neighbor_vals:
+                    x_new[k] = max(x_new[k], np.mean(neighbor_vals) * 0.7)
+                else:
+                    x_new[k] = max(x_new[k], threshold + 0.02)
+        return x_new
 
     def _build_node_elem_adjacency(self) -> Dict[int, List[int]]:
         """
@@ -571,6 +674,10 @@ class WHTopographySolver:
                 i + 1,
             )
             x = np.clip(x, 0.0, 1.0)
+
+            # 비드 연결: 단절된 비드 노드를 모폴로지 클로징으로 연결
+            if self.bead_connect:
+                x = self._apply_bead_connect(x)
 
             # 수렴 판정
             change = float(np.abs(x - x_old).max())
