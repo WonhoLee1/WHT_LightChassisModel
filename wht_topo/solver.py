@@ -201,7 +201,67 @@ class WHTopographySolver:
         self.heights = np.zeros(self._n_design)
         self.mma     = MMAOptimizer(n_vars=self._n_design, vol_frac=bead_height_ratio)
 
+        # 민감도 계산용 정적 데이터 사전 캐싱 (최적화 루프 내 재생성 방지)
+        self._bead_dir_jnp = jnp.array(self.bead_dir, dtype=jnp.float64)
+        self._build_sensitivity_cache()
+
     # ─────────────── 전처리 ───────────────
+
+    def _build_sensitivity_cache(self):
+        """
+        민감도 계산에 필요한 정적 데이터를 사전에 배열로 구성합니다.
+        최적화 루프 내 반복 생성을 방지하기 위해 __init__ 마지막에 한 번만 호출됩니다.
+
+        구축 대상:
+          QUAD4: _quad_nids, _quad_t/E/nu, _quad_dof_idx, _quad_node_design_idx
+          TRIA3: _tria_eidxs, _tria_nids, _tria_dof_idx, _tria_node_design_idx
+        """
+        quad_nids_list, quad_t_list, quad_E_list, quad_nu_list = [], [], [], []
+        quad_dof_list, quad_nd_idx_list = [], []
+        tria_eidxs, tria_nids_list, tria_dof_list, tria_nd_idx_list = [], [], [], []
+
+        for eidx, eid in enumerate(self.elem_ids):
+            elem = self.model.elements[eid]
+            nids = elem.node_ids
+            prop = self.model.properties[elem.pid]
+            mat  = self.model.materials[prop.mid]
+            dofs = [self.nid_to_idx[n] * 6 + d for n in nids for d in range(6)]
+            nd_idx = [self._design_nid_to_idx.get(n, -1) for n in nids]
+
+            if elem.type.upper() in self._QUAD_TYPES:
+                quad_nids_list.append(nids)
+                quad_t_list.append(prop.t)
+                quad_E_list.append(mat.E)
+                quad_nu_list.append(mat.nu)
+                quad_dof_list.append(dofs)
+                quad_nd_idx_list.append(nd_idx)
+            elif elem.type.upper() in self._TRIA_TYPES:
+                if any(i != -1 for i in nd_idx):
+                    tria_eidxs.append(eidx)
+                    tria_nids_list.append(nids)
+                    tria_dof_list.append(dofs)
+                    tria_nd_idx_list.append(nd_idx)
+
+        n_quad = len(quad_nids_list)
+        self._n_quad = n_quad
+        if n_quad > 0:
+            self._quad_nids          = np.array(quad_nids_list, dtype=int)
+            self._quad_t             = np.array(quad_t_list,    dtype=np.float64)
+            self._quad_E             = np.array(quad_E_list,    dtype=np.float64)
+            self._quad_nu            = np.array(quad_nu_list,   dtype=np.float64)
+            self._quad_dof_idx       = np.array(quad_dof_list,  dtype=int)   # (n_quad, 24)
+            self._quad_node_design_idx = np.array(quad_nd_idx_list, dtype=int)  # (n_quad, 4)
+            # 좌표는 최적화 도중 변하므로 캐싱하지 않음
+        else:
+            self._quad_nids = self._quad_t = self._quad_E = self._quad_nu = None
+            self._quad_dof_idx = self._quad_node_design_idx = None
+
+        self._tria_eidxs          = tria_eidxs
+        self._tria_nids_list      = tria_nids_list
+        self._tria_dof_idx        = [np.array(d, dtype=int) for d in tria_dof_list]
+        self._tria_node_design_idx = tria_nd_idx_list
+
+        print(f"    - 민감도 캐시 구축 완료: QUAD4 {n_quad}개 / TRIA3 {len(tria_eidxs)}개 (설계 노드 인접)")
 
     def _ensure_material_properties(self):
         """모델에 재료 및 속성이 없으면 Steel 기본값을 추가합니다."""
@@ -537,22 +597,10 @@ class WHTopographySolver:
             하중별 응답 데이터 (C, max_disp, max_stress)
         total_sens : (n_design,) 설계 노드별 민감도
         """
-        ndof = len(self.sorted_nids) * 6
+        ndof       = len(self.sorted_nids) * 6
         total_C    = 0.0
-        case_responses = {} # {name: {"C": float, "max_disp": float, "max_stress": float}}
+        case_responses = {}
         total_sens = np.zeros(self._n_design)
-
-        # JAX Vectorization용 데이터 컨테이너 (QUAD4)
-        n_quad = sum(1 for eid in self.elem_ids if self.model.elements[eid].type.upper() in self._QUAD_TYPES)
-        quad_c1 = np.zeros((n_quad, 3)); quad_c2 = np.zeros((n_quad, 3))
-        quad_c3 = np.zeros((n_quad, 3)); quad_c4 = np.zeros((n_quad, 3))
-        quad_ue = np.zeros((n_quad, 24))
-        quad_t = np.zeros(n_quad); quad_E = np.zeros(n_quad); quad_nu = np.zeros(n_quad)
-        quad_nids = np.zeros((n_quad, 4), dtype=int)
-        
-        # TRIA3 요소용 컨테이너
-        n_tria = sum(1 for eid in self.elem_ids if self.model.elements[eid].type.upper() in self._TRIA_TYPES)
-        tria_eidxs = [i for i, eid in enumerate(self.elem_ids) if self.model.elements[eid].type.upper() in self._TRIA_TYPES]
 
         for load_case, weight in self._load_cases:
             # ── 1. FEA 수행 ──────────────
@@ -573,76 +621,63 @@ class WHTopographySolver:
 
             C_i = float(np.dot(f_full, u_full))
             total_C += weight * C_i
-            
-            # 물리적 응답 추출 (최대 변위, 최대 응력)
-            # result.displacement shape: (N, 6)
-            # result.cell_data["Stress"] shape: (1, M, 6)
-            disp_vals = result.displacement
+
+            disp_vals  = result.displacement
             stress_vals = result.cell_data["Stress"][0]
-            
             case_responses[load_case.name] = {
                 "C": C_i,
-                "max_disp": float(np.max(np.linalg.norm(disp_vals[:, :3], axis=1))),
+                "max_disp":   float(np.max(np.linalg.norm(disp_vals[:, :3], axis=1))),
                 "max_stress": _von_mises_max(stress_vals),
-                "result": result
+                "result": result,
             }
 
-            # ── 3. QUAD4 민감도 (JAX) ─────────────────────
-            q_idx = 0
-            for eidx, eid in enumerate(self.elem_ids):
-                elem = self.model.elements[eid]
-                if elem.type.upper() in self._QUAD_TYPES:
-                    nids = elem.node_ids
-                    quad_c1[q_idx] = [self.model.nodes[nids[0]].x, self.model.nodes[nids[0]].y, self.model.nodes[nids[0]].z]
-                    quad_c2[q_idx] = [self.model.nodes[nids[1]].x, self.model.nodes[nids[1]].y, self.model.nodes[nids[1]].z]
-                    quad_c3[q_idx] = [self.model.nodes[nids[2]].x, self.model.nodes[nids[2]].y, self.model.nodes[nids[2]].z]
-                    quad_c4[q_idx] = [self.model.nodes[nids[3]].x, self.model.nodes[nids[3]].y, self.model.nodes[nids[3]].z]
-                    prop = self.model.properties[elem.pid]
-                    mat = self.model.materials[prop.mid]
-                    quad_t[q_idx] = prop.t
-                    quad_E[q_idx] = mat.E
-                    quad_nu[q_idx] = mat.nu
-                    e_dofs = [self.nid_to_idx[n]*6+d for n in nids for d in range(6)]
-                    quad_ue[q_idx] = u_full[e_dofs]
-                    quad_nids[q_idx] = nids
-                    q_idx += 1
+            # ── 3. QUAD4 민감도 (JAX vmap) ────────────────────────────
+            if self._n_quad > 0:
+                # 좌표는 매 반복마다 갱신 (비드 높이 적용 후 변경됨)
+                nodes = self.model.nodes
+                quad_c = np.array([
+                    [[nodes[nid].x, nodes[nid].y, nodes[nid].z] for nid in row]
+                    for row in self._quad_nids
+                ], dtype=np.float64)  # (n_quad, 4, 3)
 
-            if q_idx > 0:
+                quad_ue = u_full[self._quad_dof_idx]  # (n_quad, 24) — 인덱스 배열 슬라이싱
+
                 grads = vmap_element_grad_jax(
-                    jnp.array(quad_c1), jnp.array(quad_c2), jnp.array(quad_c3), jnp.array(quad_c4),
-                    jnp.array(quad_ue), jnp.array(quad_t), jnp.array(quad_E), jnp.array(quad_nu)
+                    jnp.array(quad_c[:, 0]), jnp.array(quad_c[:, 1]),
+                    jnp.array(quad_c[:, 2]), jnp.array(quad_c[:, 3]),
+                    jnp.array(quad_ue),
+                    jnp.array(self._quad_t), jnp.array(self._quad_E), jnp.array(self._quad_nu),
                 )
-                for q in range(q_idx):
-                    nids = quad_nids[q]
-                    for i_local, grad_vec in enumerate([grads[0][q], grads[1][q], grads[2][q], grads[3][q]]):
-                        idx = self._design_nid_to_idx.get(nids[i_local])
-                        if idx is not None:
-                            total_sens[idx] -= weight * float(np.dot(np.array(grad_vec), self.bead_dir))
+                # grads: tuple of 4, each (n_quad, 3)
+                # 각 노드별 bead_dir 투영값: (n_quad, 4)
+                grad_stack = np.stack([np.array(g) for g in grads], axis=1)  # (n_quad, 4, 3)
+                proj = np.einsum('qnd,d->qn', grad_stack, self.bead_dir)     # (n_quad, 4)
+
+                # 설계 노드에만 scatter: _quad_node_design_idx == -1 이면 무시
+                mask = self._quad_node_design_idx >= 0                        # (n_quad, 4)
+                valid_design_idx = np.where(mask, self._quad_node_design_idx, 0)
+                np.add.at(total_sens, valid_design_idx, np.where(mask, -weight * proj, 0.0))
 
             # ── 4. TRIA3 민감도 (3D 중앙차분) ────────────────────────
-            for eidx in tria_eidxs:
-                eid = self.elem_ids[eidx]
-                elem = self.model.elements[eid]
-                nids = elem.node_ids
-                if not any(nid in self._design_nid_to_idx for nid in nids): continue
-                
-                for nid in nids:
-                    idx = self._design_nid_to_idx.get(nid)
-                    if idx is None: continue
-                    
+            move = self.fd_dz * self.bead_dir
+            for i_t, eidx in enumerate(self._tria_eidxs):
+                nd_idx = self._tria_node_design_idx[i_t]
+                nids   = self._tria_nids_list[i_t]
+                dofs   = self._tria_dof_idx[i_t]
+                ue     = u_full[dofs]
+
+                for i_local, nid in enumerate(nids):
+                    idx = nd_idx[i_local]
+                    if idx == -1:
+                        continue
                     node = self.model.nodes[nid]
                     orig_xyz = np.array([node.x, node.y, node.z])
-                    move = self.fd_dz * self.bead_dir
-                    
                     node.x, node.y, node.z = orig_xyz + move
                     Ke_p = self._compute_element_K(eidx)
                     node.x, node.y, node.z = orig_xyz - move
                     Ke_m = self._compute_element_K(eidx)
-                    node.x, node.y, node.z = orig_xyz # 복구
-                    
+                    node.x, node.y, node.z = orig_xyz
                     dKe_dh = (Ke_p - Ke_m) / (2.0 * self.fd_dz)
-                    e_dofs = [self.nid_to_idx[n]*6+d for n in nids for d in range(6)]
-                    ue = u_full[e_dofs]
                     total_sens[idx] -= weight * float(ue @ dKe_dh @ ue)
 
         return total_C, case_responses, total_sens
