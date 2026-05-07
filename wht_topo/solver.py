@@ -608,33 +608,69 @@ class WHTopographySolver:
         """
         현재 비드 형상에서의 총 컴플라이언스 및 설계 변수별 민감도를 계산합니다.
 
+        병렬화 전략:
+          1. K_base 1회 조립 (기하학만 의존 → 모든 하중 케이스 공유)
+          2. 하중 케이스별 _augment_K + spsolve를 ThreadPoolExecutor로 병렬 실행
+             (UMFPACK은 단일스레드 → 멀티코어에서 진정한 병렬화)
+          3. JAX 민감도는 GIL 이슈로 순차 실행
+
         Parameters
         ----------
         solver : WHTSolver
-            FEA 연산을 수행할 솔버 인스턴스
 
         Returns
         -------
-        total_C : float
-            가중 합산 컴플라이언스
-        case_responses : dict
-            하중별 응답 데이터 (C, max_disp, max_stress)
-        total_sens : (n_design,) 설계 노드별 민감도
+        total_C : float, case_responses : dict, total_sens : (n_design,)
         """
+        from scipy.sparse.linalg import spsolve
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from wht_solver.wht_stress_recovery import ElementStressRecovery
+        from wht_solver.wht_result import WHTSolverResult
+
         ndof       = len(self.sorted_nids) * 6
         total_C    = 0.0
         case_responses = {}
         total_sens = np.zeros(self._n_design)
 
-        for load_case, weight in self._load_cases:
-            # ── 1. FEA 수행 ──────────────
-            result = solver.solve_static(load_case)
-            u_full = np.zeros(ndof)
-            for i, nid in enumerate(self.sorted_nids):
-                idx = self.nid_to_idx[nid]
-                u_full[idx * 6: idx * 6 + 6] = result.displacement[i, :]
+        # ── 1. K_base 1회 조립 (BC 없는 기하학 전용) ─────────────────────────
+        jm_base, _snids, _nidx = solver._build_jaxsso_model(load_case=None)
+        K_base = solver._assemble_K_scipy(jm_base, _snids, _nidx, stabilize=True)
+        print(f" -> [Solver] K_base 조립 완료 ({K_base.nnz} nnz) — {len(self._load_cases)}개 케이스 공유")
 
-            # ── 2. 컴플라이언스 및 응답 ─────────────────────────────
+        # ── 2. 노드 좌표 배열 사전 추출 (JAX 민감도 공유, 이터레이션 내 고정) ──
+        nodes = self.model.nodes
+        if self._n_quad > 0:
+            quad_c_jnp = jnp.array([
+                [[nodes[nid].x, nodes[nid].y, nodes[nid].z] for nid in row]
+                for row in self._quad_nids
+            ], dtype=jnp.float64)  # (n_quad, 4, 3)
+        if self._n_tria > 0:
+            tria_c_jnp = jnp.array([
+                [[nodes[nid].x, nodes[nid].y, nodes[nid].z] for nid in row]
+                for row in self._tria_nids
+            ], dtype=jnp.float64)  # (n_tria, 3, 3)
+
+        # ── 3. 하중 케이스별 FEA 워커 (스레드 내부, scipy만 사용) ─────────────
+        def _solve_one(load_case: "WHTLoadCase"):
+            jm_lc, _, _ = solver._build_jaxsso_model(load_case=load_case)
+            K_aug, f_aug = solver._augment_K_scipy(K_base, jm_lc)
+            u_aug_np = np.array(spsolve(K_aug.tocsc(), f_aug))
+
+            n_nodes = len(self.sorted_nids)
+            displacement = np.zeros((n_nodes, 6))
+            for ii, nid in enumerate(self.sorted_nids):
+                displacement[ii, :] = u_aug_np[self.nid_to_idx[nid] * 6:
+                                                self.nid_to_idx[nid] * 6 + 6]
+
+            rd_q = ElementStressRecovery.recover_quad4(solver.model, displacement, self.sorted_nids)
+            rd_t = ElementStressRecovery.recover_tria3(solver.model, displacement, self.sorted_nids)
+            cell_data = {k: (rd_q[k] + rd_t[k])[np.newaxis, :, :] for k in rd_q}
+
+            u_full = np.zeros(ndof)
+            for ii, nid in enumerate(self.sorted_nids):
+                u_full[self.nid_to_idx[nid] * 6:
+                       self.nid_to_idx[nid] * 6 + 6] = displacement[ii, :]
+
             f_full = np.zeros(ndof)
             for force in load_case.forces:
                 idx = self.nid_to_idx.get(force.node_id)
@@ -644,64 +680,63 @@ class WHTopographySolver:
                         f_full[idx * 6 + d] += fval
 
             C_i = float(np.dot(f_full, u_full))
-            total_C += weight * C_i
 
-            disp_vals  = result.displacement
-            stress_vals = result.cell_data["Stress"][0]
-            case_responses[load_case.name] = {
-                "C": C_i,
-                "max_disp":   float(np.max(np.linalg.norm(disp_vals[:, :3], axis=1))),
+            result = WHTSolverResult("static", self.sorted_nids)
+            result.displacement = displacement
+            result.cell_data    = cell_data
+            result._u_aug       = u_aug_np
+            result._ndof        = ndof
+            return load_case.name, C_i, u_full, displacement, cell_data, result
+
+        # ── 4. ThreadPoolExecutor 병렬 실행 ────────────────────────────────────
+        # UMFPACK(spsolve)은 단일스레드 → 멀티코어에서 진정한 병렬화
+        # BLAS 과부하 방지를 위해 워커 수 4개 상한
+        n_workers = min(len(self._load_cases), 4)
+        solve_results = [None] * len(self._load_cases)
+        lc_list = [(i, lc, w) for i, (lc, w) in enumerate(self._load_cases)]
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(_solve_one, lc): (i, w)
+                       for i, lc, w in lc_list}
+            for future in as_completed(futures):
+                i, w = futures[future]
+                solve_results[i] = (w, future.result())
+
+        # ── 5. 결과 수집 + JAX 민감도 (순차 — JAX GIL 이슈) ──────────────────
+        for weight, (name, C_i, u_full, displacement, cell_data_r, result) in solve_results:
+            total_C += weight * C_i
+            stress_vals = cell_data_r["Stress"][0]
+            case_responses[name] = {
+                "C":          C_i,
+                "max_disp":   float(np.max(np.linalg.norm(displacement[:, :3], axis=1))),
                 "max_stress": _von_mises_max(stress_vals),
-                "result": result,
+                "result":     result,
             }
 
-            # ── 3. QUAD4 민감도 (JAX vmap) ────────────────────────────
             if self._n_quad > 0:
-                # 좌표는 매 반복마다 갱신 (비드 높이 적용 후 변경됨)
-                nodes = self.model.nodes
-                quad_c = np.array([
-                    [[nodes[nid].x, nodes[nid].y, nodes[nid].z] for nid in row]
-                    for row in self._quad_nids
-                ], dtype=np.float64)  # (n_quad, 4, 3)
-
-                quad_ue = u_full[self._quad_dof_idx]  # (n_quad, 24) — 인덱스 배열 슬라이싱
-
+                quad_ue = u_full[self._quad_dof_idx]
                 grads = vmap_element_grad_jax(
-                    jnp.array(quad_c[:, 0]), jnp.array(quad_c[:, 1]),
-                    jnp.array(quad_c[:, 2]), jnp.array(quad_c[:, 3]),
+                    quad_c_jnp[:, 0], quad_c_jnp[:, 1],
+                    quad_c_jnp[:, 2], quad_c_jnp[:, 3],
                     jnp.array(quad_ue),
                     jnp.array(self._quad_t), jnp.array(self._quad_E), jnp.array(self._quad_nu),
                 )
-                # grads: tuple of 4, each (n_quad, 3)
-                # 각 노드별 bead_dir 투영값: (n_quad, 4)
                 grad_stack = np.stack([np.array(g) for g in grads], axis=1)  # (n_quad, 4, 3)
-                proj = np.einsum('qnd,d->qn', grad_stack, self.bead_dir)     # (n_quad, 4)
-
-                # 설계 노드에만 scatter: _quad_node_design_idx == -1 이면 무시
-                mask = self._quad_node_design_idx >= 0                        # (n_quad, 4)
+                proj = np.einsum('qnd,d->qn', grad_stack, self.bead_dir)
+                mask = self._quad_node_design_idx >= 0
                 valid_design_idx = np.where(mask, self._quad_node_design_idx, 0)
                 np.add.at(total_sens, valid_design_idx, np.where(mask, -weight * proj, 0.0))
 
-            # ── 4. TRIA3 민감도 (JAX Auto-Diff) ─────────────────────────
             if self._n_tria > 0:
-                nodes = self.model.nodes
-                tria_c = np.array([
-                    [[nodes[nid].x, nodes[nid].y, nodes[nid].z] for nid in row]
-                    for row in self._tria_nids
-                ], dtype=np.float64)  # (n_tria, 3, 3)
-
-                tria_ue = u_full[self._tria_dof_idx]  # (n_tria, 18)
-
+                tria_ue = u_full[self._tria_dof_idx]
                 grads_t = vmap_element_grad_tria3_jax(
-                    jnp.array(tria_c[:, 0]), jnp.array(tria_c[:, 1]), jnp.array(tria_c[:, 2]),
+                    tria_c_jnp[:, 0], tria_c_jnp[:, 1], tria_c_jnp[:, 2],
                     jnp.array(tria_ue),
                     jnp.array(self._tria_t), jnp.array(self._tria_E), jnp.array(self._tria_nu),
                 )
-                # grads_t: tuple of 3, each (n_tria, 3)
                 grad_stack_t = np.stack([np.array(g) for g in grads_t], axis=1)  # (n_tria, 3, 3)
-                proj_t = np.einsum('qnd,d->qn', grad_stack_t, self.bead_dir)     # (n_tria, 3)
-
-                mask_t = self._tria_node_design_idx >= 0                          # (n_tria, 3)
+                proj_t = np.einsum('qnd,d->qn', grad_stack_t, self.bead_dir)
+                mask_t = self._tria_node_design_idx >= 0
                 valid_design_idx_t = np.where(mask_t, self._tria_node_design_idx, 0)
                 np.add.at(total_sens, valid_design_idx_t, np.where(mask_t, -weight * proj_t, 0.0))
 
