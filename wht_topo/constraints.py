@@ -23,20 +23,30 @@ class ModeTracker:
 
 class DynamicConstraint:
     """
-    [동적 제약 조건] 특정 모드의 고유 진동수를 제어합니다.
+    [동적 제약 조건] 특정 모드의 고유 진동수 범위를 제어합니다.
     """
-    def __init__(self, target_freq: float, mode_idx: int = 0, penalty_weight: float = 100.0):
-        self.target_freq = target_freq
+    def __init__(self, min_freq: float = 0.0, max_freq: float = 0.0, mode_idx: int = 0, penalty_weight: float = 1.0):
+        self.min_freq = min_freq
+        self.max_freq = max_freq
         self.tracker = ModeTracker(target_mode_idx=mode_idx)
         self.weight = penalty_weight
         
-    def get_penalty(self, freqs: jnp.ndarray, modes: jnp.ndarray, ref_mode: jnp.ndarray) -> float:
+    def get_penalty(self, freqs: jnp.ndarray, modes: jnp.ndarray = None, ref_mode: jnp.ndarray = None) -> float:
         """
-        Pure Function: 외부에서 ref_mode를 전달받아 페널티 계산
+        Pure Function: 외부에서 진동수 배열을 받아 페널티 계산 (강체 모드 제외 첫 탄성 모드 기준)
         """
-        idx = self.tracker.find_best_match(modes, ref_mode)
-        current_f = freqs[idx]
-        violation = jnp.maximum(0.0, self.target_freq - current_f)
+        if modes is not None and ref_mode is not None:
+            idx = self.tracker.find_best_match(modes, ref_mode)
+            current_f = freqs[idx]
+        else:
+            elastic_freqs = [f for f in freqs if f > 0.1]
+            current_f = elastic_freqs[0] if elastic_freqs else 0.0
+
+        violation = 0.0
+        if self.min_freq > 0.1 and current_f < self.min_freq:
+            violation += (self.min_freq - current_f)
+        if self.max_freq > 0.1 and current_f > self.max_freq:
+            violation += (current_f - self.max_freq)
         return self.weight * (violation**2)
 
 class StressConstraint:

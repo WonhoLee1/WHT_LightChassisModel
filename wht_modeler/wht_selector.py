@@ -1,12 +1,12 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 wht_selector.py
 ===============
-WHT FEM Framework — Advanced Selection Engine
+WHT FEM Framework ??Advanced Selection Engine
 
-상용 CAE Preprocessor(HyperMesh, ANSA 등)의 선택 기능을 벤치마킹하여 구현된 
-노드 및 요소 선택 클래스입니다. 곡률 기반 선택, 공간 필터링, 그리고 
-이러한 조작들을 직렬(Serial)로 연결하여 복잡한 필터링이 가능하도록 설계되었습니다.
+?곸슜 CAE Preprocessor(HyperMesh, ANSA ?????좏깮 湲곕뒫??踰ㅼ튂留덊궧?섏뿬 援ы쁽??
+?몃뱶 諛??붿냼 ?좏깮 ?대옒?ㅼ엯?덈떎. 怨〓쪧 湲곕컲 ?좏깮, 怨듦컙 ?꾪꽣留? 洹몃━怨?
+?대윭??議곗옉?ㅼ쓣 吏곷젹(Serial)濡??곌껐?섏뿬 蹂듭옟???꾪꽣留곸씠 媛?ν븯?꾨줉 ?ㅺ퀎?섏뿀?듬땲??
 """
 
 import numpy as np
@@ -16,13 +16,13 @@ from .wht_mesh_model import WHTMeshModel
 
 class WHTSelector:
     """
-    고급 노드/요소 선택기 클래스입니다.
-    메서드 체이닝을 통해 필터링 과정을 직관적으로 기술할 수 있습니다.
+    怨좉툒 ?몃뱶/?붿냼 ?좏깮湲??대옒?ㅼ엯?덈떎.
+    硫붿꽌??泥댁씠?앹쓣 ?듯빐 ?꾪꽣留?怨쇱젙??吏곴??곸쑝濡?湲곗닠?????덉뒿?덈떎.
     """
 
     def __init__(self, model: WHTMeshModel, initial_nids: Optional[Iterable[int]] = None):
         self.model = model
-        # 현재 선택된 노드 ID들의 집합
+        # ?꾩옱 ?좏깮???몃뱶 ID?ㅼ쓽 吏묓빀
         if initial_nids is not None:
             self.selected_nids = set(initial_nids)
         else:
@@ -32,11 +32,11 @@ class WHTSelector:
         self._elem_normals = None # Lazy normals
 
     # ------------------------------------------------------------------
-    # 1. 집합 연산 (Set Operations / Chaining)
+    # 1. 吏묓빀 ?곗궛 (Set Operations / Chaining)
     # ------------------------------------------------------------------
 
     def reset(self, to_all: bool = True) -> 'WHTSelector':
-        """선택 영역을 초기화합니다."""
+        """?좏깮 ?곸뿭??珥덇린?뷀빀?덈떎."""
         if to_all:
             self.selected_nids = set(self.model.nodes.keys())
         else:
@@ -44,35 +44,35 @@ class WHTSelector:
         return self
 
     def add(self, other: Union['WHTSelector', List[int], Set[int]]) -> 'WHTSelector':
-        """기존 선택 영역에 새로운 노드들을 합칩니다 (OR 연산)."""
+        """湲곗〈 ?좏깮 ?곸뿭???덈줈???몃뱶?ㅼ쓣 ?⑹묩?덈떎 (OR ?곗궛)."""
         ids = other.selected_nids if isinstance(other, WHTSelector) else set(other)
         self.selected_nids.update(ids)
         return self
 
     def filter(self, other: Union['WHTSelector', List[int], Set[int]]) -> 'WHTSelector':
-        """기존 선택 영역 중 조건에 맞는 노드들만 남깁니다 (AND 연산)."""
+        """湲곗〈 ?좏깮 ?곸뿭 以?議곌굔??留욌뒗 ?몃뱶?ㅻ쭔 ?④퉩?덈떎 (AND ?곗궛)."""
         ids = other.selected_nids if isinstance(other, WHTSelector) else set(other)
         self.selected_nids.intersection_update(ids)
         return self
 
     def remove(self, other: Union['WHTSelector', List[int], Set[int]]) -> 'WHTSelector':
-        """기존 선택 영역에서 특정 노드들을 제외합니다 (NOT 연산)."""
+        """湲곗〈 ?좏깮 ?곸뿭?먯꽌 ?뱀젙 ?몃뱶?ㅼ쓣 ?쒖쇅?⑸땲??(NOT ?곗궛)."""
         ids = other.selected_nids if isinstance(other, WHTSelector) else set(other)
         self.selected_nids.difference_update(ids)
         return self
 
     def get_ids(self) -> List[int]:
-        """최종 선택된 노드 ID 리스트를 반환합니다."""
+        """理쒖쥌 ?좏깮???몃뱶 ID 由ъ뒪?몃? 諛섑솚?⑸땲??"""
         return sorted(list(self.selected_nids))
 
     # ------------------------------------------------------------------
-    # 2. 공간 기반 선택 (Spatial Selection)
+    # 2. 怨듦컙 湲곕컲 ?좏깮 (Spatial Selection)
     # ------------------------------------------------------------------
 
     def by_box(self, x: Tuple[float, float] = None, 
                y: Tuple[float, float] = None, 
                z: Tuple[float, float] = None) -> 'WHTSelector':
-        """Bounding Box 영역 내의 노드들을 필터링합니다."""
+        """Bounding Box ?곸뿭 ?댁쓽 ?몃뱶?ㅼ쓣 ?꾪꽣留곹빀?덈떎."""
         new_set = set()
         for nid in self.selected_nids:
             node = self.model.nodes[nid]
@@ -84,7 +84,7 @@ class WHTSelector:
         return self
 
     def by_sphere(self, center: Tuple[float, float, float], radius: float) -> 'WHTSelector':
-        """구(Sphere) 영역 내의 노드들을 필터링합니다."""
+        """援?Sphere) ?곸뿭 ?댁쓽 ?몃뱶?ㅼ쓣 ?꾪꽣留곹빀?덈떎."""
         cx, cy, cz = center
         r2 = radius ** 2
         new_set = set()
@@ -96,11 +96,16 @@ class WHTSelector:
         return self
 
     # ------------------------------------------------------------------
-    # 3. 집합 기반 선택 (Set-based Selection)
+    # 3. 吏묓빀 湲곕컲 ?좏깮 (Set-based Selection)
     # ------------------------------------------------------------------
 
+    def by_ids(self, nids: Iterable[int]) -> 'WHTSelector':
+        """?뱀젙 ?몃뱶 ID 由ъ뒪?몃? 湲곕컲?쇰줈 ?좏깮 ?곸뿭???ㅼ젙?⑸땲??"""
+        self.selected_nids = set(nids)
+        return self
+
     def by_set(self, sid_or_name: Union[int, str]) -> 'WHTSelector':
-        """Node Set ID 또는 이름을 기반으로 노드들을 선택합니다."""
+        """Node Set ID ?먮뒗 ?대쫫??湲곕컲?쇰줈 ?몃뱶?ㅼ쓣 ?좏깮?⑸땲??"""
         try:
             if isinstance(sid_or_name, int):
                 nids = self.model.get_nodes_by_set(sid_or_name)
@@ -112,7 +117,7 @@ class WHTSelector:
         return self
 
     def by_elem_set(self, sid_or_name: Union[int, str]) -> 'WHTSelector':
-        """Element Set 내의 요소들이 포함하는 모든 노드들을 선택합니다."""
+        """Element Set ?댁쓽 ?붿냼?ㅼ씠 ?ы븿?섎뒗 紐⑤뱺 ?몃뱶?ㅼ쓣 ?좏깮?⑸땲??"""
         try:
             if isinstance(sid_or_name, int):
                 nids = self.model.get_nodes_from_elem_set(sid_or_name)
@@ -124,13 +129,13 @@ class WHTSelector:
         return self
 
     # ------------------------------------------------------------------
-    # 4. 위상 및 곡률 기반 선택 (Topology & Curvature Selection)
+    # 4. ?꾩긽 諛?怨〓쪧 湲곕컲 ?좏깮 (Topology & Curvature Selection)
     # ------------------------------------------------------------------
 
     def by_path(self, seed_nid: int, angle_limit_deg: float = 20.0) -> 'WHTSelector':
         """
-        에지 방향 변화량(곡률)을 기반으로 연속된 림(Rim) 경로 노드를 선택합니다.
-        (HyperMesh의 'by Path' 기능과 유사)
+        ?먯? 諛⑺뼢 蹂?붾웾(怨〓쪧)??湲곕컲?쇰줈 ?곗냽??由?Rim) 寃쎈줈 ?몃뱶瑜??좏깮?⑸땲??
+        (HyperMesh??'by Path' 湲곕뒫怨??좎궗)
         """
         adj = self._get_adj()
         if seed_nid not in self.model.nodes: return self
@@ -153,7 +158,7 @@ class WHTSelector:
                 curr_vec = curr_vec / (np.linalg.norm(curr_vec) + 1e-9)
                 
                 if prev_vec is None:
-                    # 시작점에서는 가장 주된 방향(예: X, Y, Z축 중 하나)을 선호하도록 가정하거나 임의 선택
+                    # ?쒖옉?먯뿉?쒕뒗 媛??二쇰맂 諛⑺뼢(?? X, Y, Z異?以??섎굹)???좏샇?섎룄濡?媛?뺥븯嫄곕굹 ?꾩쓽 ?좏깮
                     angle = 0.0 
                 else:
                     angle = np.degrees(np.arccos(np.clip(np.dot(prev_vec, curr_vec), -1.0, 1.0)))
@@ -174,26 +179,26 @@ class WHTSelector:
 
     def by_face(self, seed_nid: int, angle_limit_deg: float = 30.0) -> 'WHTSelector':
         """
-        면 곡률(Face Curvature)을 기반으로 인접한 노드들을 선택합니다.
-        요소 법선(Normal) 벡터의 변화량이 임계치 이내인 영역을 Flood fill 합니다.
-        (HyperMesh의 'by Face' 기능과 유사)
+        硫?怨〓쪧(Face Curvature)??湲곕컲?쇰줈 ?몄젒???몃뱶?ㅼ쓣 ?좏깮?⑸땲??
+        ?붿냼 踰뺤꽑(Normal) 踰≫꽣??蹂?붾웾???꾧퀎移??대궡???곸뿭??Flood fill ?⑸땲??
+        (HyperMesh??'by Face' 湲곕뒫怨??좎궗)
         """
         if seed_nid not in self.model.nodes: return self
         
         adj = self._get_adj()
         elem_normals = self._get_elem_normals()
         
-        # 노드와 연결된 요소들 맵 생성
+        # ?몃뱶? ?곌껐???붿냼??留??앹꽦
         node_to_elems = self._get_node_to_elems()
         
         visited_nodes = {seed_nid}
         queue = [seed_nid]
         
-        # 시작 노드 주변 요소들의 평균 법선을 기준 법선으로 설정
+        # ?쒖옉 ?몃뱶 二쇰? ?붿냼?ㅼ쓽 ?됯퇏 踰뺤꽑??湲곗? 踰뺤꽑?쇰줈 ?ㅼ젙
         seed_elems = node_to_elems.get(seed_nid, [])
         if not seed_elems: return self
         
-        # 시작 노드의 기준 법선 계산
+        # ?쒖옉 ?몃뱶??湲곗? 踰뺤꽑 怨꾩궛
         ref_normal = np.mean([elem_normals[eid] for eid in seed_elems], axis=0)
         ref_normal /= (np.linalg.norm(ref_normal) + 1e-9)
         
@@ -202,32 +207,32 @@ class WHTSelector:
             for neighbor in adj.get(curr_nid, []):
                 if neighbor in visited_nodes: continue
                 
-                # 이웃 노드의 평균 법선 계산
+                # ?댁썐 ?몃뱶???됯퇏 踰뺤꽑 怨꾩궛
                 neighbor_elems = node_to_elems.get(neighbor, [])
                 if not neighbor_elems: continue
                 
                 neighbor_normal = np.mean([elem_normals[eid] for eid in neighbor_elems], axis=0)
                 neighbor_normal /= (np.linalg.norm(neighbor_normal) + 1e-9)
                 
-                # 두 법선 사이의 각도 계산
+                # ??踰뺤꽑 ?ъ씠??媛곷룄 怨꾩궛
                 dot = np.clip(np.dot(ref_normal, neighbor_normal), -1.0, 1.0)
                 angle = np.degrees(np.arccos(dot))
                 
                 if angle <= angle_limit_deg:
                     visited_nodes.add(neighbor)
                     queue.append(neighbor)
-                    # 선택적으로 ref_normal을 업데이트하여 점진적 곡률 대응 가능 (여기서는 고정 기준 사용)
+                    # ?좏깮?곸쑝濡?ref_normal???낅뜲?댄듃?섏뿬 ?먯쭊??怨〓쪧 ???媛??(?ш린?쒕뒗 怨좎젙 湲곗? ?ъ슜)
         
         self.selected_nids = visited_nodes
         return self
 
     def expand_by_face(self, angle_limit_deg: float = 30.0, z_min: Optional[float] = None) -> 'WHTSelector':
         """
-        현재 선택된 노드들로부터 면 곡률(Face Curvature)을 기반으로 선택 영역을 확장합니다 (Flood Fill).
+        ?꾩옱 ?좏깮???몃뱶?ㅻ줈遺??硫?怨〓쪧(Face Curvature)??湲곕컲?쇰줈 ?좏깮 ?곸뿭???뺤옣?⑸땲??(Flood Fill).
         
         Args:
-            angle_limit_deg: 법선 벡터 변화량 허용치.
-            z_min: 확장 시 고려할 최소 높이 제한 (필요시).
+            angle_limit_deg: 踰뺤꽑 踰≫꽣 蹂?붾웾 ?덉슜移?
+            z_min: ?뺤옣 ??怨좊젮??理쒖냼 ?믪씠 ?쒗븳 (?꾩슂??.
         """
         if not self.selected_nids: return self
         
@@ -240,7 +245,7 @@ class WHTSelector:
         
         while queue:
             curr_nid = queue.pop(0)
-            # 기준 법선: 현재 노드의 평균 법선
+            # 湲곗? 踰뺤꽑: ?꾩옱 ?몃뱶???됯퇏 踰뺤꽑
             curr_elems = node_to_elems.get(curr_nid, [])
             if not curr_elems: continue
             ref_normal = np.mean([elem_normals[eid] for eid in curr_elems], axis=0)
@@ -266,7 +271,7 @@ class WHTSelector:
         return self
 
     # ------------------------------------------------------------------
-    # 4. 내부 헬퍼 (Internal Helpers)
+    # 4. ?대? ?ы띁 (Internal Helpers)
     # ------------------------------------------------------------------
 
     def _get_adj(self):
@@ -275,7 +280,7 @@ class WHTSelector:
         return self._adj
 
     def _get_node_to_elems(self) -> Dict[int, List[int]]:
-        """노드 ID를 공유하는 요소 ID 리스트 맵을 생성합니다."""
+        """?몃뱶 ID瑜?怨듭쑀?섎뒗 ?붿냼 ID 由ъ뒪??留듭쓣 ?앹꽦?⑸땲??"""
         mapping = {nid: [] for nid in self.model.nodes.keys()}
         for eid, elem in self.model.elements.items():
             for nid in elem.node_ids:
@@ -284,7 +289,7 @@ class WHTSelector:
         return mapping
 
     def _get_elem_normals(self) -> Dict[int, np.ndarray]:
-        """모든 쉘 요소의 법선 벡터를 계산합니다."""
+        """紐⑤뱺 ???붿냼??踰뺤꽑 踰≫꽣瑜?怨꾩궛?⑸땲??"""
         if self._elem_normals is not None:
             return self._elem_normals
             
@@ -295,7 +300,7 @@ class WHTSelector:
                 normals[eid] = np.array([0.0, 0.0, 1.0])
                 continue
             
-            # 최소 3개의 노드를 사용하여 법선 계산 (벡터 외적)
+            # 理쒖냼 3媛쒖쓽 ?몃뱶瑜??ъ슜?섏뿬 踰뺤꽑 怨꾩궛 (踰≫꽣 ?몄쟻)
             p0 = np.array(self.model.nodes[nids[0]].coords())
             p1 = np.array(self.model.nodes[nids[1]].coords())
             p2 = np.array(self.model.nodes[nids[2]].coords())

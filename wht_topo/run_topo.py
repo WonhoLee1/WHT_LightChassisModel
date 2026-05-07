@@ -22,79 +22,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wht_modeler.wht_mesh_model import WHTMeshModel
 from wht_topo.loads import StochasticLoadManager
 from wht_topo.constraints import DynamicConstraint, StressConstraint
-from wht_topo.solver import WHTopographySolver, JaxTopoSolver  # JaxTopoSolver = 별칭
+from wht_topo.solver import WHTopographySolver
 from wht_visualizer.wht_visualizer import WHTVisualizer
 from wht_converter.wht_models import WHTMetadata
 from test_jaxSSO.mesh_utils import generate_shell_tray
-
-def apply_industrial_morphing(model, densities, max_height=10.0, vol_frac=0.3, discrete=True, draw_dir=None):
-    """
-    상용 S/W 수준의 비드 형상 생성 로직.
-    - draw_dir: 비드가 돌출될 방향 벡터
-    """
-    print(f" -> [Morphing] 제조 가능성 고려 비드 생성 중 (Height: {max_height}mm, Dir: {draw_dir})...")
-    
-    if draw_dir is None:
-        draw_dir = [0.0, 0.0, 1.0]
-    d_dir = np.array(draw_dir, dtype=np.float64)
-    d_dir = d_dir / (np.linalg.norm(d_dir) + 1e-10)
-    
-    all_z = [node.z for node in model.nodes.values()]
-    z_min = min(all_z)
-    z_threshold = z_min + 5.0 # 바닥면 근처만 비드 허용
-    
-    node_sum_density = {nid: 0.0 for nid in model.nodes.keys()}
-    node_count = {nid: 0 for nid in model.nodes.keys()}
-    elem_ids = sorted(model.elements.keys())
-    
-    for idx, eid in enumerate(elem_ids):
-        d = float(densities[idx])
-        for nid in model.elements[eid].node_ids:
-            node_sum_density[nid] += d
-            node_count[nid] += 1
-            
-    displacements = {}
-    for nid, count in node_count.items():
-        if count == 0: continue
-        avg_d = node_sum_density[nid] / count
-        
-        if discrete:
-            disp_factor = 1.0 if avg_d > vol_frac * 1.2 else 0.0
-        else:
-            diff = avg_d - vol_frac
-            denom = np.sqrt(max(vol_frac, 1.0 - vol_frac)) + 1e-6
-            disp_factor = np.sign(diff) * np.sqrt(np.abs(diff)) / denom
-            
-        displacements[nid] = disp_factor * max_height
-
-    # Laplacian Smoothing
-    smoothed_disps = displacements.copy()
-    node_to_node = {nid: set() for nid in model.nodes.keys()}
-    for elem in model.elements.values():
-        for i, n1 in enumerate(elem.node_ids):
-            for n2 in elem.node_ids[i+1:]:
-                node_to_node[n1].add(n2); node_to_node[n2].add(n1)
-                
-    smooth_iters = 3
-    for _ in range(smooth_iters):
-        temp_disps = smoothed_disps.copy()
-        for nid, neighbors in node_to_node.items():
-            if nid not in smoothed_disps or not neighbors: continue
-            neighbor_vals = [temp_disps[nn] for nn in neighbors if nn in temp_disps]
-            if neighbor_vals:
-                smoothed_disps[nid] = 0.7 * temp_disps[nid] + 0.3 * np.mean(neighbor_vals)
-
-    moved_count = 0
-    for nid, node in model.nodes.items():
-        # 바닥면 노드이면서 변위가 있는 경우만 이동
-        if node.z <= z_threshold and nid in smoothed_disps and smoothed_disps[nid] > 0.1:
-            move_vec = d_dir * float(smoothed_disps[nid])
-            node.x += move_vec[0]
-            node.y += move_vec[1]
-            node.z += move_vec[2]
-            moved_count += 1
-            
-    print(f"    - 비드 생성 완료 ({moved_count} 노드 조정됨).")
 
 def run_industrial_topo(args):
     print(f"\n" + "="*80)
@@ -119,9 +50,9 @@ def run_industrial_topo(args):
 
     # 제약 조건 리스트 구성 (향후 확장용)
     constraints = []
-    if args.target_freq > 0.1:
-        print(f" -> [제약] 목표 진동수 설정: {args.target_freq}Hz")
-        constraints.append(DynamicConstraint(target_freq=args.target_freq))
+    if args.freq_min > 0.1 or args.freq_max > 0.1:
+        print(f" -> [제약] 목표 1차 진동수 범위 설정: {args.freq_min}Hz ~ {args.freq_max}Hz")
+        constraints.append(DynamicConstraint(min_freq=args.freq_min, max_freq=args.freq_max))
 
     # 3. 최적화 실행 — WHTopographySolver (설계 변수: 노드별 비드 높이)
     print(f" -> [최적화] 최소 비드 폭: {args.min_width}mm | 최대 비드 높이: {args.bead_height}mm")
@@ -135,10 +66,11 @@ def run_industrial_topo(args):
         min_width=args.min_width,
         draw_dir=args.draw_dir,
         weights=weights,
-        mesh_size_z=10.0,
+        mesh_size_z=args.mesh_size,
         sym_x=args.sym_x,
         bead_connect=args.bead_connect,
         connect_gap=args.connect_gap,
+        bead_steps=args.height_steps,
     )
     
     # 모니터링 GUI 실행
@@ -155,7 +87,7 @@ def run_industrial_topo(args):
     final_heights = solver.solve(max_iter=args.iters, callback=callback)
 
     if ui_process and ui_process.is_alive():
-        print(" -> [GUI] 최적화 완료. 모니터링 창을 닫으면 시각화로 넘어갑니다.")
+        print(" -> [GUI] 최적화 완료. 모니터링 창을 유지한 상태로 시각화를 준비합니다.")
         # UI 종료를 기다리거나 계속 진행할 수 있음. 
         # 여기서는 비동기적으로 두기 위해 STOP 신호만 보냄
         queue.put("STOP")
@@ -164,12 +96,14 @@ def run_industrial_topo(args):
     discrete_height = args.height_steps >= 2
     if discrete_height:
         n = args.height_steps
-        step = solver.h_max / n
-        # 각 높이값을 가장 가까운 step 배수로 반올림 (0 포함 n+1개 레벨)
-        solver.heights = np.round(solver.heights / step) * step
-        solver.heights = np.clip(solver.heights, 0.0, solver.h_max)
-        levels = np.unique(np.round(solver.heights, 4))
-        print(f" -> [이산화] {n}단계 높이 양자화 완료: {levels} mm")
+        # N단계 이산 레벨 (0, ..., h_max)
+        levels = np.linspace(0.0, solver.h_max, n)
+        # 각 높이값을 가장 가까운 레벨로 매핑
+        indices = np.abs(solver.heights[:, None] - levels).argmin(axis=1)
+        solver.heights = levels[indices]
+        
+        final_levels = np.unique(np.round(solver.heights, 4))
+        print(f" -> [이산화] {n}개 레벨 양자화 완료: {final_levels} mm")
 
     # 5. 최종 형상을 모델 노드 좌표에 영구 적용
     # 이산화 후에는 필터 재적용 시 양자화값이 블러링되므로 skip_filter=True
@@ -180,7 +114,7 @@ def run_industrial_topo(args):
         model.export_to_solver('lsdyna', args.export, reorder=True)
         print(f" -> [성공] 결과 저장 완료: {args.export}")
 
-    # 6. 시각화 (옵션)
+    # 7. 시각화
     if not args.no_viz:
         print(" -> [시각화] 결과 렌더링 중...")
         # WHTMeshModel을 WHTResultData로 변환 (시각화 모듈 호환성)
@@ -232,7 +166,7 @@ def main():
     6. 대칭 + 연결 조합 (최고 품질 설계):
        python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --gui
        python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --bead-area 0.25 --gui       
-       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap  100.0 --bead-area 0.25 --height-steps 2 --gui   
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0  --min-width 30.0 --bead-area 0.25 --height-steps 2 --gui   
 
     7. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
        python wht_topo/run_topo.py --iters 50 --no-viz --export final_bead_pattern.k
@@ -260,7 +194,8 @@ def main():
       --w-twisting F     대각 비틀림 하중 가중치 (기본: 1.5)
       --w-lifting F      4코너 개별 리프팅 하중 전체 가중치 (기본: 1.2)
                          → 4개 케이스로 분할되므로 케이스당 실효 가중치 = F/4
-      --target-freq F    목표 고유 진동수 제약 Hz (기본: 0.0 = 미사용)
+      --freq-min F       목표 1차 고유 진동수 하한 Hz (기본: 0.0 = 미사용)
+      --freq-max F       목표 1차 고유 진동수 상한 Hz (기본: 0.0 = 미사용)
 
     [시각화 및 출력]
       --gui              실시간 모니터링 GUI (PySide6) 실행
@@ -295,7 +230,8 @@ def main():
     parser.add_argument("--w-bending",   type=float, default=1.0, help="중앙 굽힘 하중 가중치 (기본: 1.0)")
     parser.add_argument("--w-twisting",  type=float, default=1.5, help="대각 비틀림 하중 가중치 (기본: 1.5)")
     parser.add_argument("--w-lifting",   type=float, default=1.2, help="4코너 리프팅 하중 전체 가중치 / 4개 케이스 분할 (기본: 1.2)")
-    parser.add_argument("--target-freq", type=float, default=0.0, help="목표 고유 진동수 제약 (Hz, 기본: 0.0 = 미사용)")
+    parser.add_argument("--freq-min",    type=float, default=0.0, help="목표 1차 고유 진동수 하한 (Hz, 기본: 0.0 = 미사용)")
+    parser.add_argument("--freq-max",    type=float, default=0.0, help="목표 1차 고유 진동수 상한 (Hz, 기본: 0.0 = 미사용)")
 
     # ── 시각화 및 출력 ───────────────────────────────────────────────────────
     parser.add_argument("--gui",      action="store_true",         help="실시간 모니터링 GUI(PySide6) 실행")
@@ -310,4 +246,9 @@ def main():
     run_industrial_topo(args)
 
 if __name__ == "__main__":
+    try:
+        multiprocessing.freeze_support()
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
     main()

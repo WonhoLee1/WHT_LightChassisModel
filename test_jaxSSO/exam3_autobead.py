@@ -33,6 +33,7 @@ import koreanize_matplotlib
 
 # 시각화 설정 (사용자 규칙 준수: 한글 폰트 및 9pt 폰트 크기)
 plt.rcParams['font.size'] = 9
+plt.rcParams['font.family'] = 'Segoe UI'
 
 # JAX float64 설정 (고유치 해석의 수치적 안정성 확보를 위해 필수)
 jax.config.update("jax_enable_x64", True) 
@@ -427,5 +428,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

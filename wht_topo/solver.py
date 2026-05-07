@@ -135,8 +135,18 @@ class WHTopographySolver:
         self.sym_x          = sym_x
         self.bead_connect   = bead_connect
         self.connect_gap    = connect_gap  # mm, 버드 연결 시 채울 최대 간격
-        self.bead_steps     = bead_steps   # 0 = 연속, N >= 1 = N단계 이산 높이
+        self.bead_steps     = bead_steps   # 0 = 연속, N >= 2 = N단계 이산 레벨 (0, ..., h_max)
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
+
+        # Projection parameter (Continuation)
+        self._beta = 1.0
+        
+        self.constraints    = constraints or []
+        self.freq_min       = 0.0
+        self.freq_max       = 0.0
+        for c in self.constraints:
+            if hasattr(c, "min_freq"): self.freq_min = c.min_freq
+            if hasattr(c, "max_freq"): self.freq_max = c.max_freq
 
         # 비드 돌출 방향 정규화
         d = np.array(draw_dir, dtype=np.float64)
@@ -345,6 +355,49 @@ class WHTopographySolver:
                     x_new[k] = max(x_new[k], threshold + 0.02)
         return x_new
 
+    # ─────────────── Discrete Projection (Staircase) ───────────────
+
+    def _project_x(self, x: np.ndarray, beta: float) -> np.ndarray:
+        """
+        설계 변수를 지정된 N단계 이산 레벨로 부드럽게 투사합니다.
+        
+        N=2 이면 {0, 1}, N=3 이면 {0, 0.5, 1} 등으로 수렴하도록 tanh 기반 계단 함수 적용.
+        """
+        if self.bead_steps < 2:
+            return x
+        
+        n = self.bead_steps
+        # 각 스텝 사이의 임계점(Thresholds)
+        thresholds = np.linspace(0, 1, n * 2 + 1)[1:-1:2]
+        levels = np.linspace(0, 1, n)
+        
+        # Staircase function: f(x) = l_0 + sum( (l_{k+1} - l_k) * 0.5 * (tanh(beta*(x - t_k)) + 1) )
+        x_proj = np.full_like(x, levels[0])
+        for i in range(n - 1):
+            diff = levels[i+1] - levels[i]
+            x_proj += diff * 0.5 * (np.tanh(beta * (x - thresholds[i])) + 1.0)
+            
+        return x_proj
+
+    def _project_x_grad(self, x: np.ndarray, beta: float) -> np.ndarray:
+        """
+        투사 함수의 미분값 (Chain-rule 용).
+        """
+        if self.bead_steps < 2:
+            return np.ones_like(x)
+        
+        n = self.bead_steps
+        thresholds = np.linspace(0, 1, n * 2 + 1)[1:-1:2]
+        levels = np.linspace(0, 1, n)
+        
+        # df/dx = sum( (l_{k+1} - l_k) * 0.5 * beta * (1 - tanh^2(beta*(x - t_k))) )
+        grad = np.zeros_like(x)
+        for i in range(n - 1):
+            diff = levels[i+1] - levels[i]
+            grad += diff * 0.5 * beta * (1.0 - np.tanh(beta * (x - thresholds[i]))**2)
+            
+        return grad
+
     def _build_node_elem_adjacency(self) -> Dict[int, List[int]]:
         """
         설계 노드별로 인접한 요소의 인덱스 리스트를 사전 계산합니다.
@@ -530,7 +583,8 @@ class WHTopographySolver:
             case_responses[load_case.name] = {
                 "C": C_i,
                 "max_disp": float(np.max(np.linalg.norm(disp_vals[:, :3], axis=1))),
-                "max_stress": _von_mises_max(stress_vals)
+                "max_stress": _von_mises_max(stress_vals),
+                "result": result
             }
 
             # ── 3. QUAD4 민감도 (JAX) ─────────────────────
@@ -628,6 +682,23 @@ class WHTopographySolver:
         from wht_solver.wht_solver import WHTSolver
         fea_solver = WHTSolver(self.model)
         
+        # ── 결과 저장용 디렉토리 및 Exporter 초기화 ──
+        from datetime import datetime
+        import os
+        from wht_converter.wht_models import WHTMetadata
+        from wht_converter.wht_exporters import VTKHDFExporter
+
+        stamp = datetime.now().strftime("D%Y%m%d_%H%M%S")
+        export_dir = os.path.join("results", stamp)
+        os.makedirs(export_dir, exist_ok=True)
+        exporter = VTKHDFExporter()
+        meta = WHTMetadata(
+            solver_name="JaxTopoSolver", solver_version="2.0",
+            analysis_type="static", coordinate_system="cartesian",
+            unit_length="mm", unit_force="N"
+        )
+        print(f" -> [Solver] 이터레이션별 통합 해석 결과 저장 디렉토리: {export_dir}")
+
         C_0 = None 
 
         for i in range(max_iter):
@@ -637,8 +708,16 @@ class WHTopographySolver:
 
             x_old = x.copy()
 
+            # ── 1. Discrete Projection & Filtering ──
+            # beta continuation: 반복이 진행됨에 따라 투사 강도를 높여 이산화를 강제함
+            if self.bead_steps >= 2:
+                self._beta = min(50.0, 1.0 + (i / max_iter) * 100.0)
+                x_proj = self._project_x(x, self._beta)
+            else:
+                x_proj = x
+
             # 현재 비드 높이 (물리량) 계산 및 적용
-            h_phys = x * self.h_max
+            h_phys     = x_proj * self.h_max
             h_filtered = self._H @ h_phys
             self._apply_heights(h_filtered)
 
@@ -653,20 +732,76 @@ class WHTopographySolver:
             modal_results = fea_solver.solve_modal(num_modes=10, exclude_rigid_body=False)
             freqs = modal_results.frequencies  # Hz
 
+            # ── 이터레이션 결과 저장 (ParaView 호환 VTKHDF) ──
+            try:
+                # 기본 WHTResultData 생성 (첫 번째 하중 케이스 기준)
+                first_case_name = self._load_cases[0][0].name
+                base_res = C_responses[first_case_name]["result"]
+                wht_data = base_res.to_wht_result_data(meta, self.model)
+                
+                # 단일 Displacement/Stress 키 삭제 (이름 충돌 방지)
+                wht_data.point_data.pop("Displacement", None)
+                wht_data.cell_data.pop("Stress", None)
+                
+                # 1. 비드 높이 (Bead Height) 추가
+                h_current_full = np.zeros(len(self.sorted_nids))
+                for idx_design, nid in enumerate(self._design_nids):
+                    h_current_full[self.nid_to_idx[nid]] = h_filtered[idx_design]
+                wht_data.point_data["Bead_Height"] = h_current_full.reshape(1, -1, 1).astype(np.float32)
+
+                # 2. 하중 케이스별 결과 병합
+                for name, res_dict in C_responses.items():
+                    res_data = res_dict["result"].to_wht_result_data(meta, self.model)
+                    if "Displacement" in res_data.point_data:
+                        wht_data.point_data[f"Disp_{name}"] = res_data.point_data["Displacement"]
+                    if "Stress" in res_data.cell_data:
+                        wht_data.cell_data[f"Stress_{name}"] = res_data.cell_data["Stress"]
+
+                # 3. 고유 모드 형상 추가 및 주파수 정보 명시
+                modal_data = modal_results.to_wht_result_data(meta, self.model)
+                if "Displacement" in modal_data.point_data:
+                    mode_disp = modal_data.point_data["Displacement"] # (num_modes, N, 3)
+                    for m_idx in range(mode_disp.shape[0]):
+                        freq_hz = freqs[m_idx]
+                        field_name = f"Mode_{m_idx+1}_{freq_hz:.2f}Hz"
+                        wht_data.point_data[field_name] = mode_disp[m_idx:m_idx+1]
+                
+                if not hasattr(wht_data, "field_data") or wht_data.field_data is None:
+                    wht_data.field_data = {}
+                wht_data.field_data["Frequencies_Hz"] = np.array([freqs], dtype=np.float32)
+
+                # 파일 출력 (모든 필드를 1개 파일에 병합)
+                out_path = os.path.join(export_dir, f"iter_{i:03d}.hdf")
+                exporter.export(wht_data, out_path)
+            except Exception as e:
+                print(f"    [경고] 해석 결과 저장 실패: {e}")
+
             # 목적 함수 및 민감도 정규화 (MMA 엔진이 제약 조건을 더 잘 인식하도록 함)
             f0val = float(C_total) / C_0
             
-            # 필터 역전파 및 정규화 체인룰 적용
-            dC_dx = (self._H.T @ dC_dh) * self.h_max
+            # 필터 및 투사 역전파 (Chain-rule)
+            # dC/dx = (dx_proj/dx) * (dh/dx_proj) * (dH/dh) * (dC/dH)
+            # 1. 필터 역전파: dC/dh_phys = H^T @ dC/dh_filtered
+            dC_dh_phys = (self._H.T @ dC_dh)
+            # 2. 물리적 변환 및 투사 역전파: dC/dx = (dC/dh_phys * h_max) * dx_proj/dx
+            dC_dx = (dC_dh_phys * self.h_max)
+            if self.bead_steps >= 2:
+                dC_dx *= self._project_x_grad(x, self._beta)
+
             df0dx = (dC_dx / C_0).flatten()
             
             # 좌우 대칭 강제 (민감도 동기화)
             if self.sym_x:
                 df0dx = 0.5 * (df0dx + df0dx[self._sym_map])
 
-            # 제약 조건: Σ x_n / n_vars ≤ h_ratio  (1D 벡터, MMA 내부 브로드캐스트 요구)
-            fval = np.array([float(np.mean(x)) - self.h_ratio])
-            dfdx = np.full(self._n_design, 1.0 / self._n_design)  # (N,) — Bug #3 수정
+            # 제약 조건: Σ x_proj / n_vars ≤ h_ratio (실제 물리적 비드 면적 제약)
+            fval = np.array([float(np.mean(x_proj)) - self.h_ratio])
+            
+            # 제약 조건 민감도 (Chain-rule 적용)
+            # df/dx = (df/dx_proj) * (dx_proj/dx) = (1/N) * dx_proj/dx
+            dfdx = np.full(self._n_design, 1.0 / self._n_design)
+            if self.bead_steps >= 2:
+                dfdx *= self._project_x_grad(x, self._beta)
 
             # MMA 업데이트
             x = self.mma.update(
@@ -706,14 +841,14 @@ class WHTopographySolver:
                 data = {
                     "iter": i,
                     "compliance": float(C_total),
-                    "area_ratio": area_ratio,
+                    "area_ratio": float(np.mean(x_proj > 0.1)), # 투사된 변수 기준 면적
                     "cases": case_data,
                     "frequencies": freqs.tolist(),
-                    "avg_h": float(np.mean(x * self.h_max)),
-                    "max_h": float(np.max(x * self.h_max)),
+                    "avg_h": float(np.mean(h_filtered)),
+                    "max_h": float(np.max(h_filtered)),
                     "dx": change,
                     "coords": coords,
-                    "heights": (x * self.h_max).copy()
+                    "heights": h_filtered.copy() # 시각화 시에도 필터링/투사된 최종 높이 전달
                 }
                 callback(data)
 
@@ -734,7 +869,8 @@ class WHTopographySolver:
 
         # 원본 좌표 복원 후 최종 형상 적용
         self._restore_heights()
-        self.heights = x * self.h_max
+        # 최종 결과도 투사 적용
+        self.heights = self._project_x(x, self._beta) * self.h_max
         return self.heights
 
     def apply_final_shape(self, skip_filter: bool = False):

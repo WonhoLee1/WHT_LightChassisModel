@@ -21,9 +21,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, QObject, QThread
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-import koreanize_matplotlib
+try:
+    import koreanize_matplotlib
+except ImportError:
+    pass
 
 plt.rcParams['font.size'] = 9
+plt.rcParams['font.family'] = 'Segoe UI'
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -210,6 +214,27 @@ class WHTMonitorWindow(QMainWindow):
                     self.table.setColumnCount(len(headers))
                     self.table.setHorizontalHeaderLabels(headers)
 
+                    # ── 열 제목 툴팁(Tooltip) 추가 ──
+                    tooltips = {
+                        "Iter": "반복 횟수 (Iteration Number)",
+                        "C_total": "전체 하중 케이스 가중 컴플라이언스 합 (Total Compliance)",
+                        "Avg_h": "전체 모델 평균 비드 높이 (Average Bead Height) [mm]",
+                        "Max_h": "전체 모델 최대 비드 높이 (Maximum Bead Height) [mm]",
+                        "dx": "이전 스텝 대비 최대 밀도 변화량 (Max Density Change)",
+                        "Area_Ratio": "현재 비드가 점유한 면적 비율 (Bead Area Ratio) [0~1]"
+                    }
+                    for col, h_text in enumerate(headers):
+                        h_item = self.table.horizontalHeaderItem(col)
+                        if h_item:
+                            if h_text in tooltips:
+                                h_item.setToolTip(tooltips[h_text])
+                            elif h_text.startswith("U_"):
+                                h_item.setToolTip(f"[{h_text[2:]}] 하중 케이스의 컴플라이언스 (변형 에너지)")
+                            elif h_text.startswith("D_"):
+                                h_item.setToolTip(f"[{h_text[2:]}] 하중 케이스의 최대 변위 [mm]")
+                            elif h_text.startswith("S_"):
+                                h_item.setToolTip(f"[{h_text[2:]}] 하중 케이스의 최대 폰-미세스 응력 [MPa]")
+
             for name, res in cases_data.items():
                 self.history["cases"][name]["U"].append(res["U"])
                 self.history["cases"][name]["max_disp"].append(res["max_disp"])
@@ -291,17 +316,29 @@ class WHTMonitorWindow(QMainWindow):
             ax.legend()
         elif metric in ["Compliance", "Avg_h", "Max_h", "dx"]:
             ax.plot(iters, self.history[metric.lower()], 'o-', label=metric)
+            if metric == "Compliance": ax.set_ylabel("Compliance (N·mm)")
+            elif metric == "Avg_h": ax.set_ylabel("Average Height (mm)")
+            elif metric == "Max_h": ax.set_ylabel("Maximum Height (mm)")
+            elif metric == "dx": ax.set_ylabel("Density Change (dx)")
         else:
             for name in self.case_names:
                 if metric.endswith(name):
                     m_type = metric.split('_')[0]
                     key = "U" if m_type == "U" else ("max_disp" if m_type == "Disp" else "max_stress")
                     ax.plot(iters, self.history["cases"][name][key], 's-', label=metric)
+                    if key == "U":
+                        ax.set_ylabel("Compliance (N·mm)")
+                    elif key == "max_disp":
+                        ax.set_ylabel("Maximum Displacement (mm)")
+                    elif key == "max_stress":
+                        ax.set_ylabel("Max Von-Mises Stress (MPa)")
                     break
 
         ax.set_title(f"Optimization Trend: {metric}")
         ax.set_xlabel("Iteration")
-        ax.grid(True, alpha=0.3)
+        ax.minorticks_on()
+        ax.grid(True, which='major', linestyle='-', alpha=0.5)
+        ax.grid(True, which='minor', linestyle=':', alpha=0.2)
         self.curve_canvas.fig.tight_layout()
         self.curve_canvas.draw()
 
@@ -341,16 +378,31 @@ class WHTMonitorWindow(QMainWindow):
         data_range_x = coords[:, 0].max() - coords[:, 0].min() + spacing
         pts_per_data = (fig_w_inch * fig.dpi) / data_range_x if data_range_x > 0 else 1.0
         marker_pts = spacing * pts_per_data * 0.85  # 85%로 약간 여백
+        marker_pts = max(1.0, marker_pts - 1.0)     # 계산값에서 1픽셀(pt) 차감
         marker_size_sq = marker_pts ** 2
+
+        # 0을 중앙(보통 흰색)으로 두기 위한 대칭 범위(vmin, vmax) 설정
+        max_abs_h = max(1e-5, float(np.max(np.abs(heights))))
 
         sc = ax.scatter(
             coords[:, 0], coords[:, 1],
-            c=heights, cmap='jet',
+            c=heights, cmap='coolwarm',
             marker='s',
             s=marker_size_sq,
             linewidths=0,
-            vmin=0.0,
+            vmin=-max_abs_h,
+            vmax=max_abs_h,
         )
+
+        # 등고선(Contour) 추가
+        if np.max(np.abs(heights)) > 1e-3:
+            try:
+                ax.tricontour(
+                    coords[:, 0], coords[:, 1], heights,
+                    levels=10, colors='black', linewidths=0.5, alpha=0.5
+                )
+            except Exception:
+                pass
 
         # 컬러바 관리 (중복 생성 방지)
         if self._height_colorbar is None:
@@ -385,7 +437,7 @@ def start_monitor_ui(queue):
         솔버로부터 이터레이션 데이터를 수신하는 큐.
         데이터는 dict 형식이며, "STOP" 문자열 수신 시 종료합니다.
     """
-    app = QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)
     window = WHTMonitorWindow()
     window.show()
 
