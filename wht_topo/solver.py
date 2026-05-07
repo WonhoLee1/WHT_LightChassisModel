@@ -906,21 +906,24 @@ class WHTopographySolver:
                         if nb_sens:
                             df0dx[k] = max(df0dx[k], max(nb_sens))
 
-            # 제약 조건: Σ x_proj / n_vars ≤ h_ratio (실제 물리적 비드 면적 제약)
-            fval = np.array([float(np.mean(x_proj)) - self.h_ratio])
-
-            # 제약 조건 민감도 (Chain-rule 적용)
-            # df/dx = (df/dx_proj) * (dx_proj/dx) = (1/N) * dx_proj/dx
+            # 제약 조건 민감도 (Chain-rule: df/dx = (1/N) * dx_proj/dx)
             dfdx = np.full(self._n_design, 1.0 / self._n_design)
             if self.bead_steps >= 2:
                 dfdx *= self._project_x_grad(x, self._beta)
 
+            fval = np.array([float(np.mean(x_proj)) - self.h_ratio])
+
             # MMA 업데이트
+            # bead_steps >= 2: project_fn 전달 → 이분법이 mean(x_proj) = h_ratio 기준으로 수렴
+            # bead_steps  < 2: project_fn=None → 기존 mean(x) 기준 (연속 변수이므로 동일)
+            project_fn = (lambda xv: self._project_x(np.array(xv), self._beta)
+                          if self.bead_steps >= 2 else None)
             x = self.mma.update(
                 x, f0val, df0dx,
                 fval,
                 dfdx,
                 i + 1,
+                project_fn=project_fn,
             )
             x = np.clip(x, 0.0, 1.0)
 

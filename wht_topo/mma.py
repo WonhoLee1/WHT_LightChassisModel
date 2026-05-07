@@ -45,7 +45,8 @@ class MMAOptimizer:
         self.aub = jnp.ones(n_vars)
 
     def update(self, x: jnp.ndarray, f0val: float, df0dx: jnp.ndarray,
-               fval: jnp.ndarray, dfdx: jnp.ndarray, iteration: int) -> jnp.ndarray:
+               fval: jnp.ndarray, dfdx: jnp.ndarray, iteration: int,
+               project_fn=None) -> jnp.ndarray:
         """
         MMA 업데이트 1회 수행.
 
@@ -54,14 +55,20 @@ class MMAOptimizer:
         x : (N,) 현재 밀도
         f0val : float  목적 함수 값
         df0dx : (N,) 목적 함수 구배
-        fval : (M,) 제약 함수 값 (음수이면 만족)
-        dfdx : (N,) 체적 제약 구배 (= 요소별 면적 비율)
+        fval : (M,) 제약 함수 값 (음수이면 만족, 현재 미사용)
+        dfdx : (N,) 체적 제약 구배 (= 1/N)
         iteration : int  현재 반복 번호 (1-indexed)
+        project_fn : callable(x) → x_proj, optional
+            이산 투사 함수. 지정 시 이분법에서 mean(project(x_test))로
+            체적을 계산하여 시각적 비드 면적 = vol_frac 을 정확히 강제.
+            None이면 기존 방식 mean(x_test) 사용.
 
         Returns
         -------
         x_new : (N,) 업데이트된 밀도
         """
+        import numpy as np
+
         # ── 1. Asymptotes 업데이트 ──
         if iteration <= 2:
             self.low = x - self.move
@@ -78,25 +85,27 @@ class MMAOptimizer:
             self.upp = jnp.clip(self.upp, x + 0.01, x + 10.0)
 
         # ── 2. 이분법 기반 Lagrange Multiplier 탐색 ──
-        # df0dx에 음수 보장 (NaN 방지)
         safe_df0dx = jnp.minimum(df0dx, -1e-10)
 
-        # 하한/상한 범위
         alpha = jnp.maximum(self.alb, jnp.maximum(self.low + 0.1 * (x - self.low), x - self.move))
         beta_ = jnp.minimum(self.aub, jnp.minimum(self.upp - 0.1 * (self.upp - x), x + self.move))
+
+        # 체적 계산 함수: project_fn 제공 시 x_proj 기준, 아니면 x 기준
+        def _vol(x_t):
+            if project_fn is not None:
+                return float(jnp.mean(project_fn(x_t)))
+            return float(jnp.sum(x_t * dfdx))
 
         l1, l2 = 1e-10, 1e12
         for _ in range(60):
             l_mid = 0.5 * (l1 + l2)
             step = jnp.sqrt(-safe_df0dx / (l_mid * dfdx + 1e-10))
             x_test = jnp.clip(x * step, alpha, beta_)
-            vol_current = jnp.sum(x_test * dfdx)
-            if vol_current > self.vol_frac:
+            if _vol(x_test) > self.vol_frac:
                 l1 = l_mid
             else:
                 l2 = l_mid
 
-        # 최종 밀도
         step_final = jnp.sqrt(-safe_df0dx / (l2 * dfdx + 1e-10))
         x_new = jnp.clip(x * step_final, alpha, beta_)
 
