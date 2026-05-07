@@ -132,6 +132,63 @@ class StochasticLoadManager:
         ).get_ids()
         return list(corner_nids)
 
+    def get_edge_flange_nodes(self, axis: str, side: str, mesh_size_z: float = 10.0,
+                               wall_z_ratio: float = 0.5) -> List[int]:
+        """
+        특정 엣지 방향의 플랜지(또는 경사 벽면 상단) 노드를 반환합니다.
+
+        플랜지가 없는 면(예: Y-min)은 wall_z_ratio 이상의 Z 높이를 가진
+        경사 벽면 상단 노드를 대신 선택합니다.
+
+        Parameters
+        ----------
+        axis : 'X' or 'Y'
+            고정할 엣지의 법선 방향
+        side : 'min' or 'max'
+            해당 축의 최소/최대 면
+        mesh_size_z : float
+            플랜지 탐색 Z 허용 오차 [mm]
+        wall_z_ratio : float
+            플랜지 없는 면에서 벽면 상단부 탐색 시작 Z 비율 (기본 0.5 = 중간 이상)
+
+        Returns
+        -------
+        List[int]
+        """
+        all_z   = [n.z for n in self.model.nodes.values()]
+        z_max   = max(all_z)
+        z_min_v = min(all_z)
+        bc_tol  = max(1.0, mesh_size_z * 0.1)
+
+        if axis == 'X':
+            coord_vals = [n.x for n in self.model.nodes.values()]
+            edge_val   = min(coord_vals) if side == 'min' else max(coord_vals)
+            edge_tol   = max(5.0, (max(coord_vals) - min(coord_vals)) * 0.02)
+            def in_edge(n): return abs(n.x - edge_val) < edge_tol
+        else:  # Y
+            coord_vals = [n.y for n in self.model.nodes.values()]
+            edge_val   = min(coord_vals) if side == 'min' else max(coord_vals)
+            edge_tol   = max(5.0, (max(coord_vals) - min(coord_vals)) * 0.02)
+            def in_edge(n): return abs(n.y - edge_val) < edge_tol
+
+        # 1차: 플랜지 영역(Z≈z_max) 탐색
+        flange_nids = [
+            nid for nid, n in self.model.nodes.items()
+            if in_edge(n) and n.z >= z_max - bc_tol
+        ]
+
+        # 플랜지 없는 면이면 경사 벽면 상단부로 폴백
+        if len(flange_nids) < 3:
+            z_wall_min = z_min_v + (z_max - z_min_v) * wall_z_ratio
+            flange_nids = [
+                nid for nid, n in self.model.nodes.items()
+                if in_edge(n) and n.z >= z_wall_min
+            ]
+            if flange_nids:
+                print(f"    [LoadCase] {axis}-{side} 플랜지 없음 → 경사 벽면 상단 {len(flange_nids)}개 노드 사용")
+
+        return flange_nids
+
     def get_load_cases(
         self,
         mesh_size_z: float = 10.0,
@@ -157,7 +214,9 @@ class StochasticLoadManager:
         lifting_load_z : float
             리프팅 하중 (코너 리프팅, 상향) [N]
         weights : Dict[str, float]
-            각 하중 케이스의 목적 함수 가중치 {"bending", "twisting", "lifting"}
+            각 하중 케이스의 목적 함수 가중치.
+            키: "bending", "bending_xspan", "bending_yspan",
+                "twisting", "twisting_alt", "lifting"
 
         Returns
         -------
@@ -165,7 +224,14 @@ class StochasticLoadManager:
             (WHTLoadCase, weight) 튜플 리스트
         """
         if weights is None:
-            weights = {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
+            weights = {
+                "bending":      1.0,
+                "bending_xspan": 0.8,
+                "bending_yspan": 0.8,
+                "twisting":     1.5,
+                "twisting_alt": 1.5,
+                "lifting":      1.2,
+            }
 
         flange_nids = self.get_boundary_nodes(mesh_size_z=mesh_size_z)
         center_nids = self.get_load_nodes()
@@ -205,7 +271,51 @@ class StochasticLoadManager:
               f"반대 2코너에 ±{abs(twisting_load_z):.0f}N 비틀림 하중")
         load_cases.append((lc_twisting, weights["twisting"]))
 
-        # ── Case 3~6: Lifting (4개 코너 개별 리프팅) ──────────────────────────
+        # ── Case 3: Bending X-span (X 방향 스팬 굽힘) ──────────────────────────
+        # BC: Y-min 벽면 상단 + Y-max 플랜지만 고정 → X 방향 1800mm 스팬
+        # LOAD: 중앙 하향 하중 (현재 벤딩과 동일)
+        ymin_nids = self.get_edge_flange_nodes('Y', 'min', mesh_size_z)
+        ymax_nids = self.get_edge_flange_nodes('Y', 'max', mesh_size_z)
+        lc_bending_x = WHTLoadCase(name="bending_xspan")
+        lc_bending_x.add_bc(ymin_nids + ymax_nids, dofs=(0, 1, 2, 3, 4, 5))
+        if center_nids:
+            lc_bending_x.add_force(center_nids, dofs=(2,),
+                                    values=(bending_load_z,), distribute=True)
+        print(f" -> [LoadCase] Bending_Xspan: Y-min({len(ymin_nids)}) + Y-max({len(ymax_nids)})개 고정, "
+              f"X방향 {self.x_max - self.x_min:.0f}mm 스팬")
+        load_cases.append((lc_bending_x, weights.get("bending_xspan", 0.8)))
+
+        # ── Case 4: Bending Y-span (Y 방향 스팬 굽힘) ──────────────────────────
+        # BC: X-min + X-max 플랜지만 고정 → Y 방향 1200mm 스팬
+        # LOAD: 중앙 하향 하중
+        xmin_nids = self.get_edge_flange_nodes('X', 'min', mesh_size_z)
+        xmax_nids = self.get_edge_flange_nodes('X', 'max', mesh_size_z)
+        lc_bending_y = WHTLoadCase(name="bending_yspan")
+        lc_bending_y.add_bc(xmin_nids + xmax_nids, dofs=(0, 1, 2, 3, 4, 5))
+        if center_nids:
+            lc_bending_y.add_force(center_nids, dofs=(2,),
+                                    values=(bending_load_z,), distribute=True)
+        print(f" -> [LoadCase] Bending_Yspan: X-min({len(xmin_nids)}) + X-max({len(xmax_nids)})개 고정, "
+              f"Y방향 {self.y_max - self.y_min:.0f}mm 스팬")
+        load_cases.append((lc_bending_y, weights.get("bending_yspan", 0.8)))
+
+        # ── Case 5: Twisting Alt (반전 대각선 비틀림) ───────────────────────────
+        # BC: corner1(+x,-y) + corner2(-x,+y) 고정  ← 현재 twisting과 대각 교환
+        # LOAD: corner0(-x,-y) ↑, corner3(+x,+y) ↓  (Force-Couple)
+        # 비대칭 플랜지(Y-min 없음) 구조에서 현재 twisting과 다른 응답 발생
+        lc_twist_alt = WHTLoadCase(name="twisting_alt")
+        lc_twist_alt.add_bc(corner1 + corner2, dofs=(0, 1, 2, 3, 4, 5))
+        if corner0:
+            lc_twist_alt.add_force(corner0, dofs=(2,),
+                                    values=(-twisting_load_z,), distribute=True)
+        if corner3:
+            lc_twist_alt.add_force(corner3, dofs=(2,),
+                                    values=(twisting_load_z,), distribute=True)
+        print(f" -> [LoadCase] Twisting_Alt: 반전 대각(corner1+corner2) 고정, "
+              f"corner0↑/corner3↓ ±{abs(twisting_load_z):.0f}N")
+        load_cases.append((lc_twist_alt, weights.get("twisting_alt", 1.5)))
+
+        # ── Case 6~9: Lifting (4개 코너 개별 리프팅) ──────────────────────────
         # 각 코너에 대해 3개 코너 고정 + 1개 코너 리프팅을 개별 케이스로 생성
         corners = [corner0, corner1, corner2, corner3]
         for i in range(4):

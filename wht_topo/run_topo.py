@@ -57,7 +57,14 @@ def run_industrial_topo(args):
     # 3. 최적화 실행 — WHTopographySolver (설계 변수: 노드별 비드 높이)
     print(f" -> [최적화] 최소 비드 폭: {args.min_width}mm | 최대 비드 높이: {args.bead_height}mm")
     print(f" -> [제약] 비드 생성 영역 제한 (Bead Area Constraint): {args.bead_area * 100:.1f}%")
-    weights = {"bending": args.w_bending, "twisting": args.w_twisting, "lifting": args.w_lifting}
+    weights = {
+        "bending":       args.w_bending,
+        "bending_xspan": args.w_bending_xspan,
+        "bending_yspan": args.w_bending_yspan,
+        "twisting":      args.w_twisting,
+        "twisting_alt":  args.w_twisting_alt,
+        "lifting":       args.w_lifting,
+    }
 
     solver = WHTopographySolver(
         model, load_manager, constraints,
@@ -168,7 +175,7 @@ def main():
     6. 대칭 + 연결 조합 (최고 품질 설계):
        python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --gui
        python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --bead-area 0.25 --gui       
-       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0  --min-width 30.0 --bead-area 0.25 --height-steps 2 --gui   
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 120.0  --min-width 30.0 --bead-area 0.25 --height-steps 2 --gui   
 
     7. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
        python wht_topo/run_topo.py --iters 50 --no-viz --export final_bead_pattern.k
@@ -229,9 +236,12 @@ def main():
                         help="비드 높이 이산화 단계 수 (예: 3 → 0/h*1/3/h*2/3/h_max, 기본: 0 = 연속)")
 
     # ── 하중 케이스 가중치 (Weighted Sum Method) ─────────────────────────────
-    parser.add_argument("--w-bending",   type=float, default=1.0, help="중앙 굽힘 하중 가중치 (기본: 1.0)")
-    parser.add_argument("--w-twisting",  type=float, default=1.5, help="대각 비틀림 하중 가중치 (기본: 1.5)")
-    parser.add_argument("--w-lifting",   type=float, default=1.2, help="4코너 리프팅 하중 전체 가중치 / 4개 케이스 분할 (기본: 1.2)")
+    parser.add_argument("--w-bending",        type=float, default=1.0, help="중앙 굽힘 하중 가중치 (기본: 1.0)")
+    parser.add_argument("--w-bending-xspan",  type=float, default=0.8, help="X방향 스팬 굽힘 하중 가중치 (기본: 0.8)")
+    parser.add_argument("--w-bending-yspan",  type=float, default=0.8, help="Y방향 스팬 굽힘 하중 가중치 (기본: 0.8)")
+    parser.add_argument("--w-twisting",       type=float, default=1.5, help="대각 비틀림 하중 가중치 (기본: 1.5)")
+    parser.add_argument("--w-twisting-alt",   type=float, default=1.5, help="반전 대각 비틀림 하중 가중치 (기본: 1.5)")
+    parser.add_argument("--w-lifting",        type=float, default=1.2, help="4코너 리프팅 하중 전체 가중치 / 4개 케이스 분할 (기본: 1.2)")
     parser.add_argument("--freq-min",    type=float, default=0.0, help="목표 1차 고유 진동수 하한 (Hz, 기본: 0.0 = 미사용)")
     parser.add_argument("--freq-max",    type=float, default=0.0, help="목표 1차 고유 진동수 상한 (Hz, 기본: 0.0 = 미사용)")
 
