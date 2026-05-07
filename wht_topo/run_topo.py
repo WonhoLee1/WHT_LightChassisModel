@@ -155,6 +155,16 @@ def main():
     [WHT] Industrial Topography Optimization CLI
     ============================================================
 
+    ■ 하중 케이스 구성 (9개, Weighted Sum Method)
+    ------------------------------------------------------------------------------------------------
+    Case 1  bending       : 플랜지 전체 고정 + 중앙 하향 하중 (접시 눌림)        w=1.0
+    Case 2  twisting      : corner0+corner3 고정, corner1↑/corner2↓ (대각 비틀림) w=1.5
+    Case 3  bending_xspan : Y-min/Y-max 엣지만 고정 → X방향 1800mm 스팬 굽힘    w=0.8
+    Case 4  bending_yspan : X-min/X-max 엣지만 고정 → Y방향 1200mm 스팬 굽힘    w=0.8
+    Case 5  twisting_alt  : corner1+corner2 고정, corner0↑/corner3↓ (반전 비틀림) w=1.5
+    Case 6~9 lifting_c0~3 : 각 코너 리프팅 (3코너 고정 + 1코너 상향, 가중치 F/4)  w=0.3×4
+    ------------------------------------------------------------------------------------------------
+
     ■ 실행 시나리오 예시 (Usage Examples)
     ------------------------------------------------------------------------------------------------
     1. 기본 실행 (GUI 모니터링 + 결과 저장):
@@ -174,42 +184,51 @@ def main():
 
     6. 대칭 + 연결 조합 (최고 품질 설계):
        python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --gui
-       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --bead-area 0.25 --gui       
-       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 120.0  --min-width 30.0 --bead-area 0.25 --height-steps 2 --gui   
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --bead-area 0.25 --gui
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 120.0 --min-width 30.0 --bead-area 0.25 --height-steps 2 --gui
 
-    7. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
+    7. 스팬 굽힘 강조 (X/Y 스팬 비드 강제):
+       python wht_topo/run_topo.py --iters 40 --sym-x --w-bending-xspan 1.5 --w-bending-yspan 1.5 --gui
+
+    8. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
        python wht_topo/run_topo.py --iters 50 --no-viz --export final_bead_pattern.k
     ------------------------------------------------------------------------------------------------
 
     ■ 전체 옵션 레퍼런스
     ─────────────────────────────────────────────────────────────────────────────
     [기본 최적화]
-      --iters N          최대 반복 횟수 (기본: 30)
-      --bead-height F    최대 비드 높이 mm (기본: 10.0)
-      --min-width F      최소 비드 폭 / 공간 필터 반경 mm (기본: 80.0)
-      --bead-area F      비드 점유 면적 비율 0.0~1.0 (기본: 0.3 = 30%)
+      --iters N           최대 반복 횟수 (기본: 30)
+      --bead-height F     최대 비드 높이 mm (기본: 10.0)
+      --min-width F       최소 비드 폭 / 공간 필터 반경 mm (기본: 80.0)
+      --bead-area F       비드 점유 면적 비율 0.0~1.0 (기본: 0.3 = 30%)
 
     [비드 형상 제어]
-      --sym-x            Y-Z 평면 기준 좌우 대칭 제약 강제
-                         → KDTree로 대칭 노드 쌍을 매핑, 설계변수/민감도 평균화
-      --bead-connect     단절된 비드 영역을 Morphological Closing으로 자동 연결
-                         → Dilation(팽창) → Erosion(수축)으로 갭을 채움
-      --connect-gap F    비드 연결 시 채울 최대 갭 크기 mm (기본: 80.0)
-                         → 메시 간격(40mm)의 2~3배 권장. 너무 크면 면적 제약 느슨해짐
-      --draw-dir X Y Z   비드 돌출 방향 벡터 (기본: 0 0 1 = +Z 방향)
+      --sym-x             Y-Z 평면 기준 좌우 대칭 제약 강제
+                          → KDTree로 대칭 노드 쌍을 매핑, 설계변수/민감도 평균화
+      --bead-connect      단절된 비드 영역을 Morphological Closing으로 자동 연결
+                          → 2-phase: MMA 전 bridge 민감도 승격 + MMA 후 물리적 closing
+      --connect-gap F     비드 연결 시 채울 최대 갭 크기 mm (기본: 80.0)
+                          → 메시 간격(40mm)의 2~3배 권장. 너무 크면 면적 제약 느슨해짐
+      --draw-dir X Y Z    비드 돌출 방향 벡터 (기본: 0 0 1 = +Z 방향)
+      --height-steps N    비드 높이 이산화 단계 수 (기본: 0 = 연속)
+                          → 2: {0, h_max}, 3: {0, h_max/2, h_max}
 
     [하중 케이스 가중치]
-      --w-bending F      중앙 굽힘 하중 가중치 (기본: 1.0)
-      --w-twisting F     대각 비틀림 하중 가중치 (기본: 1.5)
-      --w-lifting F      4코너 개별 리프팅 하중 전체 가중치 (기본: 1.2)
-                         → 4개 케이스로 분할되므로 케이스당 실효 가중치 = F/4
-      --freq-min F       목표 1차 고유 진동수 하한 Hz (기본: 0.0 = 미사용)
-      --freq-max F       목표 1차 고유 진동수 상한 Hz (기본: 0.0 = 미사용)
+      --w-bending F       플랜지 전체 고정 굽힘 가중치 (기본: 1.0)
+      --w-bending-xspan F X방향 스팬 굽힘 가중치 — Y엣지 2개 고정 (기본: 0.8)
+      --w-bending-yspan F Y방향 스팬 굽힘 가중치 — X엣지 2개 고정 (기본: 0.8)
+      --w-twisting F      대각 비틀림 가중치 — corner0+corner3 고정 (기본: 1.5)
+      --w-twisting-alt F  반전 대각 비틀림 가중치 — corner1+corner2 고정 (기본: 1.5)
+      --w-lifting F       4코너 리프팅 전체 가중치 / 4개 케이스 분할 (기본: 1.2)
+                          → 케이스당 실효 가중치 = F/4
+      --freq-min F        목표 1차 고유 진동수 하한 Hz (기본: 0.0 = 미사용)
+      --freq-max F        목표 1차 고유 진동수 상한 Hz (기본: 0.0 = 미사용)
 
     [시각화 및 출력]
-      --gui              실시간 모니터링 GUI (PySide6) 실행
-      --no-viz           최적화 완료 후 최종 3D 시각화 생략
-      --export PATH      최종 결과 파일 저장 경로 LS-DYNA .k (기본: industrial_bead.k)
+      --gui               실시간 모니터링 GUI (PySide6) 실행
+      --no-viz            최적화 완료 후 최종 3D 시각화 생략
+      --export PATH       최종 결과 파일 저장 경로 LS-DYNA .k (기본: industrial_bead.k)
+      --mesh-size F       BC 탐색 기준 메시 크기 mm (기본: 10.0)
     ─────────────────────────────────────────────────────────────────────────────
     """
     parser = argparse.ArgumentParser(
