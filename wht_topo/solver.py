@@ -804,9 +804,10 @@ class WHTopographySolver:
             x_old = x.copy()
 
             # ── 1. Discrete Projection & Filtering ──
-            # beta continuation: 반복이 진행됨에 따라 투사 강도를 높여 이산화를 강제함
+            # beta continuation: 선형 증가, 전체 반복의 80%에서 max(50) 도달
+            # (기존 100 → 60으로 완화: 패턴 안정화 전 조기 이산화 방지)
             if self.bead_steps >= 2:
-                self._beta = min(50.0, 1.0 + (i / max_iter) * 100.0)
+                self._beta = min(50.0, 1.0 + (i / max_iter) * 60.0)
                 x_proj = self._project_x(x, self._beta)
             else:
                 x_proj = x
@@ -889,10 +890,13 @@ class WHTopographySolver:
             if self.sym_x:
                 df0dx = 0.5 * (df0dx + df0dx[self._sym_map])
 
-            # 비드 연결 — bridge 노드 민감도 승격 (MMA 이전)
-            # bridge 노드는 gap 영역이라 민감도가 낮아 MMA가 제거하는 것을 방지
+            # ── 비드 연결 phase 1: df0dx 승격 + vol_frac 사전 보정 ────────────────
+            # _apply_bead_connect를 1회만 호출해 두 가지를 동시 처리:
+            #   a) bridge 노드 df0dx를 활성 이웃 최댓값으로 승격 (MMA가 bridge 유지하도록)
+            #   b) bridge 추가로 인한 체적 팽창을 사전에 vol_frac에서 차감
+            #      (미보정 시: MMA가 다음 이터에서 약한 노드를 0으로 압축 → 비드 수축)
             if self.bead_connect:
-                _, bridge_idx = self._apply_bead_connect(x)
+                x_bridged, bridge_idx = self._apply_bead_connect(x)
                 if bridge_idx:
                     cg = self._connect_grid
                     for k in bridge_idx:
@@ -905,6 +909,20 @@ class WHTopographySolver:
                         ]
                         if nb_sens:
                             df0dx[k] = max(df0dx[k], max(nb_sens))
+
+                    # bridge 추가 후 체적 증가분 계산 → MMA 목표에서 선제 차감
+                    if self.bead_steps >= 2:
+                        vol_before = float(np.mean(self._project_x(x, self._beta)))
+                        vol_after  = float(np.mean(self._project_x(x_bridged, self._beta)))
+                    else:
+                        vol_before = float(np.mean(x))
+                        vol_after  = float(np.mean(x_bridged))
+                    bridge_excess = max(0.0, vol_after - vol_before)
+                    self.mma.vol_frac = max(0.01, self.h_ratio - bridge_excess)
+                else:
+                    self.mma.vol_frac = self.h_ratio
+            else:
+                self.mma.vol_frac = self.h_ratio
 
             # 제약 조건 민감도 (Chain-rule: df/dx = (1/N) * dx_proj/dx)
             dfdx = np.full(self._n_design, 1.0 / self._n_design)
@@ -927,7 +945,7 @@ class WHTopographySolver:
             )
             x = np.clip(x, 0.0, 1.0)
 
-            # 비드 연결 — 물리적 closing: MMA 결과에 bridge 값 적용
+            # ── 비드 연결 phase 2: 물리적 closing 적용 ───────────────────────────
             if self.bead_connect:
                 x, _ = self._apply_bead_connect(x)
 

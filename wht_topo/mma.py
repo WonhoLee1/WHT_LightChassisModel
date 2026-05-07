@@ -90,11 +90,12 @@ class MMAOptimizer:
         alpha = jnp.maximum(self.alb, jnp.maximum(self.low + 0.1 * (x - self.low), x - self.move))
         beta_ = jnp.minimum(self.aub, jnp.minimum(self.upp - 0.1 * (self.upp - x), x + self.move))
 
-        # 체적 계산 함수: project_fn 제공 시 x_proj 기준, 아니면 x 기준
+        # 체적 계산 함수: project_fn 제공 시 x_proj 기준, 아니면 mean(x) 기준
+        # dfdx에 projection gradient가 포함될 수 있으므로 sum(x*dfdx) 대신 mean(x) 사용
         def _vol(x_t):
             if project_fn is not None:
                 return float(jnp.mean(project_fn(x_t)))
-            return float(jnp.sum(x_t * dfdx))
+            return float(jnp.mean(x_t))
 
         l1, l2 = 1e-10, 1e12
         for _ in range(60):
