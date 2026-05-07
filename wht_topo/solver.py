@@ -378,7 +378,10 @@ class WHTopographySolver:
             "spacing": spacing, "grid_to_node": grid_to_node,
         }
 
-    def _apply_bead_connect(self, x: np.ndarray, threshold: float = 0.1) -> np.ndarray:
+    # 8방향 이웃 오프셋 (대각 포함)
+    _NEIGHBORS_8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+
+    def _apply_bead_connect(self, x: np.ndarray, threshold: float = 0.1):
         """
         Morphological Closing으로 단절된 비드 노드를 연결합니다.
 
@@ -391,10 +394,11 @@ class WHTopographySolver:
         Returns
         -------
         x_new : (n_design,) 연결이 적용된 설계 변수 벡터
+        bridge_idx : list[int] 이번에 새로 채워진 bridge 노드 인덱스
         """
         from scipy.ndimage import binary_dilation, binary_erosion
 
-        cg  = self._connect_grid
+        cg       = self._connect_grid
         gi, gj   = cg["gi"], cg["gj"]
         nx, ny   = cg["nx"], cg["ny"]
         spacing  = cg["spacing"]
@@ -406,33 +410,34 @@ class WHTopographySolver:
             if x[k] > threshold:
                 grid[gj[k], gi[k]] = True
 
-        # 2. Morphological Closing: Dilation → Erosion
-        #    n_iter = connect_gap / spacing 만큼 팽창 후 수축 → 갭 메움
+        # 2. Morphological Closing: Dilation → Erosion (8-connectivity)
+        #    n_iter = ceil(connect_gap / spacing) 셀만큼 팽창 후 동일하게 수축
+        from scipy.ndimage import generate_binary_structure
+        struct = generate_binary_structure(2, 2)  # 8-connectivity kernel
         n_iter = max(1, int(np.ceil(self.connect_gap / spacing)))
         dilated = grid.copy()
         for _ in range(n_iter):
-            dilated = binary_dilation(dilated)
+            dilated = binary_dilation(dilated, structure=struct)
         closed = dilated.copy()
         for _ in range(n_iter):
-            closed = binary_erosion(closed)
+            closed = binary_erosion(closed, structure=struct)
 
-        # 3. 클로징으로 새로 채워진 셀(브릿지 노드)을 최소 활성값으로 승격
+        # 3. bridge 노드 식별 및 값 승격
         bridge_mask = closed & ~grid  # 원래 비활성이었으나 채워진 셀
         x_new = x.copy()
+        bridge_idx = []
         for k in range(self._n_design):
             if bridge_mask[gj[k], gi[k]]:
-                # 주변 활성 노드 평균값으로 승격 (부드러운 전환)
+                bridge_idx.append(k)
+                # 8방향 활성 이웃의 최대값으로 승격 (MMA가 유지하기 충분한 수준)
                 row, col = gj[k], gi[k]
                 neighbor_vals = []
-                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                for dr, dc in self._NEIGHBORS_8:
                     nb = g2n.get((row + dr, col + dc))
                     if nb is not None and x[nb] > threshold:
                         neighbor_vals.append(x[nb])
-                if neighbor_vals:
-                    x_new[k] = max(x_new[k], np.mean(neighbor_vals) * 0.7)
-                else:
-                    x_new[k] = max(x_new[k], threshold + 0.02)
-        return x_new
+                x_new[k] = max(x_new[k], max(neighbor_vals) if neighbor_vals else threshold + 0.1)
+        return x_new, bridge_idx
 
     # ─────────────── Discrete Projection (Staircase) ───────────────
 
@@ -844,14 +849,31 @@ class WHTopographySolver:
                 dC_dx *= self._project_x_grad(x, self._beta)
 
             df0dx = (dC_dx / C_0).flatten()
-            
+
             # 좌우 대칭 강제 (민감도 동기화)
             if self.sym_x:
                 df0dx = 0.5 * (df0dx + df0dx[self._sym_map])
 
+            # 비드 연결 — bridge 노드 민감도 승격 (MMA 이전)
+            # bridge 노드는 gap 영역이라 민감도가 낮아 MMA가 제거하는 것을 방지
+            if self.bead_connect:
+                _, bridge_idx = self._apply_bead_connect(x)
+                if bridge_idx:
+                    cg = self._connect_grid
+                    for k in bridge_idx:
+                        row, col = cg["gj"][k], cg["gi"][k]
+                        nb_sens = [
+                            df0dx[nb]
+                            for dr, dc in self._NEIGHBORS_8
+                            if (nb := cg["grid_to_node"].get((row+dr, col+dc))) is not None
+                            and x[nb] > 0.1
+                        ]
+                        if nb_sens:
+                            df0dx[k] = max(df0dx[k], max(nb_sens))
+
             # 제약 조건: Σ x_proj / n_vars ≤ h_ratio (실제 물리적 비드 면적 제약)
             fval = np.array([float(np.mean(x_proj)) - self.h_ratio])
-            
+
             # 제약 조건 민감도 (Chain-rule 적용)
             # df/dx = (df/dx_proj) * (dx_proj/dx) = (1/N) * dx_proj/dx
             dfdx = np.full(self._n_design, 1.0 / self._n_design)
@@ -867,9 +889,9 @@ class WHTopographySolver:
             )
             x = np.clip(x, 0.0, 1.0)
 
-            # 비드 연결: 단절된 비드 노드를 모폴로지 클로징으로 연결
+            # 비드 연결 — 물리적 closing: MMA 결과에 bridge 값 적용
             if self.bead_connect:
-                x = self._apply_bead_connect(x)
+                x, _ = self._apply_bead_connect(x)
 
             # 수렴 판정
             change = float(np.abs(x - x_old).max())
