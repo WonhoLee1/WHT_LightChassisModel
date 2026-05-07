@@ -13,7 +13,7 @@ Topography Optimization Solver — wht_solver 기반 정밀 구현.
     - 설계 변수 : 바닥면 노드별 비드 높이 h_n ∈ [0, h_max]
     - 목적 함수 : 멀티 케이스 가중 컴플라이언스 C = Σ w_i * F_i^T u_i 최소화
     - 민감도    : ∂C/∂h_n = Σ_{e∈N(n)} u_e^T (∂K_e/∂z_n) u_e  (Adjoint)
-                  — 요소 수준 중앙차분, ∂K_e/∂z_n만 재계산 (전체 K 재조립 불필요)
+                  — QUAD4/TRIA3 모두 JAX Auto-Diff (vmap), 전체 K 재조립 불필요
     - 필터링    : 공간 필터(rmin)로 최소 비드 폭 제어
     - 업데이트  : MMA (Method of Moving Asymptotes)
 
@@ -704,7 +704,7 @@ class WHTopographySolver:
 
     # ─────────────── 메인 최적화 루프 ───────────────
 
-    def solve(self, max_iter: int = 30, tol: float = 1e-4, callback=None) -> np.ndarray:
+    def solve(self, max_iter: int = 30, tol: float = 1e-4, callback=None, stop_event=None) -> np.ndarray:
         """
         MMA 기반 Topography Optimization을 실행합니다.
 
@@ -920,6 +920,10 @@ class WHTopographySolver:
                 print(f"Avg_h={np.mean(x*self.h_max):.2f}mm dx={change:.4f}")
             if change < tol:
                 print(f"  -> 수렴 달성 (Iter {i})")
+                break
+                
+            if stop_event and stop_event.is_set():
+                print(f"  -> 사용자 중단 요청에 의한 조기 종료 (Iter {i})")
                 break
 
         # 원본 좌표 복원 후 최종 형상 적용

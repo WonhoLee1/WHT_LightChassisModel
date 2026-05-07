@@ -16,7 +16,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QTabWidget, QHeaderView,
-    QComboBox, QLabel
+    QComboBox, QLabel, QPushButton
 )
 from PySide6.QtCore import Signal, QObject, QThread
 import matplotlib.pyplot as plt
@@ -70,10 +70,11 @@ def _estimate_node_spacing(coords: np.ndarray) -> float:
 # ────────────────────────────────────────────────────────────────────────────
 
 class WHTMonitorWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, stop_event=None):
         super().__init__()
         self.setWindowTitle("WHT Topography Optimization Monitor (V2.2)")
         self.resize(1200, 860)
+        self.stop_event = stop_event
 
         # ── 1. 속성 초기 선언 (AttributeError 방지) ──
         self.history = {
@@ -102,6 +103,8 @@ class WHTMonitorWindow(QMainWindow):
         self.metric_combo = None
         self.height_iter_combo = None
         self._height_colorbar = None
+        self.status_label = None
+        self.stop_btn = None
 
         # ── 2. UI 초기화 ──
         self._init_ui()
@@ -427,7 +430,7 @@ class MonitorDataHandler(QObject):
     data_received = Signal(dict)
 
 
-def start_monitor_ui(queue):
+def start_monitor_ui(queue, stop_event=None):
     """
     별도 프로세스에서 PySide6 UI를 실행합니다.
 
@@ -436,9 +439,11 @@ def start_monitor_ui(queue):
     queue : multiprocessing.Queue
         솔버로부터 이터레이션 데이터를 수신하는 큐.
         데이터는 dict 형식이며, "STOP" 문자열 수신 시 종료합니다.
+    stop_event : multiprocessing.Event, optional
+        사용자가 GUI를 닫을 때 솔버에 중단 신호를 보내는 이벤트.
     """
     app = QApplication.instance() or QApplication(sys.argv)
-    window = WHTMonitorWindow()
+    window = WHTMonitorWindow(stop_event=stop_event)
     window.show()
 
     class Receiver(QThread):

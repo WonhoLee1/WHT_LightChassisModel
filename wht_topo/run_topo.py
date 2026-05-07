@@ -76,15 +76,17 @@ def run_industrial_topo(args):
     # 모니터링 GUI 실행
     ui_process = None
     callback = None
+    stop_event = None
     if args.gui:
         from wht_topo.monitor_ui import start_monitor_ui
         queue = multiprocessing.Queue()
-        ui_process = multiprocessing.Process(target=start_monitor_ui, args=(queue,))
+        stop_event = multiprocessing.Event()
+        ui_process = multiprocessing.Process(target=start_monitor_ui, args=(queue, stop_event))
         ui_process.daemon = True # 메인 프로세스 종료 시 함께 종료
         ui_process.start()
         callback = queue.put
 
-    final_heights = solver.solve(max_iter=args.iters, callback=callback)
+    final_heights = solver.solve(max_iter=args.iters, callback=callback, stop_event=stop_event)
 
     if ui_process and ui_process.is_alive():
         print(" -> [GUI] 최적화 완료. 모니터링 창을 유지한 상태로 시각화를 준비합니다.")
