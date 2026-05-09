@@ -89,17 +89,15 @@ def run_industrial_topo(args):
         queue = multiprocessing.Queue()
         stop_event = multiprocessing.Event()
         ui_process = multiprocessing.Process(target=start_monitor_ui, args=(queue, stop_event))
-        ui_process.daemon = True # 메인 프로세스 종료 시 함께 종료
+        ui_process.daemon = False  # 사용자가 직접 닫을 때까지 유지
         ui_process.start()
         callback = queue.put
 
     final_heights = solver.solve(max_iter=args.iters, callback=callback, stop_event=stop_event)
 
     if ui_process and ui_process.is_alive():
-        print(" -> [GUI] 최적화 완료. 모니터링 창을 유지한 상태로 시각화를 준비합니다.")
-        # UI 종료를 기다리거나 계속 진행할 수 있음. 
-        # 여기서는 비동기적으로 두기 위해 STOP 신호만 보냄
-        queue.put("STOP")
+        print(" -> [GUI] 최적화 완료. 모니터 창은 사용자가 직접 닫을 때까지 유지됩니다.")
+        queue.put("STOP")  # UI에 완료 상태 표시 (창은 닫히지 않음)
 
     # 4. 비드 높이 이산화 (--height-steps N 지정 시)
     discrete_height = args.height_steps >= 2

@@ -513,10 +513,11 @@ def start_monitor_ui(queue, stop_event=None):
                     data = self.q.get()
                     if isinstance(data, str) and data == "STOP":
                         self.handler.data_received.emit({"status": "STOP"})
-                        break
+                        # 루프 종료하지 않음 — 창은 사용자가 직접 닫을 때까지 유지
+                        return
                     self.handler.data_received.emit(data)
                 except Exception:
-                    break
+                    return
 
     receiver = Receiver(queue)
     receiver.handler.data_received.connect(window.update_data)
