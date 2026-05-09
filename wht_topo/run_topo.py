@@ -84,7 +84,7 @@ def run_industrial_topo(args):
     ui_process = None
     callback = None
     stop_event = None
-    if args.gui:
+    if not args.no_gui:
         from wht_topo.monitor_ui import start_monitor_ui
         queue = multiprocessing.Queue()
         stop_event = multiprocessing.Event()
@@ -168,50 +168,47 @@ def main():
     ■ 실행 시나리오 예시 (Usage Examples)
     ------------------------------------------------------------------------------------------------
     1. 기본 실행 (GUI 모니터링 + 결과 저장):
-       python wht_topo/run_topo.py --iters 30 --gui --export chassis_result.k
+       python wht_topo/run_topo.py --iters 30 --export chassis_result.k
 
     2. 강건 설계 (좌우 대칭 + 리프팅 가중치 강화):
-       python wht_topo/run_topo.py --iters 40 --sym-x --w-lifting 2.0 --gui
+       python wht_topo/run_topo.py --iters 40 --sym-x --w-lifting 2.0
 
     3. 제조 제약 강화 (비드 영역 25% 제한 + 최소 폭 100mm):
-       python wht_topo/run_topo.py --bead-area 0.25 --min-width 100.0 --gui
+       python wht_topo/run_topo.py --bead-area 0.25 --min-width 100.0
 
     4. 비드 연결 활성화 (단절된 비드 자동 연결, 기본 갭 80mm):
-       python wht_topo/run_topo.py --iters 30 --bead-connect --gui
+       python wht_topo/run_topo.py --iters 30 --bead-connect
 
     5. 비드 연결 + 갭 크기 조정 (120mm 이하 갭까지 채움):
-       python wht_topo/run_topo.py --iters 30 --bead-connect --connect-gap 120.0 --gui
+       python wht_topo/run_topo.py --iters 30 --bead-connect --connect-gap 120.0
 
     6. 대칭 + 연결 조합 (최고 품질 설계):
-       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --gui
-       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --bead-area 0.25 --gui
-       python wht_topo/run_topo.py --iters 15 --sym-x --bead-connect --connect-gap 120.0 --min-width 30.0 --bead-area 0.35 --height-steps 2 --gui
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0
+       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --bead-area 0.25
+       python wht_topo/run_topo.py --iters 15 --sym-x --bead-connect --connect-gap 120.0 --min-width 30.0 --bead-area 0.35 --height-steps 2
 
     7. 스팬 굽힘 강조 (X/Y 스팬 비드 강제):
-       python wht_topo/run_topo.py --iters 40 --sym-x --w-bending-xspan 1.5 --w-bending-yspan 1.5 --gui
+       python wht_topo/run_topo.py --iters 40 --sym-x --w-bending-xspan 1.5 --w-bending-yspan 1.5
 
-    8. 배치 프로세스 (UI 없이 최적화만 수행 후 종료):
-       python wht_topo/run_topo.py --iters 50 --no-viz --export final_bead_pattern.k
+    8. 배치 프로세스 (GUI 없이 최적화만 수행 후 종료):
+       python wht_topo/run_topo.py --iters 50 --no-gui --no-viz --export final_bead_pattern.k
     ------------------------------------------------------------------------------------------------
 
     ■ 전체 옵션 레퍼런스
     ─────────────────────────────────────────────────────────────────────────────
     [기본 최적화]
-      --iters N           최대 반복 횟수 (기본: 30)
+      --iters N           최대 반복 횟수 (기본: 15)
       --bead-height F     최대 비드 높이 mm (기본: 10.0)
-      --min-width F       최소 비드 폭 / 공간 필터 반경 mm (기본: 80.0)
-      --bead-area F       비드 점유 면적 비율 0.0~1.0 (기본: 0.3 = 30%)
+      --min-width F       최소 비드 폭 / 공간 필터 반경 mm (기본: 30.0)
+      --bead-area F       비드 점유 면적 비율 0.0~1.0 (기본: 0.35 = 35%)
 
     [비드 형상 제어]
-      --sym-x             Y-Z 평면 기준 좌우 대칭 제약 강제
-                          → KDTree로 대칭 노드 쌍을 매핑, 설계변수/민감도 평균화
-      --bead-connect      단절된 비드 영역을 Morphological Closing으로 자동 연결
-                          → 2-phase: MMA 전 bridge 민감도 승격 + MMA 후 물리적 closing
-      --connect-gap F     비드 연결 시 채울 최대 갭 크기 mm (기본: 80.0)
-                          → 메시 간격(40mm)의 2~3배 권장. 너무 크면 면적 제약 느슨해짐
+      --no-sym-x          좌우 대칭 제약 비활성화 (기본: 활성화)
+      --no-bead-connect   비드 자동 연결 비활성화 (기본: 활성화)
+      --connect-gap F     비드 연결 시 채울 최대 갭 크기 mm (기본: 120.0)
       --draw-dir X Y Z    비드 돌출 방향 벡터 (기본: 0 0 1 = +Z 방향)
-      --height-steps N    비드 높이 이산화 단계 수 (기본: 0 = 연속)
-                          → 2: {0, h_max}, 3: {0, h_max/2, h_max}
+      --height-steps N    비드 높이 이산화 단계 수 (기본: 2 → {0, h_max})
+                          → 3: {0, h_max/2, h_max}
 
     [하중 케이스 가중치]
       --w-bending F       플랜지 전체 고정 굽힘 가중치 (기본: 1.0)
@@ -225,7 +222,7 @@ def main():
       --freq-max F        목표 1차 고유 진동수 상한 Hz (기본: 0.0 = 미사용)
 
     [시각화 및 출력]
-      --gui               실시간 모니터링 GUI (PySide6) 실행
+      --no-gui            실시간 모니터링 GUI 비활성화 (기본: GUI 실행)
       --no-viz            최적화 완료 후 최종 3D 시각화 생략
       --export PATH       최종 결과 파일 저장 경로 LS-DYNA .k (기본: industrial_bead.k)
       --mesh-size F       BC 탐색 기준 메시 크기 mm (기본: 10.0)
@@ -237,22 +234,26 @@ def main():
     )
 
     # ── 기본 최적화 설정 ─────────────────────────────────────────────────────
-    parser.add_argument("--iters",       type=int,   default=30,   help="최대 반복 횟수 (기본: 30)")
+    parser.add_argument("--iters",       type=int,   default=15,   help="최대 반복 횟수 (기본: 15)")
     parser.add_argument("--bead-height", type=float, default=10.0, help="최대 비드 높이 (mm, 기본: 10.0)")
-    parser.add_argument("--min-width",   type=float, default=80.0, help="최소 비드 폭 / 필터 반경 (mm, 기본: 80.0)")
-    parser.add_argument("--bead-area",   type=float, default=0.3,  help="비드 점유 면적 비율 (0.0~1.0, 기본: 0.3)")
+    parser.add_argument("--min-width",   type=float, default=30.0, help="최소 비드 폭 / 필터 반경 (mm, 기본: 30.0)")
+    parser.add_argument("--bead-area",   type=float, default=0.35, help="비드 점유 면적 비율 (0.0~1.0, 기본: 0.35)")
 
     # ── 비드 형상 제어 ───────────────────────────────────────────────────────
-    parser.add_argument("--sym-x",        action="store_true",
-                        help="Y-Z 평면 기준 좌우 대칭 제약 조건 활성화 (KDTree 대칭 노드 쌍 매핑)")
-    parser.add_argument("--bead-connect", action="store_true",
-                        help="Morphological Closing으로 단절된 비드 자동 연결")
-    parser.add_argument("--connect-gap",  type=float, default=80.0,
-                        help="비드 연결 시 채울 최대 간격 (mm, 기본: 80.0 ≈ 메시 간격×2)")
+    parser.add_argument("--sym-x",        action="store_true", default=True,
+                        help="Y-Z 평면 기준 좌우 대칭 제약 조건 활성화 (기본: True)")
+    parser.add_argument("--no-sym-x",     action="store_true",
+                        help="좌우 대칭 제약 비활성화")
+    parser.add_argument("--bead-connect", action="store_true", default=True,
+                        help="Morphological Closing으로 단절된 비드 자동 연결 (기본: True)")
+    parser.add_argument("--no-bead-connect", action="store_true",
+                        help="비드 연결 비활성화")
+    parser.add_argument("--connect-gap",  type=float, default=120.0,
+                        help="비드 연결 시 채울 최대 간격 (mm, 기본: 120.0)")
     parser.add_argument("--draw-dir",     type=float, nargs=3, default=[0.0, 0.0, 1.0],
                         help="비드 돌출 방향 벡터 (X Y Z, 기본: 0 0 1)")
-    parser.add_argument("--height-steps", type=int, default=0,
-                        help="비드 높이 이산화 단계 수 (예: 3 → 0/h*1/3/h*2/3/h_max, 기본: 0 = 연속)")
+    parser.add_argument("--height-steps", type=int, default=2,
+                        help="비드 높이 이산화 단계 수 (기본: 2 → {0, h_max})")
 
     # ── 하중 케이스 가중치 (Weighted Sum Method) ─────────────────────────────
     parser.add_argument("--w-bending",        type=float, default=1.0, help="중앙 굽힘 하중 가중치 (기본: 1.0)")
@@ -265,13 +266,19 @@ def main():
     parser.add_argument("--freq-max",    type=float, default=0.0, help="목표 1차 고유 진동수 상한 (Hz, 기본: 0.0 = 미사용)")
 
     # ── 시각화 및 출력 ───────────────────────────────────────────────────────
-    parser.add_argument("--gui",      action="store_true",         help="실시간 모니터링 GUI(PySide6) 실행")
+    parser.add_argument("--no-gui",   action="store_true",         help="실시간 모니터링 GUI 비활성화 (기본: GUI 실행)")
     parser.add_argument("--no-viz",   action="store_true",         help="최적화 완료 후 최종 3D 시각화 생략")
     parser.add_argument("--export",   type=str, default="industrial_bead.k",
                         help="최종 결과 파일 저장 경로 (LS-DYNA .k, 기본: industrial_bead.k)")
     parser.add_argument("--mesh-size", type=float, default=10.0,  help="BC 탐색을 위한 기준 메시 크기 (mm)")
 
     args = parser.parse_args()
+
+    # --no-* 플래그로 기본값 오버라이드
+    if args.no_sym_x:
+        args.sym_x = False
+    if args.no_bead_connect:
+        args.bead_connect = False
 
     # 최적화 파이프라인 실행
     run_industrial_topo(args)
