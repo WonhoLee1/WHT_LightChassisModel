@@ -99,7 +99,7 @@ class MMAOptimizer:
 
         l1, l2 = 1e-10, 1e12
         for _ in range(60):
-            l_mid = 0.5 * (l1 + l2)
+            l_mid = np.sqrt(l1 * l2)  # geometric mean: uniform convergence across scale
             step = jnp.sqrt(-safe_df0dx / (l_mid * dfdx + 1e-10))
             x_test = jnp.clip(x * step, alpha, beta_)
             if _vol(x_test) > self.vol_frac:
