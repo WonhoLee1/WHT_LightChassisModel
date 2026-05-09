@@ -325,19 +325,31 @@ class WHTMonitorWindow(QMainWindow):
         if metric == "ALL (Normalized)":
             metrics_to_plot = [
                 ("Compliance", self.history["compliance"], 'o-'),
-                ("Avg_h", self.history["avg_h"], 's-'),
-                ("Max_h", self.history["max_h"], '^-'),
-                ("dx", self.history["dx"], 'd-'),
-                ("Area_Ratio", self.history["area_ratio"], 'x-')
+                ("Avg_h",      self.history["avg_h"],      's-'),
+                ("Max_h",      self.history["max_h"],      '^-'),
+                ("dx",         self.history["dx"],         'd-'),
+                ("Area_Ratio", self.history["area_ratio"], 'x-'),
             ]
+            # 하중 케이스별 컴플라이언스
+            fmts_case = ['--', '-.', ':', '-', '--', '-.', ':', '-', '--']
+            for i, name in enumerate(self.case_names):
+                u_list = self.history["cases"][name]["U"]
+                if u_list:
+                    metrics_to_plot.append((f"U_{name}", u_list, fmts_case[i % len(fmts_case)]))
+            # 1차 고유진동수
+            freq_arr = np.array(self.history["frequencies"])
+            if freq_arr.ndim == 2 and freq_arr.shape[0] > 0 and freq_arr.shape[1] > 0:
+                metrics_to_plot.append(("Freq_1", list(freq_arr[:, 0]), 'P-'))
+
             for label, data_list, fmt in metrics_to_plot:
                 arr = np.array(data_list)
                 if len(arr) > 0:
                     max_val = np.max(np.abs(arr))
                     norm_arr = arr / max_val if max_val > 1e-12 else arr
-                    ax.plot(iters, norm_arr, fmt, label=label, markersize=4, linewidth=1)
+                    ax.plot(iters, norm_arr, fmt, label=label, markersize=3, linewidth=1)
             ax.set_ylabel("Normalized Value")
-            ax.legend(loc='best', fontsize=8)
+            ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0),
+                      fontsize=7, borderaxespad=0)
         elif metric == "Natural Frequencies":
             freq_arr = np.array(self.history["frequencies"])
             if freq_arr.ndim == 2 and freq_arr.shape[1] > 0:
