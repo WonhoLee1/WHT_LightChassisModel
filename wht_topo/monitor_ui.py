@@ -337,9 +337,14 @@ class WHTMonitorWindow(QMainWindow):
                 if u_list:
                     metrics_to_plot.append((f"U_{name}", u_list, fmts_case[i % len(fmts_case)]))
             # 1차 고유진동수
+            RIGID_BODY_THRESHOLD = 0.5  # Hz — 강체 운동 모드 제외 기준
             freq_arr = np.array(self.history["frequencies"])
             if freq_arr.ndim == 2 and freq_arr.shape[0] > 0 and freq_arr.shape[1] > 0:
-                metrics_to_plot.append(("Freq_1", list(freq_arr[:, 0]), 'P-'))
+                # 마지막 이터레이션 기준으로 구조 모드인 열 인덱스 선택
+                last_freqs = freq_arr[-1]
+                struct_cols = np.where(last_freqs >= RIGID_BODY_THRESHOLD)[0]
+                if len(struct_cols) > 0:
+                    metrics_to_plot.append(("Freq_1", list(freq_arr[:, struct_cols[0]]), 'P-'))
 
             for label, data_list, fmt in metrics_to_plot:
                 arr = np.array(data_list)
@@ -351,10 +356,13 @@ class WHTMonitorWindow(QMainWindow):
             ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0),
                       fontsize=7, borderaxespad=0)
         elif metric == "Natural Frequencies":
+            RIGID_BODY_THRESHOLD = 0.5  # Hz
             freq_arr = np.array(self.history["frequencies"])
             if freq_arr.ndim == 2 and freq_arr.shape[1] > 0:
-                for i in range(min(10, freq_arr.shape[1])):
-                    ax.plot(iters, freq_arr[:, i], label=f"M{i+1}")
+                last_freqs = freq_arr[-1]
+                struct_cols = np.where(last_freqs >= RIGID_BODY_THRESHOLD)[0]
+                for rank, col in enumerate(struct_cols[:10]):
+                    ax.plot(iters, freq_arr[:, col], label=f"M{rank+1}({freq_arr[-1, col]:.1f}Hz)")
                 ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1, 1))
             ax.set_ylabel("Frequency (Hz)")
         elif metric == "Area_Ratio":
