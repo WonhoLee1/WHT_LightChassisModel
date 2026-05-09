@@ -185,7 +185,7 @@ def main():
     6. 대칭 + 연결 조합 (최고 품질 설계):
        python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --gui
        python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 100.0 --bead-area 0.25 --gui
-       python wht_topo/run_topo.py --iters 40 --sym-x --bead-connect --connect-gap 120.0 --min-width 30.0 --bead-area 0.25 --height-steps 2 --gui
+       python wht_topo/run_topo.py --iters 15 --sym-x --bead-connect --connect-gap 120.0 --min-width 30.0 --bead-area 0.35 --height-steps 2 --gui
 
     7. 스팬 굽힘 강조 (X/Y 스팬 비드 강제):
        python wht_topo/run_topo.py --iters 40 --sym-x --w-bending-xspan 1.5 --w-bending-yspan 1.5 --gui
@@ -261,7 +261,7 @@ def main():
     parser.add_argument("--w-twisting",       type=float, default=1.5, help="대각 비틀림 하중 가중치 (기본: 1.5)")
     parser.add_argument("--w-twisting-alt",   type=float, default=1.5, help="반전 대각 비틀림 하중 가중치 (기본: 1.5)")
     parser.add_argument("--w-lifting",        type=float, default=1.2, help="4코너 리프팅 하중 전체 가중치 / 4개 케이스 분할 (기본: 1.2)")
-    parser.add_argument("--freq-min",    type=float, default=0.0, help="목표 1차 고유 진동수 하한 (Hz, 기본: 0.0 = 미사용)")
+    parser.add_argument("--freq-min",    type=float, default=0.01, help="목표 1차 고유 진동수 하한 (Hz, 기본: 0.0 = 미사용)")
     parser.add_argument("--freq-max",    type=float, default=0.0, help="목표 1차 고유 진동수 상한 (Hz, 기본: 0.0 = 미사용)")
 
     # ── 시각화 및 출력 ───────────────────────────────────────────────────────

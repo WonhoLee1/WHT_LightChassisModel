@@ -934,8 +934,10 @@ class WHTopographySolver:
             # MMA 업데이트
             # bead_steps >= 2: project_fn 전달 → 이분법이 mean(x_proj) = h_ratio 기준으로 수렴
             # bead_steps  < 2: project_fn=None → 기존 mean(x) 기준 (연속 변수이므로 동일)
-            project_fn = (lambda xv: self._project_x(np.array(xv), self._beta)
-                          if self.bead_steps >= 2 else None)
+            if self.bead_steps >= 2:
+                project_fn = lambda xv: self._project_x(np.array(xv), self._beta)
+            else:
+                project_fn = None
             x = self.mma.update(
                 x, f0val, df0dx,
                 fval,

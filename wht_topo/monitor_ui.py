@@ -133,6 +133,7 @@ class WHTMonitorWindow(QMainWindow):
         ctrl2 = QHBoxLayout()
         self.metric_combo = QComboBox()
         self.metric_combo.addItems([
+            "ALL (Normalized)",
             "Compliance", "Avg_h", "Max_h", "dx",
             "Area_Ratio",               # ← 신규
             "Natural Frequencies",
@@ -172,11 +173,29 @@ class WHTMonitorWindow(QMainWindow):
         lay4.addWidget(self.modal_table)
         self.tabs.addTab(tab4, "Modal Analysis")
 
+    def _on_stop_clicked(self):
+        if self.stop_event is not None:
+            self.stop_event.set()
+            if self.status_label:
+                self.status_label.setText("Status: Stop Requested...")
+                self.status_label.setStyleSheet("color: red; font-weight: bold; font-size: 14px;")
+            if self.stop_btn:
+                self.stop_btn.setEnabled(False)
+                self.stop_btn.setText("Stopping...")
+
     # ────────────────────────────────────────────────────────────────────────
     # 데이터 수신 및 UI 갱신
     # ────────────────────────────────────────────────────────────────────────
 
     def update_data(self, data: dict):
+        if data.get("status") == "STOP":
+            if self.status_label:
+                self.status_label.setText("Status: Optimization Completed / Stopped")
+                self.status_label.setStyleSheet("color: green; font-weight: bold; font-size: 14px;")
+            if self.stop_btn:
+                self.stop_btn.setEnabled(False)
+            return
+
         try:
             it = data["iter"]
 
@@ -303,7 +322,23 @@ class WHTMonitorWindow(QMainWindow):
         ax.clear()
         iters = self.history["iter"]
 
-        if metric == "Natural Frequencies":
+        if metric == "ALL (Normalized)":
+            metrics_to_plot = [
+                ("Compliance", self.history["compliance"], 'o-'),
+                ("Avg_h", self.history["avg_h"], 's-'),
+                ("Max_h", self.history["max_h"], '^-'),
+                ("dx", self.history["dx"], 'd-'),
+                ("Area_Ratio", self.history["area_ratio"], 'x-')
+            ]
+            for label, data_list, fmt in metrics_to_plot:
+                arr = np.array(data_list)
+                if len(arr) > 0:
+                    max_val = np.max(np.abs(arr))
+                    norm_arr = arr / max_val if max_val > 1e-12 else arr
+                    ax.plot(iters, norm_arr, fmt, label=label, markersize=4, linewidth=1)
+            ax.set_ylabel("Normalized Value")
+            ax.legend(loc='best', fontsize=8)
+        elif metric == "Natural Frequencies":
             freq_arr = np.array(self.history["frequencies"])
             if freq_arr.ndim == 2 and freq_arr.shape[1] > 0:
                 for i in range(min(10, freq_arr.shape[1])):
@@ -456,7 +491,8 @@ def start_monitor_ui(queue, stop_event=None):
             while True:
                 try:
                     data = self.q.get()
-                    if data == "STOP":
+                    if isinstance(data, str) and data == "STOP":
+                        self.handler.data_received.emit({"status": "STOP"})
                         break
                     self.handler.data_received.emit(data)
                 except Exception:
