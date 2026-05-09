@@ -47,6 +47,7 @@ def _element_K_tria3_jax(c1, c2, c3, t, E, nu):
     x3 = jnp.dot(v13, x_loc)
     y3 = jnp.dot(v13, y_loc)
     A  = 0.5 * x2 * y3  # signed area in local frame
+    A_safe = jnp.where(jnp.abs(A) < 1e-10, 1e-10, A)  # degenerate guard before invJ
 
     # ── Material constants ──────────────────────────────────────────────────
     G       = E / (2.0 * (1.0 + nu))
@@ -62,7 +63,7 @@ def _element_K_tria3_jax(c1, c2, c3, t, E, nu):
     Ds = (k_shear * G * t) * jnp.eye(2)
 
     # ── Shape function derivatives in local frame (y2 = 0) ─────────────────
-    invJ   = 1.0 / (2.0 * A)
+    invJ   = 1.0 / (2.0 * A_safe)
     dN_dx  = jnp.array([-(y3), y3, 0.0]) * invJ        # [N1,N2,N3]
     dN_dy  = jnp.array([(x3 - x2), -x3, x2]) * invJ
 
