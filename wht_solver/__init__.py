@@ -15,8 +15,10 @@ Quick start
     from wht_solver.wht_monitor import OptimizationMonitor
 """
 
-from .wht_solver      import WHTSolver
-from .wht_result      import WHTSolverResult
+from .wht_solver         import WHTSolver
+from .wht_dynamic_solver import WHTDynamicSolver
+from .wht_dynamic_common import DynamicLoadGroup, DampingSpec, DynamicResult
+from .wht_result         import WHTSolverResult
 from .wht_mapper      import WHTMapper
 from .load_cases      import WHTLoadCase, LoadCaseLibrary
 from .wht_monitor     import OptimizationMonitor
@@ -27,6 +29,10 @@ from .wht_eigensolver import make_modal_freq_fn
 __version__ = "0.1.0"
 __all__ = [
     "WHTSolver",
+    "WHTDynamicSolver",
+    "DynamicLoadGroup",
+    "DampingSpec",
+    "DynamicResult",
     "WHTSolverResult",
     "WHTMapper",
     "WHTLoadCase",
