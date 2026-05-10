@@ -147,6 +147,52 @@ class DynamicResult:
         norms = np.max(np.abs(self.u.reshape(self.n_save, -1)), axis=1)
         return int(np.argmax(norms))
 
+    def to_wht_result_data(self, metadata, mesh_model):
+        """
+        WHTResultData IR로 변환 — ParaView 내보내기 및 Visualizer 연동.
+
+        point_data 구성:
+            Displacement  : (n_save, n_nodes, 3) [mm]
+            Rotation      : (n_save, n_nodes, 3) [rad]
+            Velocity      : (n_save, n_nodes, 3) [mm/s]
+            Acceleration  : (n_save, n_nodes, 3) [mm/s²]
+
+        Parameters
+        ----------
+        metadata   : WHTMetadata
+        mesh_model : WHTMeshModel (geometry source)
+
+        Returns
+        -------
+        WHTResultData
+        """
+        from wht_converter.wht_models import WHTResultData
+
+        base_rd = mesh_model.to_wht_result_data(metadata)
+
+        point_data = {}
+        if self.u is not None:
+            point_data["Displacement"] = self.u[:, :, :3]
+            point_data["Rotation"]     = self.u[:, :, 3:]
+        if self.v is not None:
+            point_data["Velocity"]     = self.v[:, :, :3]
+        if self.a is not None:
+            point_data["Acceleration"] = self.a[:, :, :3]
+
+        return WHTResultData(
+            nodes        = base_rd.nodes,
+            connectivity = base_rd.connectivity,
+            offsets      = base_rd.offsets,
+            cell_types   = base_rd.cell_types,
+            node_sets    = base_rd.node_sets,
+            element_sets = base_rd.element_sets,
+            point_data   = point_data,
+            cell_data    = {},
+            field_data   = {},
+            time_values  = self.t_saved,
+            metadata     = metadata,
+        )
+
     def summary(self) -> str:
         peak_i = self.peak_time_index()
         u_peak = float(np.max(np.abs(self.u[peak_i])))
