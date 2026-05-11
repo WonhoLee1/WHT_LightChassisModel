@@ -525,30 +525,40 @@ class WHTDynamicSolver(WHTSolver):
             print(f"    - [JAX] [3/5] Pre-calculating SPCD trajectories...", end="", flush=True)
             t_traj = time.time()
 
-        # ── 3. 시간 적분 루프 정의 (JIT) ──────────────────────────────────────
+        # ── 3. 시간 적분 루프 정의 (Nested Scan for Memory Efficiency) ────────────────
         n_steps = int(np.ceil(T / dt))
         save_every = max(1, n_steps // n_save)
-        save_idxs = list(range(0, n_steps + 1, save_every))
-        if save_idxs[-1] != n_steps:
-            save_idxs.append(n_steps)
+        n_blocks = (n_steps + save_every - 1) // save_every
+        total_steps_padded = n_blocks * save_every
         
-        # Pre-calculate SPCD trajectories
-        times = jnp.linspace(0, n_steps * dt, n_steps + 1, dtype=jnp.float64)
-        u_s_all   = jnp.zeros((n_steps + 1, n_spcd), dtype=jnp.float64)
+        # Pre-calculate SPCD trajectories (Padded to match block size)
+        times_padded = jnp.linspace(0, total_steps_padded * dt, total_steps_padded + 1, dtype=jnp.float64)
+        u_s_all   = jnp.zeros((total_steps_padded + 1, n_spcd), dtype=jnp.float64)
         
         for i, gid in enumerate(spcd_id):
             lg = spcd_map[gid]
-            # _InterpLoadGroup uses _t, _u internally
             t_data = getattr(lg, '_t', getattr(lg, 'time_arr', None))
             u_data = getattr(lg, '_u', getattr(lg, 'disp_arr', None))
             if t_data is not None and u_data is not None:
-                u_s_all = u_s_all.at[:, i].set(jnp.interp(times, jnp.array(t_data), jnp.array(u_data)))
+                # Use interp with padded times
+                u_s_all = u_s_all.at[:, i].set(jnp.interp(times_padded, jnp.array(t_data), jnp.array(u_data)))
         
-        # Calculate velocity and acceleration from displacement
         ud_s_all  = jnp.gradient(u_s_all, dt, axis=0)
         udd_s_all = jnp.gradient(ud_s_all, dt, axis=0)
+        f_f_all   = jnp.zeros((total_steps_padded + 1, n_free), dtype=jnp.float64)
+
+        # Reshape inputs into blocks: (n_blocks, save_every, ...)
+        # We exclude the last padded element for integration steps
+        def reshape_to_blocks(arr):
+            return arr[:total_steps_padded].reshape(n_blocks, save_every, -1)
+
+        block_idxs  = reshape_to_blocks(jnp.arange(total_steps_padded, dtype=jnp.int32))
+        block_u_s   = reshape_to_blocks(u_s_all)
+        block_ud_s  = reshape_to_blocks(ud_s_all)
+        block_udd_s = reshape_to_blocks(udd_s_all)
+        block_f_f   = reshape_to_blocks(f_f_all)
         
-        f_f_all = jnp.zeros((n_steps + 1, n_free), dtype=jnp.float64)
+        block_inputs = (block_idxs, block_u_s, block_ud_s, block_udd_s, block_f_f)
 
         # Jacobi preconditioner for CG (only for sparse)
         if not is_dense:
@@ -558,24 +568,22 @@ class WHTDynamicSolver(WHTSolver):
             inv_diag = None
 
         # Robust solve: Use dense direct solver with pre-factoring for medium sizes
+        from jax.scipy.linalg import lu_factor, lu_solve
         if is_dense:
-            from jax.scipy.linalg import lu_factor, lu_solve
             K_eff_lu = lu_factor(K_eff_ff)
         else:
             K_eff_lu = None
 
-        def step_fn(state, carry_in):
+        # Core Step Function (Same logic as before)
+        def single_step(state, carry_in):
             u_f, ud_f, udd_f = state
             idx, u_s, ud_s, udd_s, f_f = carry_in
-            
             f_eff = f_f + M_f * (nc["a0"]*u_f + nc["a2"]*ud_f + nc["a3"]*udd_f)
             f_eff = f_eff + C_ff @ (nc["a1"]*u_f + nc["a4"]*ud_f + nc["a5"]*udd_f)
-            
             if n_spcd:
                 f_eff -= K_fs_full @ u_s
                 f_eff -= (beta_r * K_fs_struct) @ ud_s
             
-            # Robust solve
             if is_dense:
                 u_f_new = lu_solve(K_eff_lu, f_eff)
             else:
@@ -584,46 +592,55 @@ class WHTDynamicSolver(WHTSolver):
             
             udd_f_new = nc["a0"]*(u_f_new - u_f) - nc["a2"]*ud_f - nc["a3"]*udd_f
             ud_f_new  = ud_f + dt * ((1.0 - newmark_gamma)*udd_f + newmark_gamma*udd_f_new)
+            return (u_f_new, ud_f_new, udd_f_new), (u_f_new, ud_f_new, udd_f_new, u_s, udd_s)
+
+        # Memory-Efficient Block Step
+        def block_step(state, b_in):
+            # b_in: (save_every, ...)
+            # Inner scan: Only returns final state, doesn't store intermediate history!
+            final_state, _ = jax.lax.scan(lambda s, ci: (single_step(s, ci)[0], None), state, b_in)
             
-            new_state = (u_f_new, ud_f_new, udd_f_new)
-            return new_state, (u_f_new, ud_f_new, udd_f_new, u_s, udd_s)
+            # Extract last SPCD values for the block result
+            u_s_last = b_in[1][-1]
+            a_s_last = b_in[3][-1]
+            return final_state, (final_state[0], final_state[1], final_state[2], u_s_last, a_s_last)
 
         init_state = (jnp.zeros(n_free, dtype=jnp.float64), 
                       jnp.zeros(n_free, dtype=jnp.float64), 
                       jnp.zeros(n_free, dtype=jnp.float64))
-        inputs = (jnp.arange(n_steps+1, dtype=jnp.int32), 
-                  jnp.array(u_s_all, dtype=jnp.float64), 
-                  jnp.array(ud_s_all, dtype=jnp.float64), 
-                  jnp.array(udd_s_all, dtype=jnp.float64), 
-                  jnp.array(f_f_all, dtype=jnp.float64))
 
         if verbose:
             print(f" Done ({time.time()-t_traj:.2f}s)")
-            print(f"    - [JAX] [4/5] JIT compiling & Time Integration ({n_steps} steps)...", flush=True)
+            print(f"    - [JAX] [4/5] JIT compiling & Block Integration ({n_blocks} blocks of {save_every} steps)...", flush=True)
             t0 = time.time()
         
         # ── 4. 실행 ──────────────────────────────────────────────────────────
-        _, (u_f_hist, v_f_hist, a_f_hist, u_s_hist, a_s_hist) = jax.lax.scan(step_fn, init_state, inputs)
+        # outer scan: Only returns results for n_blocks frames!
+        _, (u_f_hist, v_f_hist, a_f_hist, u_s_hist, a_s_hist) = jax.lax.scan(block_step, init_state, block_inputs)
         
         if verbose:
             print(f"    - [JAX] Time Integration Finished ({time.time()-t0:.2f}s)")
-            print(f"    - [JAX] [5/5] Sub-sampling & Converting to Numpy...", end="", flush=True)
+            print(f"    - [JAX] [5/5] Converting {len(u_f_hist)} frames to Numpy...", end="", flush=True)
             t_conv = time.time()
 
-        # Sub-sampling using JAX indexing before converting to Numpy
-        idxs = jnp.array(save_idxs, dtype=jnp.int32)
-        u_f_hist_np = np.array(u_f_hist[idxs])
-        v_f_hist_np = np.array(v_f_hist[idxs])
-        a_f_hist_np = np.array(a_f_hist[idxs])
+        # [WHT] Memory Management: Delete large device arrays before conversion to avoid stalls
+        del block_inputs, block_u_s, block_ud_s, block_udd_s, block_f_f
+        del K_ff_jax_sparse, K_struct_ff_sparse, C_ff
+        if is_dense: del K_eff_ff, K_eff_lu
+        import gc; gc.collect()
+
+        u_f_hist_np = np.array(jax.device_get(u_f_hist))
+        v_f_hist_np = np.array(jax.device_get(v_f_hist))
+        a_f_hist_np = np.array(jax.device_get(a_f_hist))
         if n_spcd:
-            u_s_hist_np = np.array(u_s_hist[idxs])
-            a_s_hist_np = np.array(a_s_hist[idxs])
+            u_s_hist_np = np.array(jax.device_get(u_s_hist))
+            a_s_hist_np = np.array(jax.device_get(a_s_hist))
         
         u_saved = []
         v_saved = []
         a_saved = []
         
-        for i, si in enumerate(save_idxs):
+        for i in range(n_blocks):
             u_vec = np.zeros(ndof)
             v_vec = np.zeros(ndof)
             a_vec = np.zeros(ndof)
@@ -640,7 +657,9 @@ class WHTDynamicSolver(WHTSolver):
         if verbose:
             print(f" Done ({time.time()-t_conv:.2f}s)")
 
-        res = DynamicResult(np.array(times)[save_idxs], sorted_nids)
+        # Result times for each block (at the end of the block)
+        t_hist = np.arange(1, n_blocks + 1) * save_every * dt
+        res = DynamicResult(t_hist, sorted_nids)
         res.u = np.array(u_saved)
         res.v = np.array(v_saved)
         res.a = np.array(a_saved)
