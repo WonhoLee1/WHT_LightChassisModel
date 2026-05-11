@@ -14,6 +14,8 @@
 """
 
 import sys
+import numpy as np
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -35,16 +37,41 @@ WIDTH, LENGTH, HEIGHT = 1800.0, 1200.0, 30.0
 MESH_XY, MESH_Z      = 60.0, 10.0
 DRAFT, FLANGE        = 10.0, 15.0
 
-# --- 해석 -------------------------------------------------------------------
+# --- 해석 기본값 -------------------------------------------------------------
 DT      = 1e-4   # s
 T_TOTAL = 0.06   # s
 N_SAVE  = 200
 
-# --- SPCD -------------------------------------------------------------------
+# --- SPCD 기본값 (Half-sine) -------------------------------------------------
 U_AMP         = 10.0    # mm  처방 변위 진폭
 T_PULSE       = 0.010   # s   half-sine 지속 시간
 T_OFFSET      = 0.005   # s   코너 간 시차
 CORNER_RADIUS = 100.0   # mm  코너 탐색 반경
+
+
+class _InterpLoadGroup:
+    """시계열 데이터를 선형 보간하여 SPCD 변위를 반환하는 그룹."""
+    def __init__(self, node_ids, dof, time_arr, disp_arr):
+        self.node_ids  = node_ids
+        self.dof       = dof
+        self.load_type = "SPCD"
+        self._t = time_arr
+        self._u = disp_arr
+
+    def evaluate(self, t: float) -> float:
+        return float(np.interp(t, self._t, self._u))
+
+    def u_value(self, t: float) -> float:
+        return self.evaluate(t)
+
+    def ud_value(self, t: float) -> float:
+        eps = 1e-6
+        return (self.evaluate(t + eps) - self.evaluate(t - eps)) / (2 * eps)
+
+    def udd_value(self, t: float) -> float:
+        eps = 1e-6
+        return (self.evaluate(t + eps) - 2 * self.evaluate(t) +
+                self.evaluate(t - eps)) / (eps ** 2)
 
 
 def find_corner_nodes(node_db: dict, width: float, length: float,
@@ -72,9 +99,33 @@ def find_corner_nodes(node_db: dict, width: float, length: float,
     return groups
 
 
-def run():
+def run(args):
+    import pandas as pd
+    
+    # --- 전역 상수/인자 연동 ---
+    dt_val = args.dt if args.dt else DT
+    t_total_val = T_TOTAL
+    n_save_val = N_SAVE
+    
+    csv_df = None
+    if args.pos_data:
+        csv_path = Path(args.pos_data)
+        if not csv_path.is_absolute():
+            csv_path = Path.cwd() / csv_path
+        print(f" [0] CSV 로드: {csv_path}")
+        csv_df = pd.read_csv(csv_path, encoding='utf-8')
+        
+        time_arr = csv_df['Time'].to_numpy(dtype=float)
+        t_total_val = float(time_arr[-1])
+        n_save_val = 100  # CSV 사용 시 100프레임 고정
+        print(f"     프레임: {len(time_arr)}, 총 시간: {t_total_val:.4f}s")
+
     print("\n" + "=" * 65)
-    print("  Exam 4: Direct Newmark-b - SPCD 4-Corner RBE2 Staggered")
+    print("  Exam 4: Direct Newmark-b - SPCD 4-Corner Staggered")
+    if args.pos_data:
+        print("  [Mode] CSV Position Data Analysis")
+    else:
+        print("  [Mode] Synthetic Half-Sine Excitation")
     print("=" * 65 + "\n")
 
     # 1. 메시 -----------------------------------------------------------------
@@ -101,62 +152,73 @@ def run():
     bot_groups = find_corner_nodes(
         node_db, WIDTH, LENGTH, CORNER_RADIUS, z_min=0.0, z_max=2.0
     )
+    # find_corner_nodes 순서: 0:(-X,-Y), 1:(+X,-Y), 2:(+X,+Y), 3:(-X,+Y)
+    # CSV 매핑: C7, C6, C5, C8
 
-    for i, ((_cx, _cy), bg) in enumerate(bot_groups):
-        print(f"     코너 {i}: 하단 {len(bg)}개 (RBE2 slave+SPCD)")
-
-    # 4. 하단 코너 RBE2 + SPCD ------------------------------------------------
-    # 각 코너 중심 좌표(z=0)에 마스터 노드 생성 → 슬레이브 노드들을 RBE2로 묶음
-    # 마스터 노드 Tz에 SPCD 처방 변위 적용
-    max_nid  = max(model.nodes.keys())
-    max_rbe2 = 1
-
+    # 4. 하단 코너 SPCD 하중 그룹 구성 -----------------------------------------
     load_groups = []
-    master_nids = []
 
-    for i, ((cx, cy), slave_nids) in enumerate(bot_groups):
-        # RBE2 대신 코너 노드(slave_nids)에 직접 SPCD 및 SPC 적용
-        corner_nodes = slave_nids
+    # 3-2-1 최소 구속
+    # bot_groups[0] (-X,-Y) 의 첫 노드: X, Y 고정
+    # bot_groups[1] (+X,-Y) 의 첫 노드: Y 고정
+    model.apply_spc(bot_groups[0][1][0], dofs=(0, 1))
+    model.apply_spc(bot_groups[1][1][0], dofs=(1,))
+
+    if csv_df is not None:
+        # CSV 모드
+        CORNER_MAP = {
+            2: 'C5', # (+X,+Y)
+            1: 'C6', # (+X,-Y)
+            0: 'C7', # (-X,-Y)
+            3: 'C8', # (-X,+Y)
+        }
+        time_arr = csv_df['Time'].to_numpy(dtype=float)
         
-        # Rigid body motion 방지를 위한 최소 구속 (3-2-1 원리)
-        if i == 0:
-            # 첫 번째 코너의 첫 번째 노드: X, Y 고정
-            model.apply_spc(corner_nodes[0], dofs=(0, 1))
-        elif i == 1:
-            # 두 번째 코너의 첫 번째 노드: Y 고정
-            model.apply_spc(corner_nodes[0], dofs=(1,))
+        for idx, (_, corner_nids) in enumerate(bot_groups):
+            cn_label = CORNER_MAP[idx]
+            z_mm = csv_df[f'{cn_label}_pos_Z'].to_numpy(dtype=float) * 1000.0
+            z_rel = z_mm - z_mm[0]
+            
+            lg = _InterpLoadGroup(
+                node_ids = corner_nids,
+                dof      = 2, # Tz
+                time_arr = time_arr,
+                disp_arr = z_rel
+            )
+            load_groups.append(lg)
+        print(f" [3] CSV 기반 SPCD 하중 구성 완료 (4개 코너)")
+    else:
+        # 기존 Half-sine 모드
+        for i, ((cx, cy), slave_nids) in enumerate(bot_groups):
+            corner_nodes = slave_nids
+            load_groups.append(DynamicLoadGroup(
+                node_ids  = corner_nodes,
+                dof       = 2,           # Tz
+                magnitude = U_AMP,
+                time_func = "half_sine",
+                load_type = "SPCD",
+                t_pulse   = T_PULSE,
+                t_start   = i * T_OFFSET,
+                distribute= False,
+            ))
+        print(f" [3] Half-Sine SPCD 하중 구성 완료 (4개 코너)")
 
-        load_groups.append(DynamicLoadGroup(
-            node_ids  = corner_nodes,
-            dof       = 2,           # Tz
-            magnitude = U_AMP,
-            time_func = "half_sine",
-            load_type = "SPCD",
-            t_pulse   = T_PULSE,
-            t_start   = i * T_OFFSET,
-            distribute= False,
-        ))
-
-    print(f" [3] 하단 코너 노드 직접 처방: 4개 그룹")
-    print(f"     SPCD: 마스터 Tz {U_AMP:.0f}mm half-sine "
-          f"{T_PULSE*1000:.0f}ms, stagger {T_OFFSET*1000:.0f}ms")
-
-    # 6. 동해석 ---------------------------------------------------------------
-    print(f"\n [5] Direct Newmark-b 동해석 (dt={DT:.1e}s, T={T_TOTAL:.3f}s)...")
+    # 5. 동해석 ---------------------------------------------------------------
+    print(f"\n [4] Direct Newmark-b 동해석 (dt={dt_val:.1e}s, T={t_total_val:.3f}s)...")
     solver  = WHTDynamicSolver(model)
     damping = DampingSpec(mode="zeta", zeta=0.02)
 
     dyn = solver.solve_direct_dynamic(
         load_groups = load_groups,
-        dt          = DT,
-        T           = T_TOTAL,
+        dt          = dt_val,
+        T           = t_total_val,
         damping     = damping,
-        n_save      = N_SAVE,
+        n_save      = n_save_val,
     )
     print(f"\n     {dyn.summary()}")
 
-    # 7. 응력/변형률 이력 복원 -------------------------------------------------
-    print(f"\n [6] 응력/변형률 복원...")
+    # 6. 응력/변형률 이력 복원 -------------------------------------------------
+    print(f"\n [5] 응력/변형률 복원...")
     solver.recover_stress_history(dyn)   # dyn.stress_data 채움
 
     # 8. 결과 변환 ------------------------------------------------------------
@@ -181,16 +243,23 @@ def run():
     VTKHDFExporter().export(wht_data, hdf_path)
     print(f"\n [6] ParaView HDF 저장: {hdf_path}")
 
-    # 9. WHTVisualizer --------------------------------------------------------
-    print(" [7] WHTVisualizer 실행...")
-    viz = WHTVisualizer(title="Exam 4: SPCD Staggered Corner Excitation (RBE2)")
-    viz.show_result(wht_data, group_name="DynamicTray")
-    viz.plotter.view_isometric()
-    viz.plotter.reset_camera()
-
-    if hasattr(viz.plotter, 'app'):
-        viz.plotter.app.exec_()
+    # 8. 시각화 --------------------------------------------------------------
+    if not args.no_viz:
+        print(" [7] WHTVisualizer 실행...")
+        title = "Exam 4: CSV Pos Dynamic" if args.pos_data else "Exam 4: Half-Sine Dynamic"
+        viz = WHTVisualizer(title=title)
+        viz.show_result(wht_data, group_name="DynamicTray")
+        viz.plotter.view_isometric()
+        viz.plotter.reset_camera()
+        if hasattr(viz.plotter, 'app'):
+            viz.plotter.app.exec_()
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Exam 4: Dynamic Analysis with SPCD")
+    parser.add_argument("--pos-data", type=str, help="CSV position data file path")
+    parser.add_argument("--dt", type=float, help="Time step (s)")
+    parser.add_argument("--no-viz", action="store_true", help="Skip visualization")
+    
+    args = parser.parse_args()
+    run(args)
