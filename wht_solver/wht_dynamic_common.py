@@ -2,102 +2,108 @@
 """
 wht_dynamic_common.py
 =====================
-WHT Dynamic Analysis — 공통 데이터 구조 및 유틸리티
-
-DynamicLoadGroup : 노드 그룹별 시간 함수 하중 입력
-DampingSpec      : 감쇠 사양 (Rayleigh 또는 모달 감쇠비 ζ)
-DynamicResult    : 동해석 시간 이력 저장
+동해석 공통 데이터 구조 및 유틸리티.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
+from wht_converter.wht_models import WHTMetadata, WHTResultData
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 하중 입력
+# 하중 및 감쇠 정의
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class DynamicLoadGroup:
     """
-    노드 그룹에 대한 시간 의존 하중.
+    동해석 시각 하중 그룹.
 
-    Parameters
+    Attributes
     ----------
-    node_ids        : 하중을 적용할 노드 ID 리스트
-    dof             : 하중 자유도 (0=Tx, 1=Ty, 2=Tz, 3=Rx, 4=Ry, 5=Rz)
-    force_magnitude : 하중 크기 [N 또는 N·mm]
-    time_func       : callable(t) → float  또는 프리셋 문자열
-                      프리셋: "sine", "half_sine", "step", "ramp", "impulse"
-    frequency_hz    : sine/cosine 프리셋 주파수 [Hz]
-    t_pulse         : half_sine/ramp 지속 시간 [s]
-    distribute      : True이면 force_magnitude를 노드 수로 균등 분배
+    node_ids:   대상 노드 ID 리스트
+    dof:        자유도 (0~5: Tx, Ty, Tz, Rx, Ry, Rz)
+    magnitude:  진폭 (Force[N] 또는 SPCD[mm])
+    time_func:  "half_sine", "step", "ramp", "sine" 등
+    t_pulse:    float = 0.02
+    t_start:    float = 0.0
+    load_type:  str   = "FORCE"
+    distribute: bool  = True
     """
-    node_ids:        List[int]
-    dof:             int
-    force_magnitude: float
-    time_func:       Union[Callable, str] = "step"
-    frequency_hz:    float = 0.0
-    t_pulse:         float = 0.0
-    distribute:      bool  = False
+    node_ids:   List[int]
+    dof:        int
+    magnitude:  float
+    time_func:  str = "half_sine"
+    t_pulse:    float = 0.02
+    t_start:    float = 0.0
+    load_type:  str   = "FORCE"
+    distribute: bool  = True
 
     def evaluate(self, t: float) -> float:
-        """시각 t에서의 하중값 반환 (magnitude 반영)."""
-        mag = self.force_magnitude
-        if self.distribute and len(self.node_ids) > 1:
-            mag = mag / len(self.node_ids)
-
-        if callable(self.time_func):
-            return mag * float(self.time_func(t))
-
-        name = self.time_func.lower()
-        if name == "step":
-            return mag
-        elif name == "sine":
-            return mag * np.sin(2 * np.pi * self.frequency_hz * t)
-        elif name == "cosine":
-            return mag * np.cos(2 * np.pi * self.frequency_hz * t)
-        elif name == "half_sine":
-            if self.t_pulse > 0 and 0 <= t <= self.t_pulse:
-                return mag * np.sin(np.pi * t / self.t_pulse)
+        """시각 t에서의 하중/변위 스칼라 값 산출."""
+        t_eff = t - self.t_start
+        if t_eff < 0:
             return 0.0
-        elif name == "ramp":
-            if self.t_pulse > 0:
-                return mag * min(t / self.t_pulse, 1.0)
-            return mag
-        elif name == "impulse":
-            return mag if t == 0.0 else 0.0
-        else:
-            raise ValueError(
-                f"Unknown time_func preset: '{self.time_func}'. "
-                "Use: 'step','sine','cosine','half_sine','ramp','impulse' or callable."
-            )
 
+        amp = self.magnitude
+        if self.load_type.upper() == "FORCE" and self.distribute:
+            amp /= max(len(self.node_ids), 1)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 감쇠 사양
-# ─────────────────────────────────────────────────────────────────────────────
+        if self.time_func == "half_sine":
+            if 0 <= t_eff <= self.t_pulse:
+                return amp * math.sin(math.pi * t_eff / self.t_pulse)
+            return 0.0
+        elif self.time_func == "step":
+            return amp
+        elif self.time_func == "ramp":
+            return amp * min(t_eff / self.t_pulse, 1.0)
+        elif self.time_func == "sine":
+            return amp * math.sin(2.0 * math.pi * t_eff / self.t_pulse)
+        return amp
+
+    def u_value(self, t: float) -> float:
+        """[SPCD 전용] 처방 변위 u(t)."""
+        return self.evaluate(t)
+
+    def ud_value(self, t: float) -> float:
+        """[SPCD 전용] 처방 속도 v(t) — d/dt(evaluate)."""
+        t_eff = t - self.t_start
+        if t_eff < 0 or t_eff > self.t_pulse:
+            return 0.0
+
+        amp = self.magnitude
+        if self.time_func == "half_sine":
+            # d/dt [ A sin(pi t / T) ] = A (pi/T) cos(pi t / T)
+            return amp * (math.pi / self.t_pulse) * math.cos(math.pi * t_eff / self.t_pulse)
+        elif self.time_func == "sine":
+            return amp * (2.0 * math.pi / self.t_pulse) * math.cos(2.0 * math.pi * t_eff / self.t_pulse)
+        return 0.0
+
+    def udd_value(self, t: float) -> float:
+        """[SPCD 전용] 처방 가속도 ü(t) — d²/dt²(evaluate)."""
+        t_eff = t - self.t_start
+        if t_eff < 0 or t_eff > self.t_pulse:
+            return 0.0
+
+        amp = self.magnitude
+        if self.time_func == "half_sine":
+            # d²/dt² [ A sin(pi t / T) ] = -A (pi/T)² sin(pi t / T)
+            return -amp * (math.pi / self.t_pulse)**2 * math.sin(math.pi * t_eff / self.t_pulse)
+        elif self.time_func == "sine":
+            # d²/dt² [ A sin(2pi t / T) ] = -A (2pi/T)² sin(2pi t / T)
+            return -amp * (2.0 * math.pi / self.t_pulse)**2 * math.sin(2.0 * math.pi * t_eff / self.t_pulse)
+        return 0.0
+
 
 @dataclass
 class DampingSpec:
-    """
-    감쇠 사양.
-
-    mode="rayleigh" : C = alpha*M + beta*K  (alpha, beta 직접 지정)
-    mode="zeta"     : 임계감쇠비 ζ 지정 → 두 기준 주파수에서 Rayleigh α,β 자동 산출
-                      omega_ref1/2 미지정 시 고유값 해석으로 자동 선택.
-
-    Examples
-    --------
-    DampingSpec(mode="zeta", zeta=0.02)
-    DampingSpec(mode="rayleigh", alpha=1.5, beta=2e-4)
-    DampingSpec(mode="zeta", zeta=0.05,
-                omega_ref1=2*pi*10, omega_ref2=2*pi*100)
-    """
+    """감쇠 사양 정의."""
     mode:       str   = "zeta"
     alpha:      float = 0.0
     beta:       float = 0.0
@@ -111,19 +117,7 @@ class DampingSpec:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DynamicResult:
-    """
-    동해석 시간 이력 결과.
-
-    Attributes
-    ----------
-    t_saved     : (n_save,)            저장된 시각 배열 [s]
-    sorted_nids : 노드 ID 리스트
-    u           : (n_save, n_nodes, 6) 변위 이력 [mm]
-    v           : (n_save, n_nodes, 6) 속도 이력 [mm/s]
-    a           : (n_save, n_nodes, 6) 가속도 이력 [mm/s²]
-    solver_type : "modal" 또는 "direct"
-    solver_info : 해석 메타데이터 dict
-    """
+    """동해석 시간 이력 결과."""
 
     def __init__(self, t_saved: np.ndarray, sorted_nids: List[int]):
         self.t_saved     = t_saved
@@ -133,42 +127,25 @@ class DynamicResult:
         self.a: Optional[np.ndarray] = None
         self.solver_type: str  = ""
         self.solver_info: dict = {}
+        # 응력/변형률 이력: {"Stress": (T, M, 6), "Von Mises": (T, M), ...}
+        self.stress_data: Optional[Dict[str, np.ndarray]] = None
 
     @property
     def n_save(self) -> int:
         return len(self.t_saved)
-
-    def max_displacement(self) -> np.ndarray:
-        """(n_nodes, 6) — 각 DOF의 최대 절대 변위."""
-        return np.max(np.abs(self.u), axis=0)
 
     def peak_time_index(self) -> int:
         """전체 최대 변위가 발생하는 저장 인덱스."""
         norms = np.max(np.abs(self.u.reshape(self.n_save, -1)), axis=1)
         return int(np.argmax(norms))
 
-    def to_wht_result_data(self, metadata, mesh_model):
-        """
-        WHTResultData IR로 변환 — ParaView 내보내기 및 Visualizer 연동.
-
-        point_data 구성:
-            Displacement  : (n_save, n_nodes, 3) [mm]
-            Rotation      : (n_save, n_nodes, 3) [rad]
-            Velocity      : (n_save, n_nodes, 3) [mm/s]
-            Acceleration  : (n_save, n_nodes, 3) [mm/s²]
-
-        Parameters
-        ----------
-        metadata   : WHTMetadata
-        mesh_model : WHTMeshModel (geometry source)
-
-        Returns
-        -------
-        WHTResultData
-        """
+    def to_wht_result_data(self, metadata, mesh_model, load_groups: Optional[List[DynamicLoadGroup]] = None):
+        """WHTResultData IR로 변환."""
         from wht_converter.wht_models import WHTResultData
 
         base_rd = mesh_model.to_wht_result_data(metadata)
+        n_nodes = len(self.sorted_nids)
+        nid_to_idx = {nid: i for i, nid in enumerate(self.sorted_nids)}
 
         point_data = {}
         if self.u is not None:
@@ -179,6 +156,34 @@ class DynamicResult:
         if self.a is not None:
             point_data["Acceleration"] = self.a[:, :, :3]
 
+        if load_groups:
+            load_history = np.zeros((self.n_save, n_nodes, 3))
+            for i, t in enumerate(self.t_saved):
+                for lg in load_groups:
+                    if lg.dof > 2: continue
+                    val = lg.evaluate(t)
+                    for nid in lg.node_ids:
+                        idx = nid_to_idx.get(nid)
+                        if idx is not None:
+                            load_history[i, idx, lg.dof] += val
+            point_data["Applied_Load"] = load_history
+
+        # [WHT] Include SPCD nodes in SPC set for visualization markers
+        if load_groups:
+            spcd_nids_all = []
+            for lg in load_groups:
+                if lg.load_type.upper() == "SPCD":
+                    spcd_nids_all.extend(lg.node_ids)
+            if spcd_nids_all:
+                spcd_nids_unique = sorted(list(set(spcd_nids_all)))
+                spcd_indices = np.array([nid_to_idx[n] for n in spcd_nids_unique if n in nid_to_idx], dtype=np.int64)
+                
+                if "SPC" in base_rd.node_sets:
+                    existing = base_rd.node_sets["SPC"]
+                    base_rd.node_sets["SPC"] = np.unique(np.concatenate([existing, spcd_indices]))
+                else:
+                    base_rd.node_sets["SPC"] = spcd_indices
+
         return WHTResultData(
             nodes        = base_rd.nodes,
             connectivity = base_rd.connectivity,
@@ -187,11 +192,54 @@ class DynamicResult:
             node_sets    = base_rd.node_sets,
             element_sets = base_rd.element_sets,
             point_data   = point_data,
-            cell_data    = {},
+            cell_data    = self._build_cell_data(mesh_model),
             field_data   = {},
             time_values  = self.t_saved,
             metadata     = metadata,
         )
+
+    def _build_cell_data(self, mesh_model=None) -> Dict[str, np.ndarray]:
+        """stress_data로부터 visualizer용 cell_data 딕셔너리를 구성합니다.
+
+        WHTResultData 검증 규칙상 cell_data[:, shape[1]] == M_total_cells 이어야 하므로,
+        stress/strain 배열(요소만)을 메시 전체 셀 수에 맞게 zero-pad 합니다.
+
+        Parameters
+        ----------
+        mesh_model : WHTMeshModel, optional
+            메시 모델. 제공 시 전체 셀 수(M_mesh)를 계산하여 패딩 수행.
+
+        Returns
+        -------
+        dict
+            Keys: 응력/변형률 필드명, Values: (T, M_mesh, ...) ndarray
+        """
+        cell_data: Dict[str, np.ndarray] = {}
+        if self.stress_data is None:
+            return cell_data
+
+        # M_mesh: 메시의 전체 셀 수(쉘 + 빔 등 포함)
+        M_mesh = None
+        if mesh_model is not None:
+            M_mesh = len(mesh_model.elements)
+            if hasattr(mesh_model, 'rbe2s') and mesh_model.rbe2s:
+                M_mesh += len(mesh_model.rbe2s)  # RBE2 → 빔 셀 포함
+
+        for key, arr in self.stress_data.items():
+            # arr.shape: (T, M_elem, 6) 또는 (T, M_elem)
+            if M_mesh is not None and arr.shape[1] != M_mesh:
+                T = arr.shape[0]
+                if arr.ndim == 3:
+                    padded = np.zeros((T, M_mesh, arr.shape[2]), dtype=arr.dtype)
+                    padded[:, :arr.shape[1], :] = arr
+                else:
+                    padded = np.zeros((T, M_mesh), dtype=arr.dtype)
+                    padded[:, :arr.shape[1]] = arr
+                cell_data[key] = padded
+            else:
+                cell_data[key] = arr
+
+        return cell_data
 
     def summary(self) -> str:
         peak_i = self.peak_time_index()
@@ -203,66 +251,20 @@ class DynamicResult:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 유틸리티 함수
-# ─────────────────────────────────────────────────────────────────────────────
-
-def assemble_rayleigh_C(
-    alpha: float,
-    beta: float,
-    M_diag: np.ndarray,
-    K_sparse,
-):
-    """
-    Rayleigh 비례 감쇠 행렬 조립.
-
-    C = alpha * M + beta * K
-    M_diag : (ndof,) 대각 집중 질량 벡터
-    K_sparse : (ndof, ndof) scipy sparse 강성 행렬
-    """
+def assemble_rayleigh_C(alpha: float, beta: float, M_diag: np.ndarray, K_sparse) -> any:
     from scipy.sparse import diags
-    M_mat = diags([alpha * M_diag], [0], format='csr')
-    C = M_mat + beta * K_sparse
-    return C.tocsr()
+    M_mat = diags([M_diag], [0], format="csr")
+    return alpha * M_mat + beta * K_sparse
 
 
-def damping_from_zeta(
-    zeta: float,
-    omega1: float,
-    omega2: float,
-) -> tuple[float, float]:
-    """
-    두 기준 주파수(ω₁, ω₂)와 감쇠비 ζ로부터 Rayleigh α, β 산출.
-
-        ζ = α/(2ω) + βω/2  →  2×2 선형계 풀이
-
-    Returns
-    -------
-    (alpha, beta)
-    """
-    A = 0.5 * np.array([[1.0 / omega1, omega1],
-                         [1.0 / omega2, omega2]])
+def damping_from_zeta(zeta: float, omega1: float, omega2: float) -> tuple[float, float]:
+    A = 0.5 * np.array([[1.0 / omega1, omega1], [1.0 / omega2, omega2]])
     b = np.array([zeta, zeta])
     alpha, beta = np.linalg.solve(A, b)
     return float(alpha), float(beta)
 
 
 def newmark_coeffs(beta: float, gamma: float, dt: float) -> dict:
-    """
-    Newmark-β 적분 상수 계산.
-
-    beta=0.25, gamma=0.5 : Constant Average Acceleration (무조건 안정)
-
-    Returns
-    -------
-    dict with keys a0..a5
-        a0 = 1/(β dt²)
-        a1 = γ/(β dt)
-        a2 = 1/(β dt)
-        a3 = 1/(2β) - 1
-        a4 = γ/β - 1
-        a5 = dt(γ/(2β) - 1)
-    """
     a0 = 1.0 / (beta * dt ** 2)
     a1 = gamma / (beta * dt)
     a2 = 1.0 / (beta * dt)

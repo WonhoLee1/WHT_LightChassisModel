@@ -252,59 +252,139 @@ class WHTDynamicSolver(WHTSolver):
         jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
         ndof    = jm.ndof
         n_nodes = len(sorted_nids)
+        # Full K (shell + RBE2 stiff beams via JaxSSO)
         K       = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
+        # Shell-only K: Rayleigh 감쇠 기준 주파수 계산용 (RBE2 beam 제외)
+        K_struct = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx,
+                                          stabilize=True, include_beams=False)
+
         M_diag  = self._assemble_lumped_mass(jm, ndof, sorted_nids, nid_to_idx)
-        free_id = np.array(jm.unknown_id, dtype=np.int64)
+        
+        # [WHT] Patch zero mass to avoid division-by-zero (NaN) during integration
+        m_max = np.max(M_diag)
+        if m_max > 0:
+            M_diag = np.maximum(M_diag, max(m_max * 1e-8, 1e-10))
+        else:
+            M_diag = np.maximum(M_diag, 1e-10)
 
-        K_free = K[free_id, :][:, free_id].tocsr()
-        M_free = M_diag[free_id]                     # (ndof_free,) 대각
-        M_mat  = diags([M_free], [0], format="csr")
+        # ── 2. DOF 분류: SPC(고정) / SPCD(시변 처방) / FREE ────────────────
+        unknown_set = set(jm.unknown_id)
 
-        # ── 2. 감쇠 행렬 ────────────────────────────────────────────────────
-        alpha, beta_r = self._rayleigh_coeffs(damping, K_free, M_free)
-        C_free = assemble_rayleigh_C(alpha, beta_r, M_free, K_free)
-        print(f"    - Rayleigh damping: α={alpha:.4e}  β={beta_r:.4e}", flush=True)
+        # SPCD DOF → DynamicLoadGroup 매핑
+        spcd_map: dict = {}   # global_dof -> DynamicLoadGroup
+        for lg in load_groups:
+            if lg.load_type.upper() != "SPCD":
+                continue
+            for nid in lg.node_ids:
+                idx = nid_to_idx.get(nid)
+                if idx is None:
+                    continue
+                gdof = idx * 6 + lg.dof
+                if gdof in unknown_set:
+                    spcd_map[gdof] = lg
 
-        # ── 3. K_eff 조립 + LU 분해 (1회) ───────────────────────────────────
+        # RBE2 슬레이브 자동 확장은 코너 변형을 왜곡(수평 유지 강제)하므로 제거함.
+        # SPCD는 오직 마스터 노드에만 적용되고, RBE2 beam 강성을 통해 슬레이브로 전달됨.
+        spcd_id = np.array(sorted(spcd_map.keys()), dtype=np.int64)
+        spcd_set = set(spcd_id.tolist())
+        free_id  = np.array(
+            [d for d in jm.unknown_id if d not in spcd_set], dtype=np.int64
+        )
+        n_free, n_spcd = len(free_id), len(spcd_id)
+
+        if n_spcd:
+            n_master = sum(1 for lg in load_groups if lg.load_type.upper() == "SPCD"
+                           for _ in lg.node_ids)
+            print(f"    - SPCD DOF: {n_spcd}개 (master {n_master})", flush=True)
+
+        # ── 3. 서브행렬 추출 ────────────────────────────────────────────────
+        K_ff = K[free_id, :][:, free_id].tocsr()
+        M_f  = M_diag[free_id]
+        M_mat_f = diags([M_f], [0], format="csr")
+
+        # ── 4. 감쇠 ────────────────────────────────────────────────────────
+        # RBE2 beam stiffness를 C와 K_eff_fs 계산에서 모두 배제
+        # → beam K가 등가 힘을 수만 배 증폭하는 오류 방지
+        K_struct_ff = K_struct[free_id, :][:, free_id].tocsr()
+        alpha, beta_r = self._rayleigh_coeffs(damping, K_struct_ff, M_f)
+        C_ff = assemble_rayleigh_C(alpha, beta_r, M_f, K_struct_ff)  # shell K만 사용
+        print(f"    - Rayleigh damping: alpha={alpha:.4e}  beta={beta_r:.4e}", flush=True)
+
+        # ── 5. K_eff 조립 + LU 분해 (1회) ──────────────────────────────────
         nc    = newmark_coeffs(newmark_beta, newmark_gamma, dt)
-        K_eff = K_free + nc["a0"] * M_mat + nc["a1"] * C_free
+        K_eff_ff = K_ff + nc["a0"] * M_mat_f + nc["a1"] * C_ff  # 동역학은 full K
         print("    - LU decomposition ... ", end="", flush=True)
-        lu = splu(K_eff.tocsc())
+        lu = splu(K_eff_ff.tocsc())
         print("Done.", flush=True)
 
-        # ── 4. 시간 적분 루프 ───────────────────────────────────────────────
+        # SPCD 커플링:
+        # 정적 평형(K)은 RBE2 beam을 포함해야 변위가 올바르게 전달됨 (K_fs_full)
+        # 감쇠(C)는 shell 구조물(K_struct_fs)만 사용 (C_fs_struct = beta_r * K_struct_fs)
+        if n_spcd:
+            K_fs_full   = K[free_id, :][:, spcd_id].tocsr()
+            K_fs_struct = K_struct[free_id, :][:, spcd_id].tocsr()
+        else:
+            K_fs_full = K_fs_struct = None
+
+        # ── 6. 시간 적분 루프 ─────────────────────────────────────────────
         n_steps    = int(np.ceil(T / dt))
         save_every = max(1, n_steps // n_save)
-        ndof_free  = len(free_id)
 
-        u   = np.zeros(ndof_free)
-        ud  = np.zeros(ndof_free)
-        udd = np.zeros(ndof_free)
+        u_f   = np.zeros(n_free)
+        ud_f  = np.zeros(n_free)
+        udd_f = np.zeros(n_free)
 
         t_saved, u_saved, v_saved, a_saved = [], [], [], []
 
+        def _get_spcd_vecs(t_cur: float):
+            """현재 시각의 SPCD 변위/속도/가속도 벡터."""
+            u_s   = np.array([spcd_map[d].u_value(t_cur)   for d in spcd_id])
+            ud_s  = np.array([spcd_map[d].ud_value(t_cur)  for d in spcd_id])
+            udd_s = np.array([spcd_map[d].udd_value(t_cur) for d in spcd_id])
+            return u_s, ud_s, udd_s
+
         for step in range(n_steps + 1):
-            t_cur  = step * dt
+            t_cur = step * dt
+
+            # 외력 (FORCE 타입만)
             f_full = self._build_load_vector(t_cur, load_groups, ndof, nid_to_idx)
-            f_free = f_full[free_id]
+            f_f    = f_full[free_id]
+
+            if n_spcd:
+                u_s, ud_s, udd_s = _get_spcd_vecs(t_cur)
+            else:
+                u_s = ud_s = udd_s = None
 
             if step == 0:
-                # 초기 가속도: M udd = f - K u - C ud  (u=ud=0)
-                udd = f_free / M_free  # M 대각이므로 원소별 나눗셈
+                # 초기 가속도: M·ü = f − K·u  (u=0, SPCD 초기값 반영)
+                rhs0 = f_f.copy()
+                if n_spcd and K_fs_full is not None:
+                    rhs0 -= K_fs_full @ u_s
+                udd_f = rhs0 / M_f
             else:
-                f_eff = (f_free
-                         + M_free * (nc["a0"]*u  + nc["a2"]*ud  + nc["a3"]*udd)
-                         + C_free @ (nc["a1"]*u  + nc["a4"]*ud  + nc["a5"]*udd))
-                u_new   = lu.solve(f_eff)
-                udd_new = nc["a0"]*(u_new - u) - nc["a2"]*ud - nc["a3"]*udd
-                ud_new  = ud + dt * ((1 - newmark_gamma)*udd + newmark_gamma*udd_new)
-                u, ud, udd = u_new, ud_new, udd_new
+                # Newmark 유효 하중
+                f_eff = (f_f
+                         + M_f  * (nc["a0"]*u_f  + nc["a2"]*ud_f  + nc["a3"]*udd_f)
+                         + C_ff @ (nc["a1"]*u_f  + nc["a4"]*ud_f  + nc["a5"]*udd_f))
+                if n_spcd and K_fs_full is not None:
+                    f_eff -= K_fs_full @ u_s   # SPCD 처방 변위 기여분 (빔 포함)
+                    f_eff -= (beta_r * K_fs_struct) @ ud_s  # SPCD 처방 속도 기여분 (빔 제외)
 
-            # 저장 판단
+                u_f_new   = lu.solve(f_eff)
+                udd_f_new = nc["a0"]*(u_f_new - u_f) - nc["a2"]*ud_f - nc["a3"]*udd_f
+                ud_f_new  = ud_f + dt * ((1 - newmark_gamma)*udd_f + newmark_gamma*udd_f_new)
+                u_f, ud_f, udd_f = u_f_new, ud_f_new, udd_f_new
+
             if step % save_every == 0 or step == n_steps:
-                u_vec = np.zeros(ndof); u_vec[free_id] = u
-                v_vec = np.zeros(ndof); v_vec[free_id] = ud
-                a_vec = np.zeros(ndof); a_vec[free_id] = udd
+                u_vec = np.zeros(ndof)
+                v_vec = np.zeros(ndof)
+                a_vec = np.zeros(ndof)
+                u_vec[free_id] = u_f
+                v_vec[free_id] = ud_f
+                a_vec[free_id] = udd_f
+                if n_spcd:
+                    u_vec[spcd_id] = u_s          # 처방 변위를 결과에 직접 기록
+                    a_vec[spcd_id] = udd_s
 
                 t_saved.append(t_cur)
                 u_saved.append(u_vec.reshape(n_nodes, 6))
@@ -385,8 +465,123 @@ class WHTDynamicSolver(WHTSolver):
         return load_cases
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Internal helpers
+    # Public API — 응력/변형률 이력 복원
     # ─────────────────────────────────────────────────────────────────────────
+
+    def recover_stress_history(
+        self,
+        dynamic_result: DynamicResult,
+        fields: Optional[List[str]] = None,
+        verbose: bool = True,
+    ) -> DynamicResult:
+        """
+        동해석 결과의 각 저장 스텝에 대해 응력/변형률을 복원합니다.
+
+        정적 해석의 ElementStressRecovery와 동일한 로직을 적용하며,
+        결과는 DynamicResult.stress_data에 (T, M, 6) 또는 (T, M) 형태로 저장됩니다.
+
+        Parameters
+        ----------
+        dynamic_result : DynamicResult
+            solve_direct_dynamic() 또는 solve_modal_dynamic()의 반환값.
+        fields : list of str, optional
+            복원할 필드명 리스트. None이면 주요 필드 전체 복원.
+            예: [\"Stress\", \"Stress (Max Envelope)\", \"Strain\", \"Von Mises (Upper)\"]
+        verbose : bool
+            진행 상황 출력 여부.
+
+        Returns
+        -------
+        DynamicResult
+            stress_data가 채워진 동일 객체 (in-place).
+        """
+        from .wht_stress_recovery import ElementStressRecovery
+
+        # 기본 복원 필드: 주요 6개 (전체 12개는 메모리 부담이 크므로 선택적)
+        if fields is None:
+            fields = [
+                "Stress",               # Upper (+t/2) — 기본
+                "Stress (Max Envelope)",# Upper/Lower 중 Von Mises 최대
+                "Strain",               # Upper (+t/2)
+                "Strain (Max Envelope)",# Upper/Lower 중 Max
+            ]
+
+        n_save  = dynamic_result.n_save
+        n_nodes = len(dynamic_result.sorted_nids)
+        sorted_nids = dynamic_result.sorted_nids
+
+        if verbose:
+            print(f"\n [Stress Recovery] {n_save} 스텝, 필드: {fields}", flush=True)
+            t0 = time.time()
+
+        # 첫 스텝으로 요소 수 파악
+        u0 = dynamic_result.u[0]   # (n_nodes, 6)
+        first = ElementStressRecovery.recover_quad4(self.model, u0, sorted_nids)
+        # TRIA3가 혼재하면 추가
+        tria = ElementStressRecovery.recover_tria3(self.model, u0, sorted_nids)
+        # 두 결과를 합산 (요소별 중첩: 한 요소는 어느 한 쪽만 채워짐)
+        sample_result = {k: first[k] + tria[k] for k in first}
+        n_elem = sample_result["Stress"].shape[0]
+
+        # (T, M, 6) 또는 (T, M) 버퍼 초기화
+        stress_data: dict = {}
+        for fld in fields:
+            if fld not in sample_result:
+                if verbose:
+                    print(f"    [경고] 필드 '{fld}'를 찾을 수 없습니다. 건너뜁니다.")
+                continue
+            arr0 = sample_result[fld]
+            if arr0.ndim == 2:          # (M, 6) → (T, M, 6)
+                stress_data[fld] = np.zeros((n_save, n_elem, 6), dtype=np.float32)
+            else:                        # (M,)   → (T, M)
+                stress_data[fld] = np.zeros((n_save, n_elem), dtype=np.float32)
+
+        # Von Mises 스칼라 필드 추가 (Stress가 복원될 경우)
+        compute_vm_upper = "Stress" in stress_data
+        compute_vm_envelope = "Stress (Max Envelope)" in stress_data
+        if compute_vm_upper:
+            stress_data["Von Mises (Upper)"] = np.zeros((n_save, n_elem), dtype=np.float32)
+        if compute_vm_envelope:
+            stress_data["Von Mises (Max Envelope)"] = np.zeros((n_save, n_elem), dtype=np.float32)
+
+        def _von_mises(voigt: np.ndarray) -> np.ndarray:
+            """Voigt (M, 6) → Von Mises (M,)."""
+            s = voigt
+            diff_sq = (s[:, 0]-s[:, 1])**2 + (s[:, 1]-s[:, 2])**2 + (s[:, 2]-s[:, 0])**2
+            shear_sq = 6.0 * (s[:, 3]**2 + s[:, 4]**2 + s[:, 5]**2)
+            return np.sqrt(0.5 * (diff_sq + shear_sq))
+
+        # 각 스텝 루프
+        for ti in range(n_save):
+            u_frame = dynamic_result.u[ti]   # (n_nodes, 6)
+            quad = ElementStressRecovery.recover_quad4(self.model, u_frame, sorted_nids)
+            tria = ElementStressRecovery.recover_tria3(self.model, u_frame, sorted_nids)
+            frame = {k: quad[k] + tria[k] for k in quad}
+
+            for fld in stress_data:
+                if fld.startswith("Von Mises"):
+                    continue   # 아래에서 별도 처리
+                if fld in frame:
+                    stress_data[fld][ti] = frame[fld].astype(np.float32)
+
+            if compute_vm_upper and "Stress" in frame:
+                stress_data["Von Mises (Upper)"][ti] = _von_mises(frame["Stress"]).astype(np.float32)
+            if compute_vm_envelope and "Stress (Max Envelope)" in frame:
+                stress_data["Von Mises (Max Envelope)"][ti] = _von_mises(frame["Stress (Max Envelope)"]).astype(np.float32)
+
+            if verbose and (ti + 1) % max(1, n_save // 10) == 0:
+                print(f"    [{ti+1:4d}/{n_save}] ...", flush=True)
+
+        dynamic_result.stress_data = stress_data
+        if verbose:
+            elapsed = time.time() - t0
+            n_fields = len(stress_data)
+            print(f" -> Stress Recovery 완료: {n_fields}개 필드, "
+                  f"{elapsed:.1f}s ({n_save} steps × {n_elem} elements)", flush=True)
+
+        return dynamic_result
+
+
 
     def _build_load_vector(
         self,
