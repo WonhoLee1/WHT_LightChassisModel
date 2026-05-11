@@ -158,12 +158,6 @@ def run(args):
     # 4. 하단 코너 SPCD 하중 그룹 구성 -----------------------------------------
     load_groups = []
 
-    # 3-2-1 최소 구속
-    # bot_groups[0] (-X,-Y) 의 첫 노드: X, Y 고정
-    # bot_groups[1] (+X,-Y) 의 첫 노드: Y 고정
-    model.apply_spc(bot_groups[0][1][0], dofs=(0, 1))
-    model.apply_spc(bot_groups[1][1][0], dofs=(1,))
-
     if csv_df is not None:
         # CSV 모드
         CORNER_MAP = {
@@ -176,17 +170,19 @@ def run(args):
         
         for idx, (_, corner_nids) in enumerate(bot_groups):
             cn_label = CORNER_MAP[idx]
-            z_mm = csv_df[f'{cn_label}_pos_Z'].to_numpy(dtype=float) * 1000.0
-            z_rel = z_mm - z_mm[0]
-            
-            lg = _InterpLoadGroup(
-                node_ids = corner_nids,
-                dof      = 2, # Tz
-                time_arr = time_arr,
-                disp_arr = z_rel
-            )
-            load_groups.append(lg)
-        print(f" [3] CSV 기반 SPCD 하중 구성 완료 (4개 코너)")
+            for axis_idx, ax in enumerate(['X', 'Y', 'Z']):
+                col = f'{cn_label}_pos_{ax}'
+                vals_mm = csv_df[col].to_numpy(dtype=float) * 1000.0
+                vals_rel = vals_mm - vals_mm[0]
+                
+                lg = _InterpLoadGroup(
+                    node_ids = corner_nids,
+                    dof      = axis_idx, # 0=Tx, 1=Ty, 2=Tz
+                    time_arr = time_arr,
+                    disp_arr = vals_rel
+                )
+                load_groups.append(lg)
+        print(f" [3] CSV 기반 XYZ SPCD 하중 구성 완료 (4개 코너)")
     else:
         # 기존 Half-sine 모드
         for i, ((cx, cy), slave_nids) in enumerate(bot_groups):

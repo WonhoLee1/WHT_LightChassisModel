@@ -157,20 +157,19 @@ def run_pos_dynamic(args):
     T_total  = float(time_arr[-1])
     print(f"     프레임 수: {len(time_arr)}, 총 시간: {T_total:.4f}s")
 
-    # 코너별 Z 변위 (단위: m → mm 변환, t0 기준 상대 변위)
-    # CSV 코너 순서: C5, C6, C7, C8 → 내부 index 0,1,2,3
+    # 코너별 X, Y, Z 변위 (단위: m → mm 변환, t0 기준 상대 변위)
     CORNER_NAMES = ['C5', 'C6', 'C7', 'C8']
-    corner_dz = {}   # {name: ndarray (N_frames,)} in mm
+    corner_disp = {cn: {} for cn in CORNER_NAMES}   # {name: {axis: ndarray}}
     for cn in CORNER_NAMES:
-        z_col = f'{cn}_pos_Z'
-        z_mm  = df[z_col].to_numpy(dtype=float) * 1000.0   # m → mm
-        z_ref = z_mm[0]                                      # t0 기준값
-        corner_dz[cn] = z_mm - z_ref                         # 상대 변위
+        for ax in ['X', 'Y', 'Z']:
+            col = f'{cn}_pos_{ax}'
+            vals_mm = df[col].to_numpy(dtype=float) * 1000.0
+            corner_disp[cn][ax] = vals_mm - vals_mm[0]
 
-    # 최대 절댓값 확인
+    # 최대 절댓값 확인 (Z축 기준)
     for cn in CORNER_NAMES:
-        peak = np.max(np.abs(corner_dz[cn]))
-        print(f"     {cn} Tz 최대 변위: {peak:.3f} mm")
+        peak_z = np.max(np.abs(corner_disp[cn]['Z']))
+        print(f"     {cn} Tz 최대 변위: {peak_z:.3f} mm")
 
     # ── [2] 메시 생성 (run_topo 와 동일 파라미터) ────────────────────────────
     print(f"\n [2] 메시 생성...")
@@ -250,20 +249,16 @@ def run_pos_dynamic(args):
 
     load_groups = []
 
-    # 3-2-1 최소 구속 (전체 강체 이동 방지)
-    # 첫 번째 코너(C5)의 노드 하나: X, Y 고정
-    # 두 번째 코너(C6)의 노드 하나: Y 고정
-    model.apply_spc(bot_groups[0][1][0], dofs=(0, 1))
-    model.apply_spc(bot_groups[1][1][0], dofs=(1,))
-
     for i, (cn, (_, corner_nids)) in enumerate(zip(CORNER_NAMES, bot_groups)):
-        lg = _InterpLoadGroup(
-            node_ids = corner_nids,
-            dof      = 2,                     # Tz
-            time_arr = time_arr,
-            disp_arr = corner_dz[cn],
-        )
-        load_groups.append(lg)
+        # X, Y, Z (dof 0, 1, 2) 모두에 대해 SPCD 적용
+        for dof_idx, ax in enumerate(['X', 'Y', 'Z']):
+            lg = _InterpLoadGroup(
+                node_ids = corner_nids,
+                dof      = dof_idx,           # 0=Tx, 1=Ty, 2=Tz
+                time_arr = time_arr,
+                disp_arr = corner_disp[cn][ax],
+            )
+            load_groups.append(lg)
 
     # ── [5] 동해석 실행 ───────────────────────────────────────────────────────
     DT     = getattr(args, 'dt', 1e-4)         # 적분 스텝 (s)
@@ -484,6 +479,9 @@ def main():
 
     8. 배치 프로세스 (GUI 없이 최적화만 수행 후 종료):
        python wht_topo/run_topo.py --iters 50 --no-gui --no-viz --export final_bead_pattern.k
+
+    9. 실측 위치 데이터(CSV) 기반 동적 응답 해석 (최적화 생략):
+       python wht_topo/run_topo.py --pos-data wht_topo/sample_pos.csv --dt 2e-4
     ------------------------------------------------------------------------------------------------
 
     ■ 전체 옵션 레퍼런스
@@ -518,6 +516,12 @@ def main():
       --no-viz            최적화 완료 후 최종 3D 시각화 생략
       --export PATH       최종 결과 파일 저장 경로 LS-DYNA .k (기본: industrial_bead.k)
       --mesh-size F       BC 탐색 기준 메시 크기 mm (기본: 10.0)
+    
+    [동적 응답 해석 (CSV 기반)]
+      --pos-data PATH     CSV 위치 데이터 파일 경로 (지정 시 최적화 생략)
+      --dt F              적분 시간 스텝 (s, 기본: 1e-4)
+      --zeta F            감쇠비 (기본: 0.02)
+      --corner-r F        코너 노드 탐색 반경 (mm, 기본: 150.0)
     ─────────────────────────────────────────────────────────────────────────────
     """
     parser = argparse.ArgumentParser(
