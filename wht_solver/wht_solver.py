@@ -391,18 +391,24 @@ class WHTSolver:
         return results
 
     def _assemble_K_scipy(
-        self, 
-        jm, 
-        sorted_nids: List[int], 
+        self,
+        jm,
+        sorted_nids: List[int],
         nid_to_idx: Dict[int, int],
-        stabilize: bool = True
+        stabilize: bool = True,
+        include_beams: bool = True,
+        include_rbe3: bool = True,
     ) -> "csr_matrix":
-        """Unified stiffness assembly (JaxSSO + MITC4 + MITC3)."""
+        """Unified stiffness assembly (JaxSSO + MITC4 + MITC3).
+
+        include_beams=False: shell-only K (Rayleigh 감쇠 기준 계산용).
+        """
         from JaxSSO import assemblemodel
         from scipy.sparse import csr_matrix, diags
 
         ndof = jm.ndof
-        if self._has_jaxsso_elements():
+        has_jaxsso = include_beams and (self._has_jaxsso_elements() or (jm.n_beamcol > 0))
+        if has_jaxsso:
             K_raw = assemblemodel.model_K(jm)
             # Robust conversion from JAX BCOO or Scipy COO to Scipy CSR
             if hasattr(K_raw, 'indices') and hasattr(K_raw, 'data'):
@@ -445,6 +451,50 @@ class WHTSolver:
                     # Add stronger spring stiffness to floating DOFs ONLY
                     penalty_val = k_max * 1e-4
                     K_out = K_out + diags([bad_dofs.astype(float) * penalty_val], [0])
+        # [WHT] RBE3 Penalty Stiffness (Weighted Interpolation)
+        # For partitioning solvers (JAX/Dynamic), RBE3 must be handled as penalty springs.
+        if include_rbe3 and hasattr(self.model, 'rbe3s') and self.model.rbe3s:
+            k_diag = K_out.diagonal()
+            k_max = np.abs(k_diag).max() if k_diag.size > 0 else 1e5
+            penalty = k_max * 1e7
+            
+            p_rows, p_cols, p_vals = [], [], []
+            for rbe3 in self.model.rbe3s.values():
+                m_idx = nid_to_idx.get(rbe3.master_nid)
+                if m_idx is None: continue
+                
+                weights = rbe3.weights if rbe3.weights else [1.0] * len(rbe3.slave_nids)
+                w_sum = sum(weights)
+                if abs(w_sum) < 1e-12: w_sum = 1.0
+                
+                for d in rbe3.dofs:
+                    # Eq: u_m - sum(ci * u_si) = 0  =>  E = 0.5 * k * (u_m - sum(ci * u_si))^2
+                    m_dof = m_idx * 6 + d
+                    p_rows.append(m_dof); p_cols.append(m_dof); p_vals.append(penalty)
+                    
+                    s_indices, coeffs = [], []
+                    for s_nid, w in zip(rbe3.slave_nids, weights):
+                        s_idx = nid_to_idx.get(s_nid)
+                        if s_idx is None: continue
+                        c_i = w / w_sum
+                        s_dof = s_idx * 6 + d
+                        s_indices.append(s_dof)
+                        coeffs.append(c_i)
+                        
+                        # Coupling terms
+                        p_rows.append(m_dof); p_cols.append(s_dof); p_vals.append(-penalty * c_i)
+                        p_rows.append(s_dof); p_cols.append(m_dof); p_vals.append(-penalty * c_i)
+                    
+                    # Self-coupling of slaves
+                    for i, si in enumerate(s_indices):
+                        ci = coeffs[i]
+                        for j, sj in enumerate(s_indices):
+                            cj = coeffs[j]
+                            p_rows.append(si); p_cols.append(sj); p_vals.append(penalty * ci * cj)
+            
+            if p_vals:
+                K_out = K_out + csr_matrix((p_vals, (p_rows, p_cols)), shape=(ndof, ndof))
+
         return K_out.tocsr()
 
     def get_k_func_args(self) -> dict:
@@ -541,10 +591,8 @@ class WHTSolver:
             pid  = elem.pid
             # ... (rest of beam assembly continues safely)
 
-        # RBE2 → Lagrange MPC (NOT stiff beams - handled in _augment_K_scipy)
-        # NOTE: _add_rbe2_beams is intentionally NOT called here to prevent
-        #       double-counting with the Lagrange MPC implementation.
-        # self._add_rbe2_beams(jm, nid_to_idx)  # DISABLED
+        # RBE2 → Stiff Beam conversion for dynamic/modal stability
+        self._add_rbe2_beams(jm, nid_to_idx)
 
         # Loads from load case
         if load_case is not None:

@@ -2,13 +2,13 @@
 """
 [WHT_LightChassisModel] Exam 4: Implicit Dynamic Analysis (Direct Newmark-beta)
 ================================================================================
-4-코너 staggered half-sine SPCD -> 직접 동해석 -> WHTVisualizer + ParaView.
+4-코너 실측 CSV 데이터 기반 동해석 (Nodal BC 방식).
 
 설계:
-  - 하단 4코너: 코너 중심에 RBE2 마스터 노드 생성, 주변 슬레이브 묶음
-    -> 마스터 Tz에 SPCD (half-sine, 10mm)
-  - 상단 플랜지 4코너: SPC 고정 (4개 클러스터만)
-  - _assemble_K_scipy 수정으로 RBE2 stiff beam이 K에 포함됨
+  - 하단 4코너 노드 그룹에 직접 SPCD 인가 (Nodal BC)
+  - 회전 자유도(Rx, Ry, Rz)는 자유(Free) 상태 유지
+  - 수평 드리프트 방지를 위한 최소 구속(SPC) 적용
+  - CSV 데이터 로드 시 t0 기준 상대 변위로 변환
 
 단위계: MPa, ton, mm -> N, s
 """
@@ -77,24 +77,39 @@ class _InterpLoadGroup:
 def find_corner_nodes(node_db: dict, width: float, length: float,
                       radius: float, z_min: float, z_max: float) -> list:
     """
-    4 코너 (+-W/2, +-L/2) 기준으로 반경 내 + z 범위 노드 그룹 반환.
-    순서: (-X,-Y), (+X,-Y), (+X,+Y), (-X,+Y)
-    반환: [(center_xy, [nid, ...]), ...]
+    4 코너 기준으로 반경 내 + z 범위 노드 그룹 반환.
+    순서: C5(+X,+Y), C6(+X,-Y), C7(-X,-Y), C8(-X,+Y)
+    반환: [((cx, cy), [nid, ...]), ...]
     """
-    hw, hl = width / 2.0, length / 2.0
-    targets = [(-hw, -hl), (hw, -hl), (hw, hl), (-hw, hl)]
+    all_xyz = np.array([v for v in node_db.values()])
+    mask_z  = (all_xyz[:, 2] >= z_min) & (all_xyz[:, 2] <= z_max)
+    xyz_z   = all_xyz[mask_z]
+
+    if len(xyz_z) == 0:
+        raise RuntimeError(f"z=[{z_min},{z_max}]mm 범위 내 노드가 없습니다.")
+
+    x_min, x_max = xyz_z[:, 0].min(), xyz_z[:, 0].max()
+    y_min, y_max = xyz_z[:, 1].min(), xyz_z[:, 1].max()
+    print(f"     [Mesh Info] detected X=[{x_min:.1f}, {x_max:.1f}], Y=[{y_min:.1f}, {y_max:.1f}]")
+
+    targets = [
+        (x_max, y_max),  # C5: +X, +Y
+        (x_max, y_min),  # C6: +X, -Y
+        (x_min, y_min),  # C7: -X, -Y
+        (x_min, y_max),  # C8: -X, +Y
+    ]
+
+    nid_arr = np.array(list(node_db.keys()))
+    xyz_arr = np.array(list(node_db.values()))
+
     groups = []
     for cx, cy in targets:
-        nids = [
-            nid for nid, xyz in node_db.items()
-            if z_min <= xyz[2] <= z_max
-            and (xyz[0] - cx) ** 2 + (xyz[1] - cy) ** 2 < radius ** 2
-        ]
+        in_z   = (xyz_arr[:, 2] >= z_min) & (xyz_arr[:, 2] <= z_max)
+        in_r   = (xyz_arr[:, 0] - cx) ** 2 + (xyz_arr[:, 1] - cy) ** 2 < radius ** 2
+        mask   = in_z & in_r
+        nids   = nid_arr[mask].tolist()
         if not nids:
-            raise RuntimeError(
-                f"코너 ({cx:.0f},{cy:.0f}) 반경 {radius:.0f}mm / "
-                f"z=[{z_min},{z_max}]mm 내 노드 없음."
-            )
+            raise RuntimeError(f"코너 ({cx:.0f},{cy:.0f}) 반경 {radius:.0f}mm 내 노드 없음.")
         groups.append(((cx, cy), nids))
     return groups
 
@@ -115,8 +130,18 @@ def run(args):
         print(f" [0] CSV 로드: {csv_path}")
         csv_df = pd.read_csv(csv_path, encoding='utf-8')
         
-        time_arr = csv_df['Time'].to_numpy(dtype=float)
-        t_total_val = float(time_arr[-1])
+        # [NEW] t-start filtering
+        t_start_limit = getattr(args, 't_start', 0.0)
+        if t_start_limit > 0:
+            csv_df = csv_df[csv_df['Time'] >= t_start_limit].copy()
+            if csv_df.empty:
+                raise ValueError(f"CSV에 {t_start_limit}s 이후의 데이터가 없습니다.")
+            print(f"     [Filter] t >= {t_start_limit}s 적용 (시작점: {csv_df['Time'].iloc[0]:.4f}s)")
+
+        time_arr_raw = csv_df['Time'].to_numpy(dtype=float)
+        t_total_val = float(time_arr_raw[-1] - time_arr_raw[0])
+        time_arr = time_arr_raw - time_arr_raw[0] # Shift to 0 for solver
+        
         n_save_val = 100  # CSV 사용 시 100프레임 고정
         print(f"     프레임: {len(time_arr)}, 총 시간: {t_total_val:.4f}s")
 
@@ -159,30 +184,76 @@ def run(args):
     load_groups = []
 
     if csv_df is not None:
-        # CSV 모드
+        enforce_axes = getattr(args, 'enforce_axes', 'Z').upper()
+        axis_map = {'X': 0, 'Y': 1, 'Z': 2}
+        axes_to_apply = [axis_map[a] for a in enforce_axes if a in axis_map]
+        if not axes_to_apply: axes_to_apply = [2]
+        
         CORNER_MAP = {
-            2: 'C5', # (+X,+Y)
+            0: 'C5', # (+X,+Y)
             1: 'C6', # (+X,-Y)
-            0: 'C7', # (-X,-Y)
+            2: 'C7', # (-X,-Y)
             3: 'C8', # (-X,+Y)
         }
-        time_arr = csv_df['Time'].to_numpy(dtype=float)
-        
+        print(f" [3] CSV 기반 SPCD 하중 구성 ({enforce_axes} 적용, Rotations Free)")
+
+        # [Rigid XY Mode] X, Y에 대해 모든 코너의 평균 변위를 계산하여 강체 이동만 허용
+        mean_rel = {}
+        if getattr(args, 'rigid_xy', False):
+            for ax in ['X', 'Y']:
+                cols = [f'C{i}_pos_{ax}' for i in range(5, 9)]
+                vals = []
+                for c in cols:
+                    if c in csv_df.columns:
+                        v = csv_df[c].to_numpy(dtype=float) * 1000.0
+                        vals.append(v - v[0])
+                if vals:
+                    mean_rel[ax] = np.mean(vals, axis=0)
+
         for idx, (_, corner_nids) in enumerate(bot_groups):
             cn_label = CORNER_MAP[idx]
-            for axis_idx, ax in enumerate(['X', 'Y', 'Z']):
-                col = f'{cn_label}_pos_{ax}'
-                vals_mm = csv_df[col].to_numpy(dtype=float) * 1000.0
-                vals_rel = vals_mm - vals_mm[0]
+            
+            pts = np.array([model.nodes[nid].coords() for nid in corner_nids])
+            center = np.mean(pts, axis=0)
+            
+            master_nid = 900000 + idx
+            model.add_node(master_nid, center[0], center[1], center[2])
+            
+            rbe3_id = 900000 + idx
+            model.add_rbe3(rbe3_id, master_nid, corner_nids, dofs=(0, 1, 2))
+            
+            for dof_idx in axes_to_apply:
+                ax_name = ['X', 'Y', 'Z'][dof_idx]
+                
+                # Rigid XY가 활성화된 경우 X, Y는 평균값 적용
+                if getattr(args, 'rigid_xy', False) and ax_name in ['X', 'Y'] and ax_name in mean_rel:
+                    vals_rel = mean_rel[ax_name]
+                    ref_t0 = 0.0 # 평균값이므로 특정 코너 기준값은 생략
+                else:
+                    col = f'{cn_label}_pos_{ax_name}'
+                    vals_mm = csv_df[col].to_numpy(dtype=float) * 1000.0
+                    vals_rel = vals_mm - vals_mm[0]
+                    ref_t0 = vals_mm[0]
                 
                 lg = _InterpLoadGroup(
-                    node_ids = corner_nids,
-                    dof      = axis_idx, # 0=Tx, 1=Ty, 2=Tz
+                    node_ids = [master_nid],
+                    dof      = dof_idx,
                     time_arr = time_arr,
                     disp_arr = vals_rel
                 )
                 load_groups.append(lg)
-        print(f" [3] CSV 기반 XYZ SPCD 하중 구성 완료 (4개 코너)")
+                if dof_idx == 2: # Z축에 대해서만 출력 (너무 많아지는 것 방지)
+                    print(f"    - [RBE3/SPCD] Master Node={master_nid}, Corner={cn_label}, DOF={ax_name}: Ref t0={ref_t0:.4f} mm.")
+        
+        # Stability SPC (for CSV mode)
+        if 0 not in axes_to_apply or 1 not in axes_to_apply:
+            stab_nid = bot_groups[0][1][0]
+            stab_dofs = []
+            if 0 not in axes_to_apply: stab_dofs.append(0)
+            if 1 not in axes_to_apply: stab_dofs.append(1)
+            if stab_dofs:
+                model.apply_spc(stab_nid, dofs=tuple(stab_dofs), value=0.0)
+                print(f"     [Stability] Node {stab_nid}에 수평 구속 {tuple(stab_dofs)} 적용")
     else:
         # 기존 Half-sine 모드
         for i, ((cx, cy), slave_nids) in enumerate(bot_groups):
@@ -210,6 +281,7 @@ def run(args):
         T           = t_total_val,
         damping     = damping,
         n_save      = n_save_val,
+        method      = getattr(args, 'solver_method', 'scipy'),
     )
     print(f"\n     {dyn.summary()}")
 
@@ -252,9 +324,30 @@ def run(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Exam 4: Dynamic Analysis with SPCD")
+    parser = argparse.ArgumentParser(
+        description="Exam 4: Dynamic Analysis with SPCD (Nodal BC)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+[실행 예제]
+  1. CSV 실측 데이터 기반 해석 (기본 솔버):
+     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.3 --enforce-axes XYZ --rigid-xy
+
+  2. JAX 가속 솔버 사용:
+     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.3 --solver-method jax  --enforce-axes XYZ --rigid-xy
+
+  3. 특정 축(Z)만 강제 변위 적용:
+     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.3 --enforce-axes Z
+
+  4. X-Y 강체 모드 유지 (XYZ 적용 시 추천):
+     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.3 --enforce-axes XYZ --rigid-xy
+        """
+    )
     parser.add_argument("--pos-data", type=str, help="CSV position data file path")
     parser.add_argument("--dt", type=float, help="Time step (s)")
+    parser.add_argument("--enforce-axes", type=str, default="Z", help="Enforced axes (e.g. Z, XYZ)")
+    parser.add_argument("--rigid-xy", action="store_true", help="Apply mean X-Y displacement to avoid stretching")
+    parser.add_argument("--t-start", type=float, default=0.0, help="Start time for CSV data analysis")
+    parser.add_argument("--solver-method", type=str, default="scipy", choices=["scipy", "jax"], help="Solver method")
     parser.add_argument("--no-viz", action="store_true", help="Skip visualization")
     
     args = parser.parse_args()

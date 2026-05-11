@@ -218,12 +218,13 @@ class DynamicResult:
         if self.stress_data is None:
             return cell_data
 
-        # M_mesh: 메시의 전체 셀 수(쉘 + 빔 등 포함)
+        # M_mesh: 메시의 전체 셀 수(쉘 + 빔 + RBE 가상 라인 등 포함)
         M_mesh = None
         if mesh_model is not None:
             M_mesh = len(mesh_model.elements)
-            if hasattr(mesh_model, 'rbe2s') and mesh_model.rbe2s:
-                M_mesh += len(mesh_model.rbe2s)  # RBE2 → 빔 셀 포함
+            # RBE2/RBE3는 각 Slave Node마다 가상 라인 요소를 생성함 (wht_mesh_model.py 참조)
+            for rbe in list(mesh_model.rbe2s.values()) + list(mesh_model.rbe3s.values()):
+                M_mesh += len(rbe.slave_nids)
 
         for key, arr in self.stress_data.items():
             # arr.shape: (T, M_elem, 6) 또는 (T, M_elem)

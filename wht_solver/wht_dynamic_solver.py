@@ -16,12 +16,23 @@ WHTSolver를 상속하여 기존 K/M 조립, BC 처리, 결과 포맷을 그대�
   (K_free = K[unknown_id, :][:, unknown_id] — solve_modal과 동일 방식)
 """
 
-from __future__ import annotations
+import os
+# Force single-threading for BLAS/LAPACK to prevent threading crashes on Windows
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+import jax
+import jax.numpy as jnp
+# High precision for structural dynamics
+jax.config.update("jax_enable_x64", True)
 
 import time
-from typing import List, Optional
-
+from typing import List, Optional, Dict, TYPE_CHECKING
 import numpy as np
+from scipy.sparse import diags, csr_matrix
+from scipy.sparse.linalg import splu
+from tqdm import tqdm
 
 from .wht_solver import WHTSolver
 from .load_cases import WHTLoadCase, WHTForceEntry
@@ -215,6 +226,8 @@ class WHTDynamicSolver(WHTSolver):
         n_save: int = 100,
         newmark_beta: float = 0.25,
         newmark_gamma: float = 0.5,
+        verbose: bool = True,
+        method: str = 'scipy',
     ) -> DynamicResult:
         """
         직접 Newmark-β 암시적 동해석 (전체 DOF).
@@ -232,16 +245,20 @@ class WHTDynamicSolver(WHTSolver):
         n_save       : 저장할 시점 수
         newmark_beta : Newmark β (0.25 = CAA)
         newmark_gamma: Newmark γ (0.5 = 수치 감쇠 없음)
+        verbose      : 출력 여부
+        method       : 'scipy'(직접 해석) 또는 'jax'(JAX 가속)
 
         Returns
         -------
         DynamicResult
         """
-        from scipy.sparse import diags
-        from scipy.sparse.linalg import splu
-
         if damping is None:
             damping = DampingSpec(mode="zeta", zeta=0.02)
+
+        if method.lower() == 'jax':
+            return self._solve_direct_dynamic_jax(
+                T, dt, load_groups, damping, newmark_beta, newmark_gamma, n_save, verbose
+            )
 
         print(f"\n{'='*60}", flush=True)
         print(f" [Direct Dynamic] dt={dt:.2e}s  T={T:.2e}s", flush=True)
@@ -254,9 +271,9 @@ class WHTDynamicSolver(WHTSolver):
         n_nodes = len(sorted_nids)
         # Full K (shell + RBE2 stiff beams via JaxSSO)
         K       = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
-        # Shell-only K: Rayleigh 감쇠 기준 주파수 계산용 (RBE2 beam 제외)
+        # Shell-only K: Rayleigh 감쇠 기준 주파수 계산용 (RBE2 beam, RBE3 penalty 제외)
         K_struct = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx,
-                                          stabilize=True, include_beams=False)
+                                          stabilize=True, include_beams=False, include_rbe3=False)
 
         M_diag  = self._assemble_lumped_mass(jm, ndof, sorted_nids, nid_to_idx)
         
@@ -343,6 +360,9 @@ class WHTDynamicSolver(WHTSolver):
             udd_s = np.array([spcd_map[d].udd_value(t_cur) for d in spcd_id])
             return u_s, ud_s, udd_s
 
+        print(f"    - [Time Loop] Integrating {n_steps} steps...")
+        pbar = tqdm(total=n_steps, desc="      Dynamic Solve", unit="step", leave=True)
+        
         for step in range(n_steps + 1):
             t_cur = step * dt
 
@@ -390,6 +410,9 @@ class WHTDynamicSolver(WHTSolver):
                 u_saved.append(u_vec.reshape(n_nodes, 6))
                 v_saved.append(v_vec.reshape(n_nodes, 6))
                 a_saved.append(a_vec.reshape(n_nodes, 6))
+            
+            pbar.update(1)
+        pbar.close()
 
         result = DynamicResult(np.array(t_saved), sorted_nids)
         result.u           = np.array(u_saved)
@@ -403,7 +426,228 @@ class WHTDynamicSolver(WHTSolver):
         print(f" -> Done in {time.time()-t_wall:.1f}s | {result.summary()}", flush=True)
         return result
 
-    # ─────────────────────────────────────────────────────────────────────────
+    def _solve_direct_dynamic_jax(
+        self,
+        T: float,
+        dt: float,
+        load_groups: List[DynamicLoadGroup],
+        damping: DampingSpec,
+        newmark_beta: float = 0.25,
+        newmark_gamma: float = 0.5,
+        n_save: int = 100,
+        verbose: bool = True,
+    ) -> DynamicResult:
+        """JAX-Accelerated Direct Dynamic Solve."""
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import sparse
+        from jax.scipy.sparse.linalg import cg
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f" [Direct Dynamic (JAX)] dt={dt:.2e}s  T={T:.2e}s")
+            print(f"{'='*60}")
+            print(f"    - [JAX] [1/5] Preparing model & assembling K/M matrices...", end="", flush=True)
+            t_prep = time.time()
+
+        # ── 1. 준비 ─────────────────────────────────────────────────────────
+        jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
+        ndof    = jm.ndof
+        n_nodes = len(sorted_nids)
+        K       = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
+        K_struct = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, 
+                                          stabilize=True, include_beams=False, include_rbe3=False)
+        M_diag  = self._assemble_lumped_mass(jm, ndof, sorted_nids, nid_to_idx)
+        
+        free_id = np.array(jm.unknown_id, dtype=np.int32)
+        n_free  = len(free_id)
+        
+        # SPCD
+        spcd_map = {}
+        for lg in load_groups:
+            if lg.load_type == "SPCD":
+                for nid in lg.node_ids:
+                    dof_gid = nid_to_idx[nid] * 6 + lg.dof
+                    spcd_map[dof_gid] = lg
+        spcd_id = np.array(sorted(spcd_map.keys()), dtype=np.int32)
+        n_spcd  = len(spcd_id)
+
+        if verbose:
+            print(f" Done ({time.time()-t_prep:.2f}s)")
+            print(f"    - [JAX] [2/5] Converting to JAX Sparse (BCOO)...", end="", flush=True)
+            t_conv_sparse = time.time()
+
+        # ── 2. JAX Sparse & Dense 변환 ───────────────────────────────────────
+        def to_jax_dense(scipy_mat):
+            return jnp.array(scipy_mat.toarray(), dtype=jnp.float64)
+
+        def to_jax_sparse(scipy_mat):
+            coo = scipy_mat.tocoo()
+            indices = jnp.stack([jnp.array(coo.row, dtype=jnp.int32), 
+                                 jnp.array(coo.col, dtype=jnp.int32)], axis=1)
+            return sparse.BCOO((jnp.array(coo.data, dtype=jnp.float64), indices), shape=coo.shape)
+
+        # 시스템 행렬 구성
+        # K_eff는 밀집 행렬로 변환하여 LU 분해 (안정성)
+        # 10,000 DOF까지는 Dense LU가 CPU/GPU에서 더 안정적임 (특히 Penalty RBE3 사용 시)
+        is_dense = (n_free < 10000)
+        
+        K_ff_jax_dense = to_jax_dense(K[free_id, :][:, free_id]) if is_dense else None
+        K_ff_jax_sparse = to_jax_sparse(K[free_id, :][:, free_id])
+        
+        K_struct_ff_sparse = to_jax_sparse(K_struct[free_id, :][:, free_id])
+        M_f  = jnp.array(M_diag[free_id], dtype=jnp.float64)
+        
+        alpha, beta_r = self._rayleigh_coeffs(damping, K_struct[free_id, :][:, free_id].tocsr(), M_diag[free_id])
+        alpha = float(alpha)
+        beta_r = float(beta_r)
+        
+        # C_ff = alpha*M + beta*K_struct (항상 Sparse로 유지하여 연산 속도 확보)
+        diag_indices = jnp.stack([jnp.arange(n_free, dtype=jnp.int32), 
+                                  jnp.arange(n_free, dtype=jnp.int32)], axis=1)
+        M_sparse = sparse.BCOO((M_f, diag_indices), shape=(n_free, n_free))
+        C_ff = alpha * M_sparse + beta_r * K_struct_ff_sparse
+        
+        raw_nc = newmark_coeffs(newmark_beta, newmark_gamma, dt)
+        nc = {k: jnp.array(v, dtype=jnp.float64) for k, v in raw_nc.items()}
+        
+        if is_dense:
+            # K_eff_ff (Dense) = K_ff + a0*M + a1*C
+            K_eff_ff = K_ff_jax_dense + nc["a0"] * jnp.diag(M_f) + nc["a1"] * C_ff.todense()
+        else:
+            K_eff_ff = K_ff_jax_sparse + nc["a0"] * M_sparse + nc["a1"] * C_ff
+        
+        K_fs_full = to_jax_sparse(K[free_id, :][:, spcd_id]) if n_spcd else None
+        K_fs_struct = to_jax_sparse(K_struct[free_id, :][:, spcd_id]) if n_spcd else None
+
+        if verbose:
+            print(f" Done ({time.time()-t_conv_sparse:.2f}s)")
+            print(f"    - [JAX] [3/5] Pre-calculating SPCD trajectories...", end="", flush=True)
+            t_traj = time.time()
+
+        # ── 3. 시간 적분 루프 정의 (JIT) ──────────────────────────────────────
+        n_steps = int(np.ceil(T / dt))
+        save_every = max(1, n_steps // n_save)
+        save_idxs = list(range(0, n_steps + 1, save_every))
+        if save_idxs[-1] != n_steps:
+            save_idxs.append(n_steps)
+        
+        # Pre-calculate SPCD trajectories
+        times = jnp.linspace(0, n_steps * dt, n_steps + 1, dtype=jnp.float64)
+        u_s_all   = jnp.zeros((n_steps + 1, n_spcd), dtype=jnp.float64)
+        
+        for i, gid in enumerate(spcd_id):
+            lg = spcd_map[gid]
+            # _InterpLoadGroup uses _t, _u internally
+            t_data = getattr(lg, '_t', getattr(lg, 'time_arr', None))
+            u_data = getattr(lg, '_u', getattr(lg, 'disp_arr', None))
+            if t_data is not None and u_data is not None:
+                u_s_all = u_s_all.at[:, i].set(jnp.interp(times, jnp.array(t_data), jnp.array(u_data)))
+        
+        # Calculate velocity and acceleration from displacement
+        ud_s_all  = jnp.gradient(u_s_all, dt, axis=0)
+        udd_s_all = jnp.gradient(ud_s_all, dt, axis=0)
+        
+        f_f_all = jnp.zeros((n_steps + 1, n_free), dtype=jnp.float64)
+
+        # Jacobi preconditioner for CG (only for sparse)
+        if not is_dense:
+            diag_K_eff = K_eff_ff.todense().diagonal() 
+            inv_diag = jnp.array(1.0, dtype=jnp.float64) / jnp.where(jnp.abs(diag_K_eff) > 1e-12, diag_K_eff, jnp.array(1.0, dtype=jnp.float64))
+        else:
+            inv_diag = None
+
+        # Robust solve: Use dense direct solver with pre-factoring for medium sizes
+        if is_dense:
+            from jax.scipy.linalg import lu_factor, lu_solve
+            K_eff_lu = lu_factor(K_eff_ff)
+        else:
+            K_eff_lu = None
+
+        def step_fn(state, carry_in):
+            u_f, ud_f, udd_f = state
+            idx, u_s, ud_s, udd_s, f_f = carry_in
+            
+            f_eff = f_f + M_f * (nc["a0"]*u_f + nc["a2"]*ud_f + nc["a3"]*udd_f)
+            f_eff = f_eff + C_ff @ (nc["a1"]*u_f + nc["a4"]*ud_f + nc["a5"]*udd_f)
+            
+            if n_spcd:
+                f_eff -= K_fs_full @ u_s
+                f_eff -= (beta_r * K_fs_struct) @ ud_s
+            
+            # Robust solve
+            if is_dense:
+                u_f_new = lu_solve(K_eff_lu, f_eff)
+            else:
+                from jax.scipy.sparse.linalg import cg
+                u_f_new, _ = cg(lambda x: K_eff_ff @ x, f_eff, x0=u_f, tol=1e-8, maxiter=2000, M=lambda x: inv_diag * x)
+            
+            udd_f_new = nc["a0"]*(u_f_new - u_f) - nc["a2"]*ud_f - nc["a3"]*udd_f
+            ud_f_new  = ud_f + dt * ((1.0 - newmark_gamma)*udd_f + newmark_gamma*udd_f_new)
+            
+            new_state = (u_f_new, ud_f_new, udd_f_new)
+            return new_state, (u_f_new, ud_f_new, udd_f_new, u_s, udd_s)
+
+        init_state = (jnp.zeros(n_free, dtype=jnp.float64), 
+                      jnp.zeros(n_free, dtype=jnp.float64), 
+                      jnp.zeros(n_free, dtype=jnp.float64))
+        inputs = (jnp.arange(n_steps+1, dtype=jnp.int32), 
+                  jnp.array(u_s_all, dtype=jnp.float64), 
+                  jnp.array(ud_s_all, dtype=jnp.float64), 
+                  jnp.array(udd_s_all, dtype=jnp.float64), 
+                  jnp.array(f_f_all, dtype=jnp.float64))
+
+        if verbose:
+            print(f" Done ({time.time()-t_traj:.2f}s)")
+            print(f"    - [JAX] [4/5] JIT compiling & Time Integration ({n_steps} steps)...", flush=True)
+            t0 = time.time()
+        
+        # ── 4. 실행 ──────────────────────────────────────────────────────────
+        _, (u_f_hist, v_f_hist, a_f_hist, u_s_hist, a_s_hist) = jax.lax.scan(step_fn, init_state, inputs)
+        
+        if verbose:
+            print(f"    - [JAX] Time Integration Finished ({time.time()-t0:.2f}s)")
+            print(f"    - [JAX] [5/5] Sub-sampling & Converting to Numpy...", end="", flush=True)
+            t_conv = time.time()
+
+        # Sub-sampling using JAX indexing before converting to Numpy
+        idxs = jnp.array(save_idxs, dtype=jnp.int32)
+        u_f_hist_np = np.array(u_f_hist[idxs])
+        v_f_hist_np = np.array(v_f_hist[idxs])
+        a_f_hist_np = np.array(a_f_hist[idxs])
+        if n_spcd:
+            u_s_hist_np = np.array(u_s_hist[idxs])
+            a_s_hist_np = np.array(a_s_hist[idxs])
+        
+        u_saved = []
+        v_saved = []
+        a_saved = []
+        
+        for i, si in enumerate(save_idxs):
+            u_vec = np.zeros(ndof)
+            v_vec = np.zeros(ndof)
+            a_vec = np.zeros(ndof)
+            u_vec[free_id] = u_f_hist_np[i]
+            v_vec[free_id] = v_f_hist_np[i]
+            a_vec[free_id] = a_f_hist_np[i]
+            if n_spcd:
+                u_vec[spcd_id] = u_s_hist_np[i]
+                a_vec[spcd_id] = a_s_hist_np[i]
+            u_saved.append(u_vec.reshape(n_nodes, 6))
+            v_saved.append(v_vec.reshape(n_nodes, 6))
+            a_saved.append(a_vec.reshape(n_nodes, 6))
+
+        if verbose:
+            print(f" Done ({time.time()-t_conv:.2f}s)")
+
+        res = DynamicResult(np.array(times)[save_idxs], sorted_nids)
+        res.u = np.array(u_saved)
+        res.v = np.array(v_saved)
+        res.a = np.array(a_saved)
+        res.solver_type = "jax_direct"
+        res.solver_info = dict(dt=dt, T=T, method="jax_cg", n_steps=n_steps)
+        return res
+
     # Public API — ESL 추출
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -552,6 +796,10 @@ class WHTDynamicSolver(WHTSolver):
             return np.sqrt(0.5 * (diff_sq + shear_sq))
 
         # 각 스텝 루프
+        if verbose:
+            print(f"    - [Stress History] [Final Step] Recovering {n_save} frames of stress/strain data...")
+        pbar = tqdm(total=n_save, desc="      Stress History", unit="frame", leave=False)
+        
         for ti in range(n_save):
             u_frame = dynamic_result.u[ti]   # (n_nodes, 6)
             quad = ElementStressRecovery.recover_quad4(self.model, u_frame, sorted_nids)
@@ -569,8 +817,9 @@ class WHTDynamicSolver(WHTSolver):
             if compute_vm_envelope and "Stress (Max Envelope)" in frame:
                 stress_data["Von Mises (Max Envelope)"][ti] = _von_mises(frame["Stress (Max Envelope)"]).astype(np.float32)
 
-            if verbose and (ti + 1) % max(1, n_save // 10) == 0:
-                print(f"    [{ti+1:4d}/{n_save}] ...", flush=True)
+            pbar.update(1)
+        
+        pbar.close()
 
         dynamic_result.stress_data = stress_data
         if verbose:
