@@ -463,73 +463,35 @@ def extract_dynamic_snapshots(model, node_db, csv_path, t_start,
             del model.nodes[nid]
     model.rbe3s = {k: v for k, v in model.rbe3s.items() if k < 900000}
 
-    # ── [8] K_base 조립 (원복된 모델 기준) ───────────────────────────────────
-    print(f"     -> K_base 조립 중...")
+    # ── [8] 노드 인덱스 구성 (코너 BC 처방에 필요) ──────────────────────────────
     static_solver = WHTSolver(model)
     jm_base, sorted_nids_orig, nid_to_idx_orig = static_solver._build_jaxsso_model(load_case=None)
-    K_base = static_solver._assemble_K_scipy(jm_base, sorted_nids_orig, nid_to_idx_orig,
-                                             stabilize=True)
-    ndof_orig = len(sorted_nids_orig) * 6
-    print(f"     -> K_base: {ndof_orig}×{ndof_orig}, nnz={K_base.nnz}")
 
-    # 코너 구속 DOF 집합 — ESL 힘 적용에서 제외
     stab_nid = bot_groups[0][1][0]
-    corner_bc_dofs: set = set()
-    for midx in range(4):
-        for cnid in bot_groups[midx][1]:
-            if cnid in nid_to_idx_orig:
-                corner_bc_dofs.add(nid_to_idx_orig[cnid] * 6 + 2)   # Z
-    if stab_nid in nid_to_idx_orig:
-        corner_bc_dofs.add(nid_to_idx_orig[stab_nid] * 6 + 0)       # X
-        corner_bc_dofs.add(nid_to_idx_orig[stab_nid] * 6 + 1)       # Y
 
-    # ── [9] 피크 시점별 ESL 하중 케이스 생성 ─────────────────────────────────
+    # ── [9] 피크 시점별 하중 케이스 생성 (코너 변위 BC 직접 처방) ─────────────
+    # ESL force(K·u)는 수치적 불안정성을 유발할 수 있으므로,
+    # 동해석 결과 코너 변위를 BC로 직접 처방하고 compliance = u^T·K·u로 계산.
     snapshots = []
     for pk, weight in sorted(peak_weight.items()):
         t_val  = float(res.t_saved[pk])
         u_snap = res.u[pk]   # (n_nodes_dyn, 6)
 
-        # 원복 모델 DOF 순서로 전체 변위 벡터 재구성
-        u_full = np.zeros(ndof_orig)
-        for nid in sorted_nids_orig:
-            dyn_idx = nid_to_idx_dyn.get(nid)
-            if dyn_idx is None:
-                continue
-            orig_idx = nid_to_idx_orig[nid]
-            u_full[orig_idx * 6: orig_idx * 6 + 6] = u_snap[dyn_idx, :]
-
-        # ESL: F = K_base · u_dynamic
-        F_esl = K_base @ u_full
-        f_thr = max(float(np.max(np.abs(F_esl))) * 1e-4, 1e-6)
-
         lc = WHTLoadCase(name=f"Dyn_{t_val:.4f}s")
 
-        # 코너 슬레이브 노드: Z 변위 BC
+        # 코너 슬레이브 노드: Z 변위 BC (동해석 결과 직접 처방)
+        n_bcs = 0
         for midx in range(4):
             for cnid in bot_groups[midx][1]:
-                if cnid in nid_to_idx_orig:
+                if cnid in nid_to_idx_orig and cnid in nid_to_idx_dyn:
                     val = float(u_snap[nid_to_idx_dyn[cnid], 2])
                     lc.add_bc([cnid], dofs=(2,), value=val)
+                    n_bcs += 1
         # 안정성 구속: X, Y
         lc.add_bc([stab_nid], dofs=(0, 1))
 
-        # 자유 노드: ESL 노달 하중 (코너 구속 DOF 제외, 노드별 일괄 적용)
-        n_forces = 0
-        for nid in sorted_nids_orig:
-            orig_idx = nid_to_idx_orig[nid]
-            f_node = F_esl[orig_idx * 6: orig_idx * 6 + 6].copy()
-            for d in range(6):
-                if (orig_idx * 6 + d) in corner_bc_dofs:
-                    f_node[d] = 0.0
-            active = [(d, float(f_node[d])) for d in range(6) if abs(f_node[d]) > f_thr]
-            if active:
-                dofs_t  = tuple(d for d, _ in active)
-                vals_t  = tuple(v for _, v in active)
-                lc.add_force([nid], dofs=dofs_t, values=vals_t)
-                n_forces += len(active)
-
         snapshots.append((lc, float(weight)))
-        print(f"     -> ESL Snapshot: t={t_val:.4f}s  weight={weight}  forces={n_forces}")
+        print(f"     -> Dyn Snapshot: t={t_val:.4f}s  weight={weight}  bcs={n_bcs}")
 
     print(f"     -> 총 {len(snapshots)}개 ESL 스냅샷 생성 완료.")
     return snapshots
