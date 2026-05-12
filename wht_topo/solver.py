@@ -312,9 +312,12 @@ class WHTopographySolver:
         List[int]
             설계 변수로 사용할 노드 ID 리스트
         """
-        flange_nids = set(self.load_manager.get_boundary_nodes(
-            mesh_size_z=self.mesh_size_z
-        ))
+        if self.load_manager is not None:
+            flange_nids = set(self.load_manager.get_boundary_nodes(
+                mesh_size_z=self.mesh_size_z
+            ))
+        else:
+            flange_nids = set()
 
         # 바닥면 노드 = Z가 최소에 가까운 노드
         all_z = [self.model.nodes[nid].z for nid in self.sorted_nids]
@@ -688,7 +691,12 @@ class WHTopographySolver:
                     if abs(fval) > 1e-12:
                         f_full[idx * 6 + d] += fval
 
-            C_i = float(np.dot(f_full, u_full))
+            if load_case.forces and not load_case.bcs:
+                # 순수 힘 주도 케이스: C = F · u  (equilibrium에서 u^T·K·u와 동일)
+                C_i = float(np.dot(f_full, u_full))
+            else:
+                # 변위 BC 포함 케이스(SPCD/ESL): C = u^T · K · u (항상 양수인 변형 에너지)
+                C_i = float(u_full @ (K_base @ u_full))
 
             result = WHTSolverResult("static", self.sorted_nids)
             result.displacement = displacement
@@ -834,8 +842,13 @@ class WHTopographySolver:
                 C_0 = float(C_total) if float(C_total) > 1e-6 else 1.0
 
             # ── 고유진동수 해석 (10차 모드) ──
-            modal_results = fea_solver.solve_modal(num_modes=10, exclude_rigid_body=False)
-            freqs = modal_results.frequencies  # Hz
+            try:
+                modal_results = fea_solver.solve_modal(num_modes=10, exclude_rigid_body=False)
+                freqs = modal_results.frequencies  # Hz
+            except Exception as e:
+                print(f"    [경고] 고유진동수 해석 실패 (Iter {i}): {e}")
+                modal_results = None
+                freqs = np.zeros(10)
 
             # ── 이터레이션 결과 저장 (ParaView 호환 VTKHDF) ──
             try:
