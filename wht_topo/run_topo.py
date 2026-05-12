@@ -153,6 +153,7 @@ def run_pos_dynamic(args):
         csv_path = Path.cwd() / csv_path   # CWD 기준 상대 경로
     print(f" [1] CSV 로드: {csv_path}")
     df = pd.read_csv(csv_path, encoding='utf-8')
+    df.columns = [c.replace('Chassis_', '') for c in df.columns]
 
     # 시간 축 (s)
     time_arr = df['Time'].to_numpy(dtype=float)          # shape (N_frames,)
@@ -358,6 +359,7 @@ def extract_dynamic_snapshots(model, node_db, csv_path, t_start,
 
     # ── [1] CSV 로드 ─────────────────────────────────────────────────────────
     df = pd.read_csv(csv_path, encoding='utf-8')
+    df.columns = [c.replace('Chassis_', '') for c in df.columns]
     df = df[df['Time'] >= t_start].reset_index(drop=True)
     time_arr = (df['Time'] - df['Time'].iloc[0]).to_numpy()
     dt = time_arr[1] - time_arr[0] if len(time_arr) > 1 else 1e-4
