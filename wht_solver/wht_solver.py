@@ -371,6 +371,7 @@ class WHTSolver:
         result.cell_data     = cell_data
         result._max_vm_diagnostic = max_vm 
         result._u_aug        = u_aug_np
+        result._f_aug        = f_aug
         result._ndof         = ndof
         
         # Explicit mapping to ensure no mismatch
