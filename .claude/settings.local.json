@@ -12,7 +12,12 @@
       "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -c \"import sys; open\\('.graphify_python', 'w'\\).write\\(sys.executable\\)\")",
       "Bash(C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe -c ' *)",
       "Bash(mkdir -p graphify-out)",
-      "Bash(rm -f .graphify_detect.json .graphify_extract.json .graphify_ast.json .graphify_semantic.json .graphify_analysis.json .graphify_labels.json .graphify_uncached.txt .graphify_python graphify-out/.graphify_chunk_*.json)"
+      "Bash(rm -f .graphify_detect.json .graphify_extract.json .graphify_ast.json .graphify_semantic.json .graphify_analysis.json .graphify_labels.json .graphify_uncached.txt .graphify_python graphify-out/.graphify_chunk_*.json)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe *)",
+      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -m py_compile D:/PythonCodeStudy/WHT_LightChassisModel/wht_topo/loads.py)",
+      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -m py_compile D:/PythonCodeStudy/WHT_LightChassisModel/wht_topo/run_topo.py)"
     ]
   }
 }

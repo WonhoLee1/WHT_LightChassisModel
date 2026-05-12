@@ -183,6 +183,161 @@ class ElementStressRecovery:
             kappa_xx, kappa_yy, kappa_xy,
         )
 
+
+    @staticmethod
+    def recover_quad4_nodal(
+        wht_model,
+        u_global_array: np.ndarray,
+        sorted_nids: list,
+    ) -> dict:
+        """
+        QUAD4 요소의 4개 코너 노드 위치에서 응력/변형률을 복원합니다.
+        반환 형태는 Dict[str, np.ndarray] 이며 값의 shape은 (M_total, 4, 6) 입니다.
+        """
+        nid_to_idx = {nid: i for i, nid in enumerate(sorted_nids)}
+        M_total = len(wht_model.elements)
+        eid_list, node_idx_list, E_list, nu_list, t_list, row_map = [], [], [], [], [], []
+
+        for i, eid in enumerate(sorted(wht_model.elements.keys())):
+            elem = wht_model.elements[eid]
+            is_obj = hasattr(elem, 'type')
+            etype = elem.type if is_obj else wht_model.element_types.get(eid, "QUAD4")
+            node_ids = elem.node_ids if is_obj else elem
+
+            if etype in ["QUAD", "QUAD4"] and len(node_ids) == 4:
+                eid_list.append(eid)
+                node_idx_list.append([nid_to_idx[n] for n in node_ids])
+                pid = getattr(elem, 'pid', 0) if hasattr(elem, 'pid') else 0
+                E, nu, t = 210000.0, 0.3, 1.0
+                if hasattr(wht_model, 'properties') and pid in wht_model.properties:
+                    prop = wht_model.properties[pid]
+                    t = getattr(prop, 't', 1.0)
+                    mid = getattr(prop, 'mid', 0)
+                    if hasattr(wht_model, 'materials') and mid in wht_model.materials:
+                        mat = wht_model.materials[mid]
+                        E = getattr(mat, 'E', 210000.0)
+                        nu = getattr(mat, 'nu', 0.3)
+                E_list.append(E)
+                nu_list.append(nu)
+                t_list.append(t)
+                row_map.append(i)
+
+        if not eid_list:
+            z = np.zeros((M_total, 4, 6))
+            return {k: z.copy() for k in [
+                "Stress", "Stress (Mid)", "Stress (Lower)", "Stress (Membrane)", "Stress (Bending)", "Stress (Max Envelope)",
+                "Strain", "Strain (Mid)", "Strain (Lower)", "Strain (Membrane)", "Strain (Bending)", "Strain (Max Envelope)"
+            ]}
+
+        idx_arr = np.array(node_idx_list)
+        E_arr = np.array(E_list)
+        nu_arr = np.array(nu_list)
+        t_arr = np.array(t_list)
+        row_arr = np.array(row_map)
+
+        c_list = [[wht_model.nodes[nid].x, wht_model.nodes[nid].y, wht_model.nodes[nid].z] for nid in sorted_nids]
+        C = np.array(c_list)[idx_arr]
+        U = u_global_array[idx_arr]
+
+        V1 = C[:, 1, :] - C[:, 0, :]
+        V2 = C[:, 3, :] - C[:, 0, :]
+        X_loc = V1 / np.linalg.norm(V1, axis=1, keepdims=True)
+        Z_raw = np.cross(X_loc, V2)
+        Z_loc = Z_raw / np.linalg.norm(Z_raw, axis=1, keepdims=True)
+        Y_loc = np.cross(Z_loc, X_loc)
+        T = np.stack([X_loc, Y_loc, Z_loc], axis=1)
+
+        U_disp_loc = np.einsum('mij, mkj -> mki', T, U[:, :, :3])
+        U_rot_loc = np.einsum('mij, mkj -> mki', T, U[:, :, 3:6])
+
+        p0 = C[:, 0, :]
+        C_loc = np.stack([np.einsum('mi,mi->m', C[:, k, :] - p0, X_loc) for k in range(4)], axis=1)
+        D_loc = np.stack([np.einsum('mi,mi->m', C[:, k, :] - p0, Y_loc) for k in range(4)], axis=1)
+
+        xi_pts = np.array([-1.0, 1.0, 1.0, -1.0])
+        eta_pts = np.array([-1.0, -1.0, 1.0, 1.0])
+
+        eps_xx_m_all = np.zeros((len(E_arr), 4))
+        eps_yy_m_all = np.zeros((len(E_arr), 4))
+        gamma_xy_m_all = np.zeros((len(E_arr), 4))
+        kappa_xx_all = np.zeros((len(E_arr), 4))
+        kappa_yy_all = np.zeros((len(E_arr), 4))
+        kappa_xy_all = np.zeros((len(E_arr), 4))
+
+        import sys
+        # Note: _compute_all_layers needs to be available
+        for p in range(4):
+            xi, eta = xi_pts[p], eta_pts[p]
+            dNxi = np.array([-(1-eta), (1-eta), (1+eta), -(1+eta)]) * 0.25
+            dNeta = np.array([-(1-xi), -(1+xi), (1+xi), (1-xi)]) * 0.25
+
+            J11 = np.dot(C_loc, dNxi)
+            J12 = np.dot(D_loc, dNxi)
+            J21 = np.dot(C_loc, dNeta)
+            J22 = np.dot(D_loc, dNeta)
+
+            detJ = J11 * J22 - J12 * J21
+            detJ_safe = np.where(np.abs(detJ) > 1e-12, detJ, 1e-12)
+
+            invJ11 = J22 / detJ_safe
+            invJ12 = -J12 / detJ_safe
+            invJ21 = -J21 / detJ_safe
+            invJ22 = J11 / detJ_safe
+
+            dN_dx = np.outer(invJ11, dNxi) + np.outer(invJ12, dNeta)
+            dN_dy = np.outer(invJ21, dNxi) + np.outer(invJ22, dNeta)
+
+            u_x, u_y = U_disp_loc[:, :, 0], U_disp_loc[:, :, 1]
+            th_x, th_y = U_rot_loc[:, :, 0], U_rot_loc[:, :, 1]
+
+            eps_xx_m_all[:, p] = np.sum(dN_dx * u_x, axis=1)
+            eps_yy_m_all[:, p] = np.sum(dN_dy * u_y, axis=1)
+            gamma_xy_m_all[:, p] = np.sum(dN_dy * u_x + dN_dx * u_y, axis=1)
+            
+            kappa_xx_all[:, p] = np.sum(dN_dx * th_y, axis=1)
+            kappa_yy_all[:, p] = -np.sum(dN_dy * th_x, axis=1)
+            kappa_xy_all[:, p] = np.sum(dN_dy * th_y - dN_dx * th_x, axis=1)
+
+        result_dict = {}
+        for key in [
+            "Stress", "Stress (Mid)", "Stress (Lower)", "Stress (Membrane)", "Stress (Bending)", "Stress (Max Envelope)",
+            "Strain", "Strain (Mid)", "Strain (Lower)", "Strain (Membrane)", "Strain (Bending)", "Strain (Max Envelope)"
+        ]:
+            result_dict[key] = np.zeros((M_total, 4, 6))
+
+        for p in range(4):
+            res_p = _compute_all_layers(
+                M_total, row_arr, E_arr, nu_arr, t_arr, T,
+                eps_xx_m_all[:, p], eps_yy_m_all[:, p], gamma_xy_m_all[:, p],
+                kappa_xx_all[:, p], kappa_yy_all[:, p], kappa_xy_all[:, p]
+            )
+            for k in result_dict.keys():
+                result_dict[k][row_arr, p, :] = res_p[k][row_arr]
+
+        return result_dict
+
+
+
+    @staticmethod
+    def recover_tria3_nodal(
+        wht_model,
+        u_global_array: np.ndarray,
+        sorted_nids: list,
+    ) -> dict:
+        """
+        TRIA3 (CST) 요소의 3개 코너 노드 위치에서 응력/변형률을 복원합니다.
+        CST는 곡률이 없으므로 Centroid 값을 복제하여 반환합니다.
+        """
+        res_centroid = ElementStressRecovery.recover_tria3(wht_model, u_global_array, sorted_nids)
+        M_total = len(wht_model.elements)
+        result_dict = {}
+        for k, v in res_centroid.items():
+            arr_3 = np.zeros((M_total, 3, 6))
+            for p in range(3):
+                arr_3[:, p, :] = v
+            result_dict[k] = arr_3
+        return result_dict
+
     @staticmethod
     def recover_tria3(
         wht_model,

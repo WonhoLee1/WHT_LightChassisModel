@@ -1046,17 +1046,28 @@ class WHTVisualizer:
         
         # 3. Rebuild Assembly
         shared_base = self._make_pv_grid(result.nodes, result.connectivity, result.offsets, result.cell_types)
+        self.whole_mesh = shared_base
         
         prefix = f"{group_name}_" if group_name else ""
         
         self.list_parts.blockSignals(True)
+        covered_indices = set()
         if result.element_sets:
             for part_name, elem_indices in result.element_sets.items():
                 if len(elem_indices) == 0: continue
                 part_mesh = shared_base.extract_cells(elem_indices)
+                # vtkOriginalPointIds must be preserved for _bind_data_to_mesh submesh mapping
                 self._add_part(f"{prefix}{part_name}", part_mesh)
-        else:
-            self._add_part(f"{prefix}Mesh_Model", shared_base)
+                covered_indices.update(elem_indices)
+
+        # [WHT-FIX] Ensure elements not in any set are still rendered as "Base_Mesh"
+        all_indices = set(range(result.n_cells))
+        remaining = sorted(list(all_indices - covered_indices))
+        if remaining:
+            remaining_mesh = shared_base.extract_cells(remaining)
+            name = f"{prefix}Base_Mesh" if result.element_sets else f"{prefix}Mesh_Model"
+            self._add_part(name, remaining_mesh)
+            
         self.list_parts.blockSignals(False)
             
         # UI State Init with Guard
@@ -1090,17 +1101,18 @@ class WHTVisualizer:
     def _make_pv_grid(nodes, connectivity, offsets, cell_types):
         """Builds a PyVista UnstructuredGrid using the most compatible format."""
         import numpy as np
-        # PyVista/VTK 9+ preferred 'cells' format: [n1, p1, p2, ..., n2, p_k, ...]
+        # offsets is CSR format with leading 0: [0, n0, n0+n1, ...]  (n_cells+1 entries)
+        # np.diff(offsets) -> n_cells counts; offsets[:-1] -> n_cells start positions
         cell_counts = np.diff(offsets)
         cells = np.empty(len(connectivity) + len(cell_counts), dtype=connectivity.dtype)
-        
+
         insert_pos = np.arange(len(cell_counts)) + offsets[:-1]
         cells[insert_pos] = cell_counts
-        
+
         mask = np.ones(len(cells), dtype=bool)
         mask[insert_pos] = False
         cells[mask] = connectivity
-        
+
         return pv.UnstructuredGrid(cells, cell_types, nodes)
 
     def load_results(self, result: "WHTResultData", group_name: Optional[str] = None, clear: bool = True, **kwargs):
@@ -1393,7 +1405,6 @@ class WHTVisualizer:
             # [WHT Flicker Fix] Ensure scalar bar exists and is updated without jumping
             if not self.plotter.scalar_bars:
                 # First time: Add scalar bar with fixed width
-                n_col = self.cb_levels if self.cb_mode == "Discrete" else 256
                 n_lbl = (self.cb_levels + 1) if self.cb_mode == "Discrete" else 11
                 fmt_str = f"%.{self.spin_cb_decimals.value()}e"
                 
@@ -1470,16 +1481,18 @@ class WHTVisualizer:
                 if std is None or np.isnan(std) or std <= 1e-12: return 0.0
                 return (val - mu) / std
             
-            print(f"\n[WHT-STATS] Field: {field_name}")
-            print(f"  > Absolute MAX: {v_max:.4e} (Z: {get_z(v_max):.2f}s)")
-            print(f"  > 99th Pct    : {p99:.4e} (Z: {get_z(p99):.2f}s)")
-            print(f"  > 95th Pct    : {p95:.4e} (Z: {get_z(p95):.2f}s)")
-            print(f"  > Robust MAX ({p_high}%): {r_max:.4e} (Z: {get_z(r_max):.2f}s)")
-            print(f"  > Absolute MIN: {float(np.nanmin(merged)):.4e}")
-            print(f"  > Mean/Std    : {mu:.4e} / {std:.4e}")
-            print(f"  > Total Nodes : {len(merged):,}")
+            if not getattr(self, 'is_playing', False):
+                print(f"\n[WHT-STATS] Field: {field_name}")
+                print(f"  > Absolute MAX: {v_max:.4e} (Z: {get_z(v_max):.2f}s)")
+                print(f"  > 99th Pct    : {p99:.4e} (Z: {get_z(p99):.2f}s)")
+                print(f"  > 95th Pct    : {p95:.4e} (Z: {get_z(p95):.2f}s)")
+                print(f"  > Robust MAX ({p_high}%): {r_max:.4e} (Z: {get_z(r_max):.2f}s)")
+                print(f"  > Absolute MIN: {float(np.nanmin(merged)):.4e}")
+                print(f"  > Mean/Std    : {mu:.4e} / {std:.4e}")
+                print(f"  > Total Nodes : {len(merged):,}")
         except Exception as e:
-            print(f"[WHT-ERROR] Stats calculation failed: {e}")
+            if not getattr(self, 'is_playing', False):
+                print(f"[WHT-ERROR] Stats calculation failed: {e}")
 
         if r_min == r_max: r_max = r_min + 1e-6 # Safety expand
         return [r_min, r_max]
@@ -1765,6 +1778,9 @@ class WHTVisualizer:
             if part["actor"] and hasattr(part["actor"], "mapper"):
                 part["actor"].mapper.SetInputData(mesh)
         
+        # [WHT-FIX] Ensure symbolic markers (BC/Load) follow the warped mesh nodes
+        self._sync_symbolic_positions()
+
         if hasattr(self.plotter, 'update'): self.plotter.update()
 
     def set_timestep(self, t_idx: int):
@@ -2072,13 +2088,34 @@ class WHTVisualizer:
             unique_idxs = np.unique(bc_indices)
             bc_pts = self.result_data.nodes[unique_idxs]
             poly = pv.PolyData(bc_pts)
+            poly["orig_idxs"] = unique_idxs # Store for dynamic tracking
+            # [WHT-FIX] Apply slight Z-offset to markers to avoid Z-fighting with mesh surface
+            poly.points[:, 2] += 2.0  # 2mm offset
+            
             act_bc = self.plotter.add_mesh(
                 poly, color='#ff2222', point_size=12, 
                 render_points_as_spheres=True, 
-                pickable=False
+                pickable=False,
+                name="_wht_bc_symbols"
             )
             act_bc.SetVisibility(self.chk_bc.isChecked())
             self.actors_misc["BC"] = act_bc
+
+        # [WHT-NEW] Render RBE Rigids as a distinct layer (Bold White Lines)
+        if "RIGIDS" in self.result_data.element_sets:
+            rigid_indices = self.result_data.element_sets["RIGIDS"]
+            # vtkOriginalPointIds must be preserved for _sync_symbolic_positions
+            rigid_mesh = self.whole_mesh.extract_cells(rigid_indices)
+            
+            act_rigids = self.plotter.add_mesh(
+                rigid_mesh, 
+                color='white', 
+                line_width=3, 
+                label="Rigid Elements",
+                pickable=False,
+                name="_wht_rigid_lines"
+            )
+            self.actors_misc["RIGIDS"] = act_rigids
             
         # 2. Loads (point_data)
         load_indices = []
@@ -2092,13 +2129,68 @@ class WHTVisualizer:
             unique_idxs = np.unique(load_indices)
             load_pts = self.result_data.nodes[unique_idxs]
             poly = pv.PolyData(load_pts)
+            poly["orig_idxs"] = unique_idxs # Store for dynamic tracking
             act_load = self.plotter.add_mesh(
-                poly, color='#22ff22', point_size=10, 
+                poly, color='#22ff22', point_size=5, # [User Request] 10 -> 5
                 render_points_as_spheres=True, 
-                pickable=False
+                pickable=False,
+                name="_wht_load_symbols"
             )
             act_load.SetVisibility(self.chk_load.isChecked())
             self.actors_misc["Load"] = act_load
+
+    def _sync_symbolic_positions(self):
+        """[WHT-FIX] Warps BC/Load symbols based on current global mesh deformation."""
+        if not self.result_data: return
+        
+        # Get warping parameters from UI state
+        chk = self.chk_warp.isChecked()
+        scale = self.spin_scale.value()
+        warp_field = self.combo_warp_vec.currentText()
+        
+        # Base coordinates for all nodes (N, 3)
+        base_pts = self.result_data.nodes
+        
+        # Displacement for current timestep (N, 3)
+        disp = None
+        if chk and warp_field in self.result_data.point_data:
+            disp_all = self.result_data.point_data[warp_field]
+            if self.current_timestep < len(disp_all):
+                disp = np.nan_to_num(disp_all[self.current_timestep])
+        
+        for key in ["BC", "Load", "RIGIDS"]:
+            if key in self.actors_misc:
+                actor = self.actors_misc[key]
+                mesh = actor.mapper.dataset
+                
+                if key == "RIGIDS":
+                    # [WHT-FIX] Use VTK's original point IDs to map displacement
+                    if "vtkOriginalPointIds" in mesh.point_data:
+                        orig_nids = mesh.point_data["vtkOriginalPointIds"]
+                        pts = base_pts[orig_nids].copy()
+                        if disp is not None:
+                            pts += disp[orig_nids, :3] * scale
+                        mesh.points = pts
+                    else:
+                        # Fallback: skip update (vtkOriginalPointIds missing means
+                        # clear_point_data was called — do not corrupt mesh with wrong size)
+                        pass
+                else:
+                    # BC/Load are PolyData with specific markers
+                    poly = mesh
+                    if "orig_idxs" in poly.point_data:
+                        idxs = poly.point_data["orig_idxs"]
+                        pts = base_pts[idxs].copy()
+                        if disp is not None:
+                            pts += disp[idxs, :3] * scale
+                        
+                        # Apply BC offset (2mm) if it's the BC actor
+                        if key == "BC":
+                            pts[:, 2] += 2.0
+                            
+                        poly.points = pts
+                
+                actor.mapper.SetInputData(mesh)
 
     def _on_colormap_changed(self, cmap):
         for part in self.parts.values():

@@ -355,6 +355,20 @@ class WHTMeshModel:
             offsets_list.append(len(connectivity_list))
             cell_types_list.append(_VTK_TYPE.get(elem.type, 9))
 
+        # [WHT] Rigid Elements (RBE2/RBE3) → Lines in IR Connectivity
+        # We add them as VTK_LINE (3) to a separate Element Set for visualization
+        rigid_start_idx = len(cell_types_list)
+        for rbe in list(self.rbe2s.values()) + list(self.rbe3s.values()):
+            m_idx = nid_to_idx.get(rbe.master_nid)
+            if m_idx is None: continue
+            for s_nid in rbe.slave_nids:
+                s_idx = nid_to_idx.get(s_nid)
+                if s_idx is None: continue
+                connectivity_list.extend([m_idx, s_idx])
+                offsets_list.append(len(connectivity_list))
+                cell_types_list.append(3) # VTK_LINE
+        rigid_end_idx = len(cell_types_list)
+
         connectivity = np.array(connectivity_list, dtype=np.int64)
         offsets      = np.array(offsets_list,      dtype=np.int64)
         cell_types   = np.array(cell_types_list,   dtype=np.int64)
@@ -368,6 +382,14 @@ class WHTMeshModel:
                 dtype=np.int64,
             )
 
+        # [WHT] Boundary Conditions (SPC) → Node Set for Visualization
+        spc_nids = sorted(list(set(spc.node_id for spc in self.spc_conditions)))
+        if spc_nids:
+            node_sets_ir["SPC"] = np.array(
+                [nid_to_idx[n] for n in spc_nids if n in nid_to_idx],
+                dtype=np.int64,
+            )
+
         elem_sets_ir: Dict[str, np.ndarray] = {}
         sorted_eids = sorted(self.elements.keys())
         eid_to_cidx = {eid: i for i, eid in enumerate(sorted_eids)}
@@ -377,6 +399,10 @@ class WHTMeshModel:
                 [eid_to_cidx[e] for e in es.elem_ids if e in eid_to_cidx],
                 dtype=np.int64,
             )
+        
+        # [WHT] Rigids set
+        if rigid_end_idx > rigid_start_idx:
+            elem_sets_ir["RIGIDS"] = np.arange(rigid_start_idx, rigid_end_idx, dtype=np.int64)
 
         return WHTResultData(
             nodes=nodes_arr,

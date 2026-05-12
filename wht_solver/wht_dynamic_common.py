@@ -169,6 +169,7 @@ class DynamicResult:
             point_data["Applied_Load"] = load_history
 
         # [WHT] Include SPCD nodes in SPC set for visualization markers
+
         if load_groups:
             spcd_nids_all = []
             for lg in load_groups:
@@ -184,6 +185,19 @@ class DynamicResult:
                 else:
                     base_rd.node_sets["SPC"] = spcd_indices
 
+        cell_data = self._build_cell_data(mesh_model)
+        
+        # [WHT] Nodal Stress Recovery 지원: stress_data 배열의 1번째 차원이 노드 수와 같으면 PointData로 매핑
+        if self.stress_data is not None:
+            for k, arr in list(cell_data.items()):
+                if arr.shape[1] == n_nodes:
+                    point_data[k] = arr
+                    del cell_data[k]
+                elif self.stress_data[k].shape[1] == n_nodes:
+                    # _build_cell_data가 M_mesh로 zero-pad를 시도했을 수 있으므로 원본을 사용
+                    point_data[k] = self.stress_data[k]
+                    del cell_data[k]
+
         return WHTResultData(
             nodes        = base_rd.nodes,
             connectivity = base_rd.connectivity,
@@ -192,7 +206,7 @@ class DynamicResult:
             node_sets    = base_rd.node_sets,
             element_sets = base_rd.element_sets,
             point_data   = point_data,
-            cell_data    = self._build_cell_data(mesh_model),
+            cell_data    = cell_data,
             field_data   = {},
             time_values  = self.t_saved,
             metadata     = metadata,
@@ -226,7 +240,11 @@ class DynamicResult:
             for rbe in list(mesh_model.rbe2s.values()) + list(mesh_model.rbe3s.values()):
                 M_mesh += len(rbe.slave_nids)
 
-        for key, arr in self.stress_data.items():
+        n_nodes = len(self.sorted_nids) if hasattr(self, 'sorted_nids') else -1
+        for key, arr in list(self.stress_data.items()):
+            if arr.shape[1] == n_nodes:
+                cell_data[key] = arr
+                continue
             # arr.shape: (T, M_elem, 6) 또는 (T, M_elem)
             if M_mesh is not None and arr.shape[1] != M_mesh:
                 T = arr.shape[0]

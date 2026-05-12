@@ -459,18 +459,33 @@ class WHTDynamicSolver(WHTSolver):
                                           stabilize=True, include_beams=False, include_rbe3=False)
         M_diag  = self._assemble_lumped_mass(jm, ndof, sorted_nids, nid_to_idx)
         
-        free_id = np.array(jm.unknown_id, dtype=np.int32)
-        n_free  = len(free_id)
-        
-        # SPCD
+        # ── 1b. DOF 분류: SPCD → free_id에서 제거 (Scipy 솔버와 동일한 파티셔닝) ──
+        #   [BUG FIX] 기존에는 free_id = jm.unknown_id 전체를 사용하여 SPCD DOF가
+        #   free DOF에 포함되어 K_fs 커플링이 무효화되는 문제가 있었음.
+        #   Scipy 솔버와 동일하게: SPCD DOF → spcd_id / 나머지 → free_id로 분리.
         spcd_map = {}
+        unknown_set = set(int(x) for x in jm.unknown_id)
         for lg in load_groups:
             if lg.load_type == "SPCD":
                 for nid in lg.node_ids:
-                    dof_gid = nid_to_idx[nid] * 6 + lg.dof
-                    spcd_map[dof_gid] = lg
+                    idx = nid_to_idx.get(nid)
+                    if idx is None:
+                        continue
+                    dof_gid = idx * 6 + lg.dof
+                    if dof_gid in unknown_set:
+                        spcd_map[dof_gid] = lg
         spcd_id = np.array(sorted(spcd_map.keys()), dtype=np.int32)
+        spcd_set = set(spcd_id.tolist())
         n_spcd  = len(spcd_id)
+
+        # SPCD DOF를 제외한 진정한 자유 DOF
+        free_id = np.array(
+            [d for d in jm.unknown_id if int(d) not in spcd_set], dtype=np.int32
+        )
+        n_free  = len(free_id)
+
+        if n_spcd and verbose:
+            print(f"    - [JAX] SPCD DOF: {n_spcd}개 | Free DOF: {n_free}개", flush=True)
 
         if verbose:
             print(f" Done ({time.time()-t_prep:.2f}s)")
@@ -618,8 +633,13 @@ class WHTDynamicSolver(WHTSolver):
         # outer scan: Only returns results for n_blocks frames!
         _, (u_f_hist, v_f_hist, a_f_hist, u_s_hist, a_s_hist) = jax.lax.scan(block_step, init_state, block_inputs)
         
+        # [WHT] JAX 비동기 디스패치 완료 대기: block_until_ready()를 호출하지 않으면
+        # "Time Integration Finished"가 JIT 컴파일 완료 시점(~1s)에 찍히고,
+        # 실제 연산은 Step 5(np.array 호출)에서 수행되어 수 분이 소요되는 문제가 있음.
+        u_f_hist = jax.block_until_ready(u_f_hist)
+        
         if verbose:
-            print(f"    - [JAX] Time Integration Finished ({time.time()-t0:.2f}s)")
+            print(f"    - [JAX] Time Integration Finished ({time.time()-t0:.2f}s) [실제 연산 완료]")
             print(f"    - [JAX] [5/5] Converting {len(u_f_hist)} frames to Numpy...", end="", flush=True)
             t_conv = time.time()
 
@@ -731,6 +751,7 @@ class WHTDynamicSolver(WHTSolver):
     # Public API — 응력/변형률 이력 복원
     # ─────────────────────────────────────────────────────────────────────────
 
+
     def recover_stress_history(
         self,
         dynamic_result: DynamicResult,
@@ -738,29 +759,10 @@ class WHTDynamicSolver(WHTSolver):
         verbose: bool = True,
     ) -> DynamicResult:
         """
-        동해석 결과의 각 저장 스텝에 대해 응력/변형률을 복원합니다.
-
-        정적 해석의 ElementStressRecovery와 동일한 로직을 적용하며,
-        결과는 DynamicResult.stress_data에 (T, M, 6) 또는 (T, M) 형태로 저장됩니다.
-
-        Parameters
-        ----------
-        dynamic_result : DynamicResult
-            solve_direct_dynamic() 또는 solve_modal_dynamic()의 반환값.
-        fields : list of str, optional
-            복원할 필드명 리스트. None이면 주요 필드 전체 복원.
-            예: [\"Stress\", \"Stress (Max Envelope)\", \"Strain\", \"Von Mises (Upper)\"]
-        verbose : bool
-            진행 상황 출력 여부.
-
-        Returns
-        -------
-        DynamicResult
-            stress_data가 채워진 동일 객체 (in-place).
+        동해석 결과의 각 저장 스텝에 대해 응력/변형률을 Nodal Point Data로 복원합니다.
         """
         from .wht_stress_recovery import ElementStressRecovery
 
-        # 기본 복원 필드: 주요 6개 (전체 12개는 메모리 부담이 크므로 선택적)
         if fields is None:
             fields = [
                 "Stress",               # Upper (+t/2) — 기본
@@ -777,64 +779,99 @@ class WHTDynamicSolver(WHTSolver):
             print(f"\n [Stress Recovery] {n_save} 스텝, 필드: {fields}", flush=True)
             t0 = time.time()
 
-        # 첫 스텝으로 요소 수 파악
-        u0 = dynamic_result.u[0]   # (n_nodes, 6)
-        first = ElementStressRecovery.recover_quad4(self.model, u0, sorted_nids)
-        # TRIA3가 혼재하면 추가
-        tria = ElementStressRecovery.recover_tria3(self.model, u0, sorted_nids)
-        # 두 결과를 합산 (요소별 중첩: 한 요소는 어느 한 쪽만 채워짐)
-        sample_result = {k: first[k] + tria[k] for k in first}
-        n_elem = sample_result["Stress"].shape[0]
+        # [WHT] Nodal Averaging Setup
+        M_total = len(self.model.elements)
+        sorted_eids = sorted(self.model.elements.keys())
+        
+        node_count = np.zeros(n_nodes, dtype=np.int32)
+        quad_to_node = np.zeros((M_total, 4), dtype=np.int64) - 1
+        tria_to_node = np.zeros((M_total, 3), dtype=np.int64) - 1
+        
+        nid_to_idx = {nid: i for i, nid in enumerate(sorted_nids)}
+        
+        for i, eid in enumerate(sorted_eids):
+            elem = self.model.elements[eid]
+            is_obj = hasattr(elem, 'type')
+            etype = elem.type if is_obj else self.model.element_types.get(eid, "QUAD4")
+            node_ids = elem.node_ids if is_obj else elem
+            
+            if etype in ["QUAD", "QUAD4"] and len(node_ids) == 4:
+                idx_list = [nid_to_idx[n] for n in node_ids]
+                quad_to_node[i] = idx_list
+                for idx in idx_list:
+                    node_count[idx] += 1
+            elif etype in ["TRIA", "TRIA3"] and len(node_ids) == 3:
+                idx_list = [nid_to_idx[n] for n in node_ids]
+                tria_to_node[i] = idx_list
+                for idx in idx_list:
+                    node_count[idx] += 1
 
-        # (T, M, 6) 또는 (T, M) 버퍼 초기화
+        node_count_safe = np.maximum(node_count, 1)[:, None]
+
+        # 첫 스텝으로 필드 파악
+        u0 = dynamic_result.u[0]
+        quad_0 = ElementStressRecovery.recover_quad4_nodal(self.model, u0, sorted_nids)
+        tria_0 = ElementStressRecovery.recover_tria3_nodal(self.model, u0, sorted_nids)
+
         stress_data: dict = {}
         for fld in fields:
-            if fld not in sample_result:
+            if fld not in quad_0:
                 if verbose:
                     print(f"    [경고] 필드 '{fld}'를 찾을 수 없습니다. 건너뜁니다.")
                 continue
-            arr0 = sample_result[fld]
-            if arr0.ndim == 2:          # (M, 6) → (T, M, 6)
-                stress_data[fld] = np.zeros((n_save, n_elem, 6), dtype=np.float32)
-            else:                        # (M,)   → (T, M)
-                stress_data[fld] = np.zeros((n_save, n_elem), dtype=np.float32)
+            arr0 = quad_0[fld]
+            if arr0.ndim == 3:          # (M, 4, 6) -> (T, N_nodes, 6)
+                stress_data[fld] = np.zeros((n_save, n_nodes, 6), dtype=np.float32)
+            else:                        
+                stress_data[fld] = np.zeros((n_save, n_nodes), dtype=np.float32)
 
-        # Von Mises 스칼라 필드 추가 (Stress가 복원될 경우)
         compute_vm_upper = "Stress" in stress_data
         compute_vm_envelope = "Stress (Max Envelope)" in stress_data
         if compute_vm_upper:
-            stress_data["Von Mises (Upper)"] = np.zeros((n_save, n_elem), dtype=np.float32)
+            stress_data["Von Mises (Upper)"] = np.zeros((n_save, n_nodes), dtype=np.float32)
         if compute_vm_envelope:
-            stress_data["Von Mises (Max Envelope)"] = np.zeros((n_save, n_elem), dtype=np.float32)
+            stress_data["Von Mises (Max Envelope)"] = np.zeros((n_save, n_nodes), dtype=np.float32)
 
         def _von_mises(voigt: np.ndarray) -> np.ndarray:
-            """Voigt (M, 6) → Von Mises (M,)."""
             s = voigt
             diff_sq = (s[:, 0]-s[:, 1])**2 + (s[:, 1]-s[:, 2])**2 + (s[:, 2]-s[:, 0])**2
             shear_sq = 6.0 * (s[:, 3]**2 + s[:, 4]**2 + s[:, 5]**2)
             return np.sqrt(0.5 * (diff_sq + shear_sq))
 
-        # 각 스텝 루프
         if verbose:
-            print(f"    - [Stress History] [Final Step] Recovering {n_save} frames of stress/strain data...")
+            print(f"    - [Stress History] [Final Step] Recovering {n_save} frames to NODAL Data (PointData)...")
         pbar = tqdm(total=n_save, desc="      Stress History", unit="frame", leave=False)
         
+        q_mask = quad_to_node[:, 0] >= 0
+        t_mask = tria_to_node[:, 0] >= 0
+        quad_nodes_mapped = quad_to_node[q_mask]
+        tria_nodes_mapped = tria_to_node[t_mask]
+
         for ti in range(n_save):
-            u_frame = dynamic_result.u[ti]   # (n_nodes, 6)
-            quad = ElementStressRecovery.recover_quad4(self.model, u_frame, sorted_nids)
-            tria = ElementStressRecovery.recover_tria3(self.model, u_frame, sorted_nids)
-            frame = {k: quad[k] + tria[k] for k in quad}
+            u_frame = dynamic_result.u[ti]
+            quad = ElementStressRecovery.recover_quad4_nodal(self.model, u_frame, sorted_nids)
+            tria = ElementStressRecovery.recover_tria3_nodal(self.model, u_frame, sorted_nids)
 
             for fld in stress_data:
                 if fld.startswith("Von Mises"):
-                    continue   # 아래에서 별도 처리
-                if fld in frame:
-                    stress_data[fld][ti] = frame[fld].astype(np.float32)
+                    continue
+                if fld in quad:
+                    nodal_val = np.zeros((n_nodes, 6), dtype=np.float32)
+                    q_val = quad[fld]
+                    t_val = tria[fld]
+                    
+                    if np.any(q_mask):
+                        np.add.at(nodal_val, quad_nodes_mapped, q_val[q_mask])
+                    if np.any(t_mask):
+                        np.add.at(nodal_val, tria_nodes_mapped, t_val[t_mask])
+                        
+                    nodal_val /= node_count_safe
+                    stress_data[fld][ti] = nodal_val
 
-            if compute_vm_upper and "Stress" in frame:
-                stress_data["Von Mises (Upper)"][ti] = _von_mises(frame["Stress"]).astype(np.float32)
-            if compute_vm_envelope and "Stress (Max Envelope)" in frame:
-                stress_data["Von Mises (Max Envelope)"][ti] = _von_mises(frame["Stress (Max Envelope)"]).astype(np.float32)
+            if compute_vm_upper and "Stress" in quad:
+                stress_data["Von Mises (Upper)"][ti] = _von_mises(stress_data["Stress"][ti]).astype(np.float32)
+            if compute_vm_envelope and "Stress (Max Envelope)" in quad:
+                stress_data["Von Mises (Max Envelope)"][ti] = _von_mises(stress_data["Stress (Max Envelope)"][ti]).astype(np.float32)
 
             pbar.update(1)
         
@@ -844,12 +881,10 @@ class WHTDynamicSolver(WHTSolver):
         if verbose:
             elapsed = time.time() - t0
             n_fields = len(stress_data)
-            print(f" -> Stress Recovery 완료: {n_fields}개 필드, "
-                  f"{elapsed:.1f}s ({n_save} steps × {n_elem} elements)", flush=True)
+            print(f" -> Nodal Stress Recovery 완료: {n_fields}개 필드, "
+                  f"{elapsed:.1f}s ({n_save} steps × {n_nodes} nodes)", flush=True)
 
         return dynamic_result
-
-
 
     def _build_load_vector(
         self,
