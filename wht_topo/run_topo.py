@@ -13,6 +13,8 @@ WHT 산업용 섀시 비드 최적화(Topography Optimization) 통합 도구.
 [동적 하중 추출 전략]
 - 바닥면을 N x N 그리드로 분할하고, 각 영역에서 '변형 에너지 합'이 최대가 되는 시점을 Peak Time으로 간주
 - 해당 시점의 변위 및 관성 하중 상태를 정적 하중 케이스로 변환하여 최적화 루프에 주입
+- --add-inertia  : 관성 하중(-ma)을 통해 충격력을 물리적으로 정확히 모사 (추천)
+- --use-global-z : 샤시의 글로벌 낙하/회전 궤적을 그대로 추종 (시각적 확인용, 인장 왜곡 주의)
 """
 
 import argparse
@@ -113,11 +115,13 @@ def run(args):
         csv_path = opts[0]
         t_start = float(opts[1]) if len(opts) > 1 else 1.6
         add_inertia = "--add-inertia" in opts or args.add_inertia
+        use_global_z = "--use-global-z" in opts or args.use_global_z
         
         dynamic_snapshots = extract_dynamic_snapshots(
             model, csv_path, t_start, 
             grid_n=args.dyn_grid, 
             add_inertia=add_inertia,
+            use_global_z=use_global_z,
             solver_method=args.solver_method
         )
 
@@ -199,14 +203,24 @@ def run(args):
 
 # ── 동적 하중 추출 로직 ──────────────────────────────────────────────────────
 
-def extract_dynamic_snapshots(model, csv_path, t_start, grid_n=3, add_inertia=True, solver_method="scipy"):
+def extract_dynamic_snapshots(model, csv_path, t_start, grid_n=3, add_inertia=True, use_global_z=False, solver_method="scipy"):
     """
     영역별 변형 에너지(Strain Energy) 합을 기준으로 최악의 시점을 추출하여 정적 하중 케이스로 반환합니다.
+    
+    Parameters
+    ----------
+    use_global_z : bool
+        True이면 샤시의 글로벌 낙하 궤적을 그대로 변위로 인가합니다. (시각적 확인용)
+        False(기본값)이면 로컬 좌표계 투영을 통해 순수 벤딩 변위만 추출합니다. (정밀 응력 분석용)
     """
     from wht_solver.wht_dynamic_solver import WHTDynamicSolver
     from wht_solver.wht_dynamic_common import DampingSpec
     
     print(f"\n [1] 동적 해석 수행 (CSV: {csv_path}, Start: {t_start}s)")
+    if use_global_z:
+        print("     [Mode] --use-global-z: 글로벌 궤적 직접 추종 모드 (Large Rotation 시 인장 왜곡 발생 가능)")
+    else:
+        print("     [Mode] Local-Frame: 로컬 벤딩 추출 모드 (회전 왜곡 없는 정밀 해석용)")
     
     df = pd.read_csv(csv_path)
     df = df[df['Time'] >= t_start].reset_index(drop=True)
@@ -311,10 +325,10 @@ if __name__ == "__main__":
   2. 동적 하중 통합 최적화 (실측 데이터 기반):
      python wht_topo/run_topo.py --dynamic-opts "wht_topo/sample_pos.csv, 1.6" --add-inertia
 
-  3. JAX 기반 고속 동적-토포 통합 최적화:
-     python wht_topo/run_topo.py --dynamic-opts "wht_topo/sample_pos.csv, 1.6" --add-inertia --solver-method jax
+  4. 글로벌 궤적 확인 및 비교 분석:
+     python wht_topo/run_topo.py --dynamic-opts "wht_topo/sample_pos.csv, 1.6" --use-global-z
 
-  4. 비드 이산화 및 연결 조건 강화:
+  5. 비드 이산화 및 연결 조건 강화:
      python wht_topo/run_topo.py --iters 30 --height-steps 2 --bead-connect --connect-gap 100.0
         """
     )
@@ -338,7 +352,8 @@ if __name__ == "__main__":
     
     # 동적 하중 설정
     parser.add_argument("--dynamic-opts", type=str, help="CSV경로,시작시간 e.g. 'sample.csv,1.6'")
-    parser.add_argument("--add-inertia",  action="store_true", help="동적 하중 추출 시 관성 하중(-ma) 포함")
+    parser.add_argument("--add-inertia",  action="store_true", help="동적 하중 추출 시 관성 하중(-ma) 포함 (추천)")
+    parser.add_argument("--use-global-z", action="store_true", help="로컬 변형 대신 글로벌 Z 궤적 직접 추종 (시각화용)")
     parser.add_argument("--dyn-grid",     type=int,   default=3,     help="동적 피크 탐색을 위한 그리드 분할 수 (N x N)")
     
     # 시스템 설정
