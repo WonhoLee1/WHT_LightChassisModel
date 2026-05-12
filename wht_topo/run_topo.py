@@ -319,17 +319,23 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 [실행 예제]
-  1. 기본 최적화 (정적 하중 케이스만 사용):
+  1. 기본 정적 최적화 (Bending, Twisting 등 표준 케이스):
      python wht_topo/run_topo.py --iters 20 --sym-x --bead-area 0.25
 
-  2. 동적 하중 통합 최적화 (실측 데이터 기반):
+  2. 실측 데이터 기반 동적-토포 통합 최적화 (추천):
+     # 1.6s 이후 충격 데이터를 분석하여 비틀림/충격 취약 지점 보강 패턴 생성
      python wht_topo/run_topo.py --dynamic-opts "wht_topo/sample_pos.csv, 1.6" --add-inertia
 
-  4. 글로벌 궤적 확인 및 비교 분석:
-     python wht_topo/run_topo.py --dynamic-opts "wht_topo/sample_pos.csv, 1.6" --use-global-z
+  3. 고해상도 충격 분석 모드 (그리드 분할 강화):
+     # 4x4 그리드로 세분화하여 더 많은 국부 충격 시점(최대 16개)을 하중 케이스로 추출
+     python wht_topo/run_topo.py --dynamic-opts "wht_topo/sample_pos.csv, 1.6" --dyn-grid 4 --add-inertia
 
-  5. 비드 이산화 및 연결 조건 강화:
-     python wht_topo/run_topo.py --iters 30 --height-steps 2 --bead-connect --connect-gap 100.0
+  4. 특정 하중 강조 설계 (정적 굽힘 가중치 하향, 동적 충격 우선):
+     # 정적 가중치를 낮춰 동적 스냅샷 케이스들의 영향력을 상대적으로 높임
+     python wht_topo/run_topo.py --dynamic-opts "data.csv, 1.5" --w-bending 0.2 --w-twisting 0.2
+
+  5. 산업용 최종 설계 조합 (대칭 + 연결 + 이산화):
+     python wht_topo/run_topo.py --dynamic-opts "data.csv, 1.6" --add-inertia --sym-x --bead-connect --height-steps 2
         """
     )
     # 최적화 제어
