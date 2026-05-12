@@ -120,8 +120,8 @@ class WHTopographySolver:
     def __init__(
         self,
         model: WHTMeshModel,
-        load_manager: StochasticLoadManager,
-        constraints=None,       # 향후 확장용 (현재 미사용)
+        load_manager: Optional[StochasticLoadManager] = None,
+        constraints=None,
         bead_height_max: float = 10.0,
         bead_height_ratio: float = 0.3,
         min_width: float = 80.0,
@@ -133,6 +133,7 @@ class WHTopographySolver:
         bead_connect: bool = False,
         connect_gap: float = 80.0,
         bead_steps: int = 0,
+        load_cases: Optional[List[Tuple["WHTLoadCase", float]]] = None,
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -143,11 +144,12 @@ class WHTopographySolver:
         self.fd_dz          = fd_dz
         self.sym_x          = sym_x
         self.bead_connect   = bead_connect
-        self.connect_gap    = connect_gap  # mm, 버드 연결 시 채울 최대 간격
-        self.bead_steps     = bead_steps   # 0 = 연속, N >= 2 = N단계 이산 레벨 (0, ..., h_max)
+        self.connect_gap    = connect_gap 
+        self.bead_steps     = bead_steps  
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
+        self.load_cases_input = load_cases # 외부 주입 하중 케이스
 
-        # Projection parameter (Continuation)
+        # ... (중략) ...
         self._beta = 1.0
         
         self.constraints    = constraints or []
@@ -189,11 +191,18 @@ class WHTopographySolver:
         self._H = self._build_filter()
 
         # 하중 케이스 생성 (하중별 개별 BC 포함)
-        print(" -> [Solver] 하중 케이스 생성 중 (하중별 개별 BC 적용)...")
-        self._load_cases = load_manager.get_load_cases(
-            mesh_size_z=mesh_size_z,
-            weights=self.weights,
-        )
+        if self.load_cases_input:
+            print(f" -> [Solver] 외부 주입 하중 케이스 {len(self.load_cases_input)}개 로드됨.")
+            self._load_cases = self.load_cases_input
+        elif self.load_manager:
+            print(" -> [Solver] 하중 케이스 생성 중 (하중별 개별 BC 적용)...")
+            self._load_cases = self.load_manager.get_load_cases(
+                mesh_size_z=mesh_size_z,
+                weights=self.weights,
+            )
+        else:
+            print(" -> [Error] 하중 케이스 정보가 없습니다.")
+            self._load_cases = []
 
         # 좌우 대칭 매핑 (X-mid plane 기준)
         self._sym_map = None

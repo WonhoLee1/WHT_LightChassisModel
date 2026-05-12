@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-[WHT_LightChassisModel] Exam 4: Implicit Dynamic Analysis (Direct Newmark-beta)
+[WHT_LightChassisModel] Exam 4: Implicit Dynamic Analysis (Large Rotation Handling)
 ================================================================================
-4-코너 실측 CSV 데이터 기반 동해석 (Nodal BC 방식).
+대회전(Large Rotation) 및 낙하 충격을 포함한 CSV 실측 데이터 기반 동해석.
 
-설계:
-  - 하단 4코너 노드 그룹에 직접 SPCD 인가 (Nodal BC)
-  - 회전 자유도(Rx, Ry, Rz)는 자유(Free) 상태 유지
-  - 수평 드리프트 방지를 위한 최소 구속(SPC) 적용
-  - CSV 데이터 로드 시 t0 기준 상대 변위로 변환
+핵심 기능:
+  - 대회전 대응 (Rigid Body Decoupling): 
+    CSV의 글로벌 궤적에서 강체 회전을 분리하여 샤시 로컬 좌표계 기준의 순수 굽힘(Local Z)만 추출.
+  - 자동 관성 하중 (Inertial Load): 
+    낙하 시의 급격한 가속도 변화를 감지하여 샤시 본체에 관성력(F=-ma)을 인가. 
+    (코너 변위만 인가했을 때 응력이 과소평가되는 문제 해결)
+  - Nodal BC (SPCD): RBE3 마스터 노드에 로컬 벤딩 변위 인가.
 
 단위계: MPa, ton, mm -> N, s
 """
@@ -114,6 +116,108 @@ def find_corner_nodes(node_db: dict, width: float, length: float,
     return groups
 
 
+def calculate_local_z_history(csv_df, time_arr):
+    """
+    4개 코너(C5, C6, C7, C8)의 3D 궤적으로부터 강체 회전을 제거한 후,
+    샤시 로컬 좌표계 기준의 순수 수직(Z) 변위만을 추출합니다.
+    (로컬 X/Y는 0으로 고정하여 면내 변형 노이즈 제거)
+    
+    Returns:
+        Dict[str, np.ndarray]: { 'C5': z_arr, 'C6': z_arr, ... } (T,)
+    """
+    n_steps = len(time_arr)
+    corner_labels = ['C5', 'C6', 'C7', 'C8']
+    
+    # 1. (T, 4, 3) 궤적 데이터 구축 (mm 단위)
+    traj = np.zeros((n_steps, 4, 3))
+    for i, lbl in enumerate(corner_labels):
+        for j, ax in enumerate(['X', 'Y', 'Z']):
+            col = f"{lbl}_pos_{ax}"
+            if col in csv_df.columns:
+                traj[:, i, j] = csv_df[col].to_numpy(dtype=float) * 1000.0
+            else:
+                # 데이터 부재 시 0으로 채움 (추후 경고 필요할 수 있음)
+                pass
+
+    local_z_results = {lbl: np.zeros(n_steps) for lbl in corner_labels}
+    p_loc_t0 = None
+
+    print(f"    - [RigidBodyDecouple] Processing {n_steps} steps for local frame projection...")
+    
+    for t in range(n_steps):
+        pts = traj[t] # (4, 3)
+        
+        # A. 중심점 및 로컬 좌표계(R) 구성
+        origin = np.mean(pts, axis=0)
+        p_c = pts - origin
+        
+        # C5(+X+Y), C6(+X-Y), C7(-X-Y), C8(-X+Y)
+        # X축 방향: C7->C6 및 C8->C5의 평균
+        v_x = ( (p_c[1] - p_c[2]) + (p_c[0] - p_c[3]) ) / 2.0
+        # Y축 방향: C7->C8 및 C6->C5의 평균
+        v_y = ( (p_c[3] - p_c[2]) + (p_c[0] - p_c[1]) ) / 2.0
+        
+        # 법선 벡터(Z) 산출 및 정규화
+        z_loc = np.cross(v_x, v_y)
+        z_norm = np.linalg.norm(z_loc)
+        if z_norm < 1e-12:
+            z_loc = np.array([0, 0, 1.0])
+        else:
+            z_loc /= z_norm
+            
+        # 전역 Z축 방향성 유지 (뒤집힘 방지)
+        if z_loc @ np.array([0, 0, 1.0]) < 0:
+            z_loc = -z_loc
+            
+        # 그람-슈미트 직교화
+        x_loc = v_x / (np.linalg.norm(v_x) + 1e-12)
+        y_loc = np.cross(z_loc, x_loc)
+        x_loc = np.cross(y_loc, z_loc) # Re-ortho
+        
+        R = np.stack([x_loc, y_loc, z_loc], axis=1) # (3, 3)
+        
+        # B. 로컬 좌표계로 투영
+        p_loc = p_c @ R # (4, 3)
+        
+        if t == 0:
+            p_loc_t0 = p_loc.copy()
+            
+        # C. 초기 상태 대비 상대 변위 (Z 성분만 추출)
+        delta_p_loc = p_loc - p_loc_t0
+        for i, lbl in enumerate(corner_labels):
+            local_z_results[lbl][t] = delta_p_loc[i, 2]
+
+    return local_z_results, traj
+
+
+def calculate_corner_accelerations(traj, dt):
+    """
+    (T, 4, 3) 궤적 데이터로부터 4개 코너 각각의 Z 가속도를 산출합니다.
+    Returns:
+        np.ndarray: (T, 4) - C5, C6, C7, C8 순서의 가속도 이력
+    """
+    n_steps = traj.shape[0]
+    accels = np.zeros((n_steps, 4))
+    
+    def smooth(y, box_pts=5):
+        box = np.ones(box_pts)/box_pts
+        y_s = np.convolve(y, box, mode='same')
+        y_s[:box_pts] = y[:box_pts]
+        y_s[-box_pts:] = y[-box_pts:]
+        return y_s
+
+    for i in range(4):
+        z = traj[:, i, 2]
+        # 스무딩 -> 1차 미분 -> 스무딩 -> 2차 미분 -> 스무딩
+        z_s = smooth(z)
+        v_z = np.gradient(z_s, dt)
+        v_s = smooth(v_z)
+        a_z = np.gradient(v_s, dt)
+        accels[:, i] = smooth(a_z)
+        
+    return accels
+
+
 def run(args):
     import pandas as pd
     
@@ -180,14 +284,30 @@ def run(args):
     # find_corner_nodes 순서: 0:(-X,-Y), 1:(+X,-Y), 2:(+X,+Y), 3:(-X,+Y)
     # CSV 매핑: C7, C6, C5, C8
 
-    # 4. 하단 코너 SPCD 하중 그룹 구성 -----------------------------------------
+    # 4. 하단 코너 SPCD 하중 그룹 구성 (로컬 변위 추출 방식) -------------------------
     load_groups = []
 
     if csv_df is not None:
-        enforce_axes = getattr(args, 'enforce_axes', 'Z').upper()
-        axis_map = {'X': 0, 'Y': 1, 'Z': 2}
-        axes_to_apply = [axis_map[a] for a in enforce_axes if a in axis_map]
-        if not axes_to_apply: axes_to_apply = [2]
+        if getattr(args, 'use_global_z', False):
+            print(f" [3] CSV 기반 글로벌 Z 변위 직접 인가 (기존 방식, t0 기준 상대값)")
+            # 1. (T, 4, 3) 궤적 데이터 구축 (mm 단위)
+            n_steps = len(time_arr)
+            traj_mm = np.zeros((n_steps, 4, 3))
+            corner_labels = ['C5', 'C6', 'C7', 'C8']
+            for i, lbl in enumerate(corner_labels):
+                for j, ax in enumerate(['X', 'Y', 'Z']):
+                    col = f"{lbl}_pos_{ax}"
+                    if col in csv_df.columns:
+                        traj_mm[:, i, j] = csv_df[col].to_numpy(dtype=float) * 1000.0
+            
+            # 각 코너별 Z 변위 (t - t0)
+            corner_z_data = {}
+            for i, lbl in enumerate(corner_labels):
+                corner_z_data[lbl] = traj_mm[:, i, 2] - traj_mm[0, i, 2]
+        else:
+            print(f" [3] CSV 기반 로컬 변위(Z) 추출 및 SPCD 하중 구성 (Large Rotation 대응)")
+            # 로컬 좌표계 투영을 통한 순수 벤딩 변위(Z) 산출
+            corner_z_data, traj_mm = calculate_local_z_history(csv_df, time_arr)
         
         CORNER_MAP = {
             0: 'C5', # (+X,+Y)
@@ -195,23 +315,10 @@ def run(args):
             2: 'C7', # (-X,-Y)
             3: 'C8', # (-X,+Y)
         }
-        print(f" [3] CSV 기반 SPCD 하중 구성 ({enforce_axes} 적용, Rotations Free)")
-
-        # [Rigid XY Mode] X, Y에 대해 모든 코너의 평균 변위를 계산하여 강체 이동만 허용
-        mean_rel = {}
-        if getattr(args, 'rigid_xy', False):
-            for ax in ['X', 'Y']:
-                cols = [f'C{i}_pos_{ax}' for i in range(5, 9)]
-                vals = []
-                for c in cols:
-                    if c in csv_df.columns:
-                        v = csv_df[c].to_numpy(dtype=float) * 1000.0
-                        vals.append(v - v[0])
-                if vals:
-                    mean_rel[ax] = np.mean(vals, axis=0)
 
         for idx, (_, corner_nids) in enumerate(bot_groups):
             cn_label = CORNER_MAP[idx]
+            z_vals_rel = corner_z_data[cn_label]
             
             pts = np.array([model.nodes[nid].coords() for nid in corner_nids])
             center = np.mean(pts, axis=0)
@@ -222,38 +329,81 @@ def run(args):
             rbe3_id = 900000 + idx
             model.add_rbe3(rbe3_id, master_nid, corner_nids, dofs=(0, 1, 2))
             
-            for dof_idx in axes_to_apply:
-                ax_name = ['X', 'Y', 'Z'][dof_idx]
+            # Z 변위 인가
+            lg = _InterpLoadGroup(
+                node_ids = [master_nid],
+                dof      = 2, # Z
+                time_arr = time_arr,
+                disp_arr = z_vals_rel
+            )
+            load_groups.append(lg)
+            
+            max_z = np.max(np.abs(z_vals_rel))
+            print(f"    - [RBE3/SPCD] Master Node={master_nid}, Corner={cn_label}, Z-DOF: Max Abs={max_z:.4f} mm.")
+
+        # --- [WHT] 자동 관성 하중 (Inertial Load) 생성 (코너별 시차 충격 반영) ---
+        if getattr(args, 'add_inertia', False):
+            print(f" [4] 시차 충격 반영 관성 하중(Staggered Inertia) 생성 중...")
+            dt_csv = time_arr[1] - time_arr[0]
+            # 4개 코너별 가속도 (T, 4) -> 0:C5, 1:C6, 2:C7, 3:C8
+            accels_4 = calculate_corner_accelerations(traj_mm, dt_csv)
+            
+            # 보간을 위한 가속도 매핑 (Bilinear Interpolation 준비)
+            # C5(+X+Y), C6(+X-Y), C7(-X-Y), C8(-X+Y)
+            # 바운딩 박스 확인
+            all_pts = np.array([model.nodes[nid].coords() for nid in model.nodes if nid < 900000])
+            x_min, x_max = all_pts[:, 0].min(), all_pts[:, 0].max()
+            y_min, y_max = all_pts[:, 1].min(), all_pts[:, 1].max()
+            dx = x_max - x_min if x_max != x_min else 1.0
+            dy = y_max - y_min if y_max != y_min else 1.0
+
+            # 1. 솔버를 이용해 노드별 질량 산출
+            temp_solver = WHTDynamicSolver(model)
+            jm, sorted_nids, nid_to_idx = temp_solver._build_jaxsso_model()
+            m_diag = temp_solver._assemble_lumped_mass(jm, jm.ndof, sorted_nids, nid_to_idx)
+            
+            # 2. 모든 노드에 대해 Bilinear Interpolated F = -m * a(x,y) 추가
+            n_added = 0
+            for nid in model.nodes:
+                if nid >= 900000: continue
+                idx = nid_to_idx.get(nid)
+                if idx is None: continue
                 
-                # Rigid XY가 활성화된 경우 X, Y는 평균값 적용
-                if getattr(args, 'rigid_xy', False) and ax_name in ['X', 'Y'] and ax_name in mean_rel:
-                    vals_rel = mean_rel[ax_name]
-                    ref_t0 = 0.0 # 평균값이므로 특정 코너 기준값은 생략
-                else:
-                    col = f'{cn_label}_pos_{ax_name}'
-                    vals_mm = csv_df[col].to_numpy(dtype=float) * 1000.0
-                    vals_rel = vals_mm - vals_mm[0]
-                    ref_t0 = vals_mm[0]
+                node = model.nodes[nid]
+                nx = (node.x - x_min) / dx
+                ny = (node.y - y_min) / dy
                 
-                lg = _InterpLoadGroup(
-                    node_ids = [master_nid],
-                    dof      = dof_idx,
-                    time_arr = time_arr,
-                    disp_arr = vals_rel
+                # Bilinear 가속도 보간
+                # a7(0,0), a6(1,0), a5(1,1), a8(0,1)
+                a_local = (
+                    accels_4[:, 2] * (1-nx)*(1-ny) + # C7
+                    accels_4[:, 1] * (nx)*(1-ny)   + # C6
+                    accels_4[:, 0] * (nx)*(ny)     + # C5
+                    accels_4[:, 3] * (1-nx)*(ny)     # C8
                 )
-                load_groups.append(lg)
-                if dof_idx == 2: # Z축에 대해서만 출력 (너무 많아지는 것 방지)
-                    print(f"    - [RBE3/SPCD] Master Node={master_nid}, Corner={cn_label}, DOF={ax_name}: Ref t0={ref_t0:.4f} mm.")
-        
-        # Stability SPC (for CSV mode)
-        if 0 not in axes_to_apply or 1 not in axes_to_apply:
-            stab_nid = bot_groups[0][1][0]
-            stab_dofs = []
-            if 0 not in axes_to_apply: stab_dofs.append(0)
-            if 1 not in axes_to_apply: stab_dofs.append(1)
-            if stab_dofs:
-                model.apply_spc(stab_nid, dofs=tuple(stab_dofs), value=0.0)
-                print(f"     [Stability] Node {stab_nid}에 수평 구속 {tuple(stab_dofs)} 적용")
+                
+                node_mass = m_diag[idx * 6 + 2]
+                if node_mass <= 0: continue
+                
+                f_history = -node_mass * a_local
+                
+                lg_i = _InterpLoadGroup(
+                    node_ids = [nid],
+                    dof      = 2,
+                    time_arr = time_arr,
+                    disp_arr = f_history
+                )
+                lg_i.load_type = "FORCE"
+                load_groups.append(lg_i)
+                n_added += 1
+            
+            avg_max_a = np.mean(np.max(np.abs(accels_4), axis=0))
+            print(f"    - [Inertia] {n_added}개 노드에 시차 관성 하중 인가 완료. (Avg Max Accel={avg_max_a:.1f} mm/s^2)")
+
+        # Stability SPC (X, Y 방향 강체 이동 방지)
+        stab_nid = bot_groups[0][1][0]
+        model.apply_spc([stab_nid], dofs=(0, 1)) # X, Y 구속
+        print(f"    - [Stability] Node {stab_nid} constrained in X, Y.")
     else:
         # 기존 Half-sine 모드
         for i, ((cx, cy), slave_nids) in enumerate(bot_groups):
@@ -325,30 +475,37 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Exam 4: Dynamic Analysis with SPCD (Nodal BC)",
+        description="Exam 4: Dynamic Analysis with Large Rotation Handling & Inertial Loads",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 [실행 예제]
-  1. CSV 실측 데이터 기반 해석 (기본 솔버):
-     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.3 --enforce-axes XYZ --rigid-xy
+  1. 실측 데이터 기반 해석 (추천: 로컬 벤딩 + 관성 하중 적용)
+     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.6 --add-inertia
+     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.6 --use-global-z
+     
 
-  2. JAX 가속 솔버 사용:
-     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.3 --solver-method jax  --enforce-axes XYZ --rigid-xy
+  2. JAX 가속 솔버 사용 (대용량 모델 추천)
+     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.6 --add-inertia --solver-method jax
 
-  3. 특정 축(Z)만 강제 변위 적용:
-     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.3 --enforce-axes Z
+  3. 가속도 노이즈가 심할 경우 (기본값: 관성 하중 미적용)
+     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.6
 
-  4. X-Y 강체 모드 유지 (XYZ 적용 시 추천):
-     python test_jaxSSO/exam4_dynamic.py --pos-data wht_topo/sample_pos.csv --t-start 1.3 --enforce-axes XYZ --rigid-xy
+[주의 사항]
+  - --add-inertia 없이 변위만 인가할 경우, 4개 코너가 강체로 움직이면 응력이 0에 가깝게 나옵니다.
+  - 실제 낙하 충격 응력을 보려면 --add-inertia 옵션 사용이 필수적입니다.
         """
     )
     parser.add_argument("--pos-data", type=str, help="CSV position data file path")
-    parser.add_argument("--dt", type=float, help="Time step (s)")
-    parser.add_argument("--enforce-axes", type=str, default="Z", help="Enforced axes (e.g. Z, XYZ)")
-    parser.add_argument("--rigid-xy", action="store_true", help="Apply mean X-Y displacement to avoid stretching")
-    parser.add_argument("--t-start", type=float, default=0.0, help="Start time for CSV data analysis")
+    parser.add_argument("--dt", type=float, help="Time step (s) [Default: 1e-4]")
+    parser.add_argument("--t-start", type=float, default=0.0, help="Start time (s) to crop CSV data")
     parser.add_argument("--solver-method", type=str, default="scipy", choices=["scipy", "jax"], help="Solver method")
-    parser.add_argument("--no-viz", action="store_true", help="Skip visualization")
+    parser.add_argument("--add-inertia", action="store_true", help="Apply automatic inertial loads (-m*a) derived from CSV acceleration")
+    parser.add_argument("--use-global-z", action="store_true", help="Use raw global Z displacements instead of local frame projection")
+    parser.add_argument("--no-viz", action="store_true", help="Skip the visualizer GUI after analysis")
+    
+    # Legacy arguments (ignored in Local Frame mode)
+    parser.add_argument("--enforce-axes", type=str, default="Z", help="[Legacy] Enforced axes (now handled by local frame)")
+    parser.add_argument("--rigid-xy", action="store_true", help="[Legacy] Apply mean X-Y (now handled by local frame)")
     
     args = parser.parse_args()
     run(args)
