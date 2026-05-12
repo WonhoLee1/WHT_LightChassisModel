@@ -320,33 +320,33 @@ def run_pos_dynamic(args):
 def extract_dynamic_snapshots(model, node_db, csv_path, t_start,
                               grid_n=3, add_inertia=True, use_global_z=False):
     """
-    영역별 변형 에너지(u^2) 합을 기준으로 최악의 시점을 추출하여
-    정적 하중 케이스(WHTLoadCase, weight) 튜플 리스트로 반환합니다.
+    exam4_dynamic.py 방법론으로 동해석 수행 후, 영역별 최대 변형 에너지 시점을
+    추출하여 ESL(Equivalent Static Load) 기반 정적 하중 케이스를 반환합니다.
+
+    ESL 구성:
+      F_ESL = K_base · u_dynamic  (전체 노드 등가 노달 하중)
+      코너 슬레이브 노드 Z DOF → 변위 BC (동해석 결과 직접 처방)
+      나머지 자유 DOF → F_ESL 노달 하중
+
+    중복 시점 처리:
+      여러 영역이 동일 시점에서 피크이면 weight를 누적 (해석은 1회)
 
     Parameters
     ----------
     model : WHTMeshModel
-        해석 대상 모델.
-    node_db : dict
-        {nid: (x, y, z)} 노드 좌표 딕셔너리.
+    node_db : dict  {nid: (x, y, z)}
     csv_path : str
-        4코너 위치 데이터 CSV 파일 경로.
-    t_start : float
-        충격 시작 시간 (s). 이 시점 이후의 데이터만 사용.
-    grid_n : int
-        바닥면 그리드 분할 수 (N x N).
-    add_inertia : bool
-        관성 하중(-ma) 포함 여부 (추천).
-    use_global_z : bool
-        True: 글로벌 Z 궤적 직접 추종 (시각 확인용, 인장 왜곡 주의).
-        False: 로컬 프레임 투영으로 순수 벤딩 추출 (정밀 해석용).
+    t_start : float  충격 시작 시간 (s)
+    grid_n : int  바닥면 그리드 분할 수 (N×N)
+    add_inertia : bool  관성 하중(-ma) 포함 여부
+    use_global_z : bool  True: 글로벌 Z 직접 사용, False: 로컬 프레임 투영
 
     Returns
     -------
     List[Tuple[WHTLoadCase, float]]
-        (LoadCase, weight=1.0) 튜플 리스트.
     """
     from wht_solver.wht_dynamic_solver import WHTDynamicSolver
+    from wht_solver.wht_solver import WHTSolver
     from wht_solver.wht_dynamic_common import DampingSpec
     from test_jaxSSO.exam4_dynamic import (
         calculate_local_z_history, calculate_corner_accelerations, _InterpLoadGroup
@@ -356,17 +356,17 @@ def extract_dynamic_snapshots(model, node_db, csv_path, t_start,
     mode_str = "글로벌 Z 궤적" if use_global_z else "로컬 프레임 벤딩"
     print(f"     [Mode] {mode_str} | 관성하중: {add_inertia} | Grid: {grid_n}x{grid_n}")
 
+    # ── [1] CSV 로드 ─────────────────────────────────────────────────────────
     df = pd.read_csv(csv_path, encoding='utf-8')
     df = df[df['Time'] >= t_start].reset_index(drop=True)
     time_arr = (df['Time'] - df['Time'].iloc[0]).to_numpy()
     dt = time_arr[1] - time_arr[0] if len(time_arr) > 1 else 1e-4
 
-    # 코너 변위 데이터 구성
+    # ── [2] 코너 변위/궤적 구성 ───────────────────────────────────────────────
     corner_labels = ['C5', 'C6', 'C7', 'C8']
     if use_global_z:
         corner_z = {lbl: (df[f"{lbl}_pos_Z"].to_numpy() - df[f"{lbl}_pos_Z"].iloc[0]) * 1000.0
                     for lbl in corner_labels}
-        # 가속도 계산용 궤적
         traj_mm = np.zeros((len(time_arr), 4, 3))
         for i, lbl in enumerate(corner_labels):
             for j, ax in enumerate(['X', 'Y', 'Z']):
@@ -376,42 +376,42 @@ def extract_dynamic_snapshots(model, node_db, csv_path, t_start,
 
     corner_accels = calculate_corner_accelerations(traj_mm, dt)
 
-    # 코너 노드 탐색 및 마스터 노드 설정
+    # ── [3] 코너 노드 탐색 + RBE3 마스터 노드 추가 ───────────────────────────
     bot_groups = _find_corner_nodes(node_db, 1800.0, 1200.0, 150.0, z_min=0.0, z_max=2.0)
     load_groups = []
-    master_nids = []
+    CORNER_MAP = {0: 'C5', 1: 'C6', 2: 'C7', 3: 'C8'}
 
-    for idx, ((_, _), cnids) in enumerate(bot_groups):
+    for idx, (_, cnids) in enumerate(bot_groups):
         pts = np.array([node_db[nid] for nid in cnids])
         mnid = 900000 + idx
         model.add_node(mnid, *np.mean(pts, axis=0))
         model.add_rbe3(900000 + idx, mnid, cnids, dofs=(0, 1, 2))
-        master_nids.append(mnid)
         lg = _InterpLoadGroup(node_ids=[mnid], dof=2,
-                              time_arr=time_arr, disp_arr=corner_z[corner_labels[idx]])
+                              time_arr=time_arr,
+                              disp_arr=corner_z[CORNER_MAP[idx]])
         load_groups.append(lg)
 
-    # 관성 하중 설정
+    # ── [4] 관성 하중 ────────────────────────────────────────────────────────
     all_xyz = np.array(list(node_db.values()))
     xmin, xmax = all_xyz[:, 0].min(), all_xyz[:, 0].max()
     ymin, ymax = all_xyz[:, 1].min(), all_xyz[:, 1].max()
-    dx, dy = (xmax - xmin) or 1.0, (ymax - ymin) or 1.0
+    dx_b = (xmax - xmin) or 1.0
+    dy_b = (ymax - ymin) or 1.0
 
-    solver = WHTDynamicSolver(model)
-    jm, sorted_nids, nid_to_idx = solver._build_jaxsso_model()
-    m_diag = solver._assemble_lumped_mass(jm, jm.ndof, sorted_nids, nid_to_idx)
+    dyn_solver = WHTDynamicSolver(model)
+    jm, sorted_nids_dyn, nid_to_idx_dyn = dyn_solver._build_jaxsso_model()
+    m_diag = dyn_solver._assemble_lumped_mass(jm, jm.ndof, sorted_nids_dyn, nid_to_idx_dyn)
 
     if add_inertia:
         for nid in node_db:
-            ix = nid_to_idx.get(nid)
+            ix = nid_to_idx_dyn.get(nid)
             if ix is None:
                 continue
             x, y, _ = node_db[nid]
-            nx, ny = (x - xmin) / dx, (y - ymin) / dy
-            # 쌍선형 보간으로 가속도 분배 (C5=+X+Y, C6=+X-Y, C7=-X-Y, C8=-X+Y)
+            nx, ny = (x - xmin) / dx_b, (y - ymin) / dy_b
             a = (corner_accels[:, 2] * (1 - nx) * (1 - ny) +
-                 corner_accels[:, 1] * nx * (1 - ny) +
-                 corner_accels[:, 0] * nx * ny +
+                 corner_accels[:, 1] * nx       * (1 - ny) +
+                 corner_accels[:, 0] * nx       * ny       +
                  corner_accels[:, 3] * (1 - nx) * ny)
             mass = m_diag[ix * 6 + 2]
             if mass > 0:
@@ -420,18 +420,20 @@ def extract_dynamic_snapshots(model, node_db, csv_path, t_start,
                 lg_i.load_type = "FORCE"
                 load_groups.append(lg_i)
 
-    # 과도 응답 해석
-    print(f"     -> 과도 응답 해석 중... ({len(time_arr)} steps)")
-    res = solver.solve_direct_dynamic(
-        load_groups, time_arr, damping=DampingSpec(zeta=0.02))
+    # ── [5] 동해석 ───────────────────────────────────────────────────────────
+    T_total = float(time_arr[-1])
+    dt_dyn  = float(time_arr[1] - time_arr[0]) if len(time_arr) > 1 else 1e-4
+    print(f"     -> 과도 응답 해석 중... ({len(time_arr)} steps, dt={dt_dyn:.2e}s, T={T_total:.4f}s)")
+    res = dyn_solver.solve_direct_dynamic(
+        load_groups, dt=dt_dyn, T=T_total,
+        damping=DampingSpec(mode="zeta", zeta=0.02), n_save=100)
 
-    # 영역별 변형 에너지 피크 추출
+    # ── [6] 영역별 최대 변형 에너지 시점 추출 (중복 허용, weight 누적) ──────────
     floor_nids = [nid for nid in node_db if node_db[nid][2] < 5.0]
     gx = np.linspace(xmin, xmax, grid_n + 1)
     gy = np.linspace(ymin, ymax, grid_n + 1)
 
-    snapshots = []
-    seen = set()
+    peak_weight: dict = {}   # {pk_index: weight}
     for i in range(grid_n):
         for j in range(grid_n):
             region = [nid for nid in floor_nids
@@ -439,34 +441,95 @@ def extract_dynamic_snapshots(model, node_db, csv_path, t_start,
                       and gy[j] <= node_db[nid][1] < gy[j + 1]]
             if not region:
                 continue
-            dof_indices = [nid_to_idx[nid] * 6 + 2 for nid in region
-                           if nid in nid_to_idx]
-            if not dof_indices:
+            node_indices = [nid_to_idx_dyn[nid] for nid in region if nid in nid_to_idx_dyn]
+            if not node_indices:
                 continue
-            u_r = res.displacements[:, dof_indices]
+            u_r    = res.u[:, node_indices, 2]
             energy = np.sum(u_r ** 2, axis=1)
-            pk = int(np.argmax(energy))
-            if pk in seen:
+            if np.max(energy) < 1e-12:
+                print(f"     Grid({i},{j}): 유의미한 변위 없음 (skip)")
                 continue
-            seen.add(pk)
-            t_val = res.time[pk]
-            u_snap = res.displacements[pk]
+            pk     = int(np.argmax(energy))
+            peak_weight[pk] = peak_weight.get(pk, 0) + 1
+            print(f"     Grid({i},{j}): 피크 t={res.t_saved[pk]:.4f}s  E={energy[pk]:.2e}")
 
-            lc = WHTLoadCase(name=f"Dyn_{t_val:.3f}s")
-            for midx in range(4):
-                val = float(u_snap[nid_to_idx[900000 + midx] * 6 + 2])
-                lc.add_bc([900000 + midx], dofs=(2,), value=val)
-            lc.add_bc([900000], dofs=(0, 1))  # 안정성 구속
-            snapshots.append((lc, 1.0))
-            print(f"     -> Snapshot: t={t_val:.4f}s, E_proxy={energy[pk]:.2e}")
+    print(f"     -> 고유 피크 {len(peak_weight)}개 / 전체 영역 {grid_n*grid_n}개")
 
-    # 모델 원상 복구 (마스터 노드 및 RBE3 제거)
+    # ── [7] 모델 원상 복구 (마스터 노드 + RBE3 제거) ─────────────────────────
     for nid in range(900000, 900004):
         if nid in model.nodes:
             del model.nodes[nid]
     model.rbe3s = {k: v for k, v in model.rbe3s.items() if k < 900000}
 
-    print(f"     -> 총 {len(snapshots)}개 동적 스냅샷 추출 완료.")
+    # ── [8] K_base 조립 (원복된 모델 기준) ───────────────────────────────────
+    print(f"     -> K_base 조립 중...")
+    static_solver = WHTSolver(model)
+    jm_base, sorted_nids_orig, nid_to_idx_orig = static_solver._build_jaxsso_model(load_case=None)
+    K_base = static_solver._assemble_K_scipy(jm_base, sorted_nids_orig, nid_to_idx_orig,
+                                             stabilize=True)
+    ndof_orig = len(sorted_nids_orig) * 6
+    print(f"     -> K_base: {ndof_orig}×{ndof_orig}, nnz={K_base.nnz}")
+
+    # 코너 구속 DOF 집합 — ESL 힘 적용에서 제외
+    stab_nid = bot_groups[0][1][0]
+    corner_bc_dofs: set = set()
+    for midx in range(4):
+        for cnid in bot_groups[midx][1]:
+            if cnid in nid_to_idx_orig:
+                corner_bc_dofs.add(nid_to_idx_orig[cnid] * 6 + 2)   # Z
+    if stab_nid in nid_to_idx_orig:
+        corner_bc_dofs.add(nid_to_idx_orig[stab_nid] * 6 + 0)       # X
+        corner_bc_dofs.add(nid_to_idx_orig[stab_nid] * 6 + 1)       # Y
+
+    # ── [9] 피크 시점별 ESL 하중 케이스 생성 ─────────────────────────────────
+    snapshots = []
+    for pk, weight in sorted(peak_weight.items()):
+        t_val  = float(res.t_saved[pk])
+        u_snap = res.u[pk]   # (n_nodes_dyn, 6)
+
+        # 원복 모델 DOF 순서로 전체 변위 벡터 재구성
+        u_full = np.zeros(ndof_orig)
+        for nid in sorted_nids_orig:
+            dyn_idx = nid_to_idx_dyn.get(nid)
+            if dyn_idx is None:
+                continue
+            orig_idx = nid_to_idx_orig[nid]
+            u_full[orig_idx * 6: orig_idx * 6 + 6] = u_snap[dyn_idx, :]
+
+        # ESL: F = K_base · u_dynamic
+        F_esl = K_base @ u_full
+        f_thr = max(float(np.max(np.abs(F_esl))) * 1e-4, 1e-6)
+
+        lc = WHTLoadCase(name=f"Dyn_{t_val:.4f}s")
+
+        # 코너 슬레이브 노드: Z 변위 BC
+        for midx in range(4):
+            for cnid in bot_groups[midx][1]:
+                if cnid in nid_to_idx_orig:
+                    val = float(u_snap[nid_to_idx_dyn[cnid], 2])
+                    lc.add_bc([cnid], dofs=(2,), value=val)
+        # 안정성 구속: X, Y
+        lc.add_bc([stab_nid], dofs=(0, 1))
+
+        # 자유 노드: ESL 노달 하중 (코너 구속 DOF 제외, 노드별 일괄 적용)
+        n_forces = 0
+        for nid in sorted_nids_orig:
+            orig_idx = nid_to_idx_orig[nid]
+            f_node = F_esl[orig_idx * 6: orig_idx * 6 + 6].copy()
+            for d in range(6):
+                if (orig_idx * 6 + d) in corner_bc_dofs:
+                    f_node[d] = 0.0
+            active = [(d, float(f_node[d])) for d in range(6) if abs(f_node[d]) > f_thr]
+            if active:
+                dofs_t  = tuple(d for d, _ in active)
+                vals_t  = tuple(v for _, v in active)
+                lc.add_force([nid], dofs=dofs_t, values=vals_t)
+                n_forces += len(active)
+
+        snapshots.append((lc, float(weight)))
+        print(f"     -> ESL Snapshot: t={t_val:.4f}s  weight={weight}  forces={n_forces}")
+
+    print(f"     -> 총 {len(snapshots)}개 ESL 스냅샷 생성 완료.")
     return snapshots
 
 
