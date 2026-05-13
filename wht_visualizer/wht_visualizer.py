@@ -1367,7 +1367,7 @@ class WHTVisualizer:
         
         self.set_timestep(self.current_timestep)
 
-    def _apply_colorbar_range(self):
+    def _apply_colorbar_range(self, show_stats=False):
         """Applies global min-max range to the scalar bar across all parts.
         [Optimization] Prevents flickering by only re-creating the scalar bar when the field changes.
         """
@@ -1380,7 +1380,7 @@ class WHTVisualizer:
         if mode == "Dynamic (Auto)":
             rng = self._get_field_global_range(field)
         elif mode == "Robust (Auto)":
-            rng = self._calculate_robust_range(field)
+            rng = self._calculate_robust_range(field, show_stats=show_stats)
             self.range_min, self.range_max = rng
         else:
             # Static (Fixed) mode
@@ -1434,7 +1434,7 @@ class WHTVisualizer:
                 # Re-enforce 60px to prevent jumping during range updates
                 self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
             
-    def _calculate_robust_range(self, field_name: str, p_low: float = None, p_high: float = None) -> List[float]:
+    def _calculate_robust_range(self, field_name: str, p_low: float = None, p_high: float = None, show_stats: bool = False) -> List[float]:
         """Ignores outliers based on percentiles."""
         if p_low is None or p_high is None:
             pct = self.robust_pct
@@ -1481,15 +1481,13 @@ class WHTVisualizer:
                 if std is None or np.isnan(std) or std <= 1e-12: return 0.0
                 return (val - mu) / std
             
-            if not getattr(self, 'is_playing', False):
-                print(f"\n[WHT-STATS] Field: {field_name}")
-                print(f"  > Absolute MAX: {v_max:.4e} (Z: {get_z(v_max):.2f}s)")
-                print(f"  > 99th Pct    : {p99:.4e} (Z: {get_z(p99):.2f}s)")
-                print(f"  > 95th Pct    : {p95:.4e} (Z: {get_z(p95):.2f}s)")
-                print(f"  > Robust MAX ({p_high}%): {r_max:.4e} (Z: {get_z(r_max):.2f}s)")
-                print(f"  > Absolute MIN: {float(np.nanmin(merged)):.4e}")
-                print(f"  > Mean/Std    : {mu:.4e} / {std:.4e}")
-                print(f"  > Total Nodes : {len(merged):,}")
+            if show_stats and not getattr(self, 'is_playing', False):
+                min_v = float(np.nanmin(merged))
+                cv = (std / mu * 100) if mu != 0 else 0.0
+                
+                print(f"[WHT-STATS] Field: {field_name} | Nodes: {len(merged):,}")
+                print(f"  > MAX: {v_max:.4e} (Z:{get_z(v_max):.2f}) | 99%: {p99:.4e} | 95%: {p95:.4e} | MIN: {min_v:.4e}")
+                print(f"  > Robust: {r_max:.4e} ({p_high}%) | Mean: {mu:.4e} | Std: {std:.4e} | CV: {cv:.1f}%")
         except Exception as e:
             if not getattr(self, 'is_playing', False):
                 print(f"[WHT-ERROR] Stats calculation failed: {e}")
@@ -1720,7 +1718,7 @@ class WHTVisualizer:
                     else:
                         part["actor"].mapper.scalar_visibility = False
 
-            self._apply_colorbar_range()
+            self._apply_colorbar_range(show_stats=False)
         except Exception as e:
             print(f" -> [Visualizer Error] Failed to bind data at step {t_idx}: {e}")
 
@@ -1797,7 +1795,7 @@ class WHTVisualizer:
             self._apply_warping()
             # [WHT Performance] Scalar range is usually held static during playback 
             # unless Dynamic mode is on.
-            self._apply_colorbar_range() 
+            self._apply_colorbar_range(show_stats=False) 
             self.plotter.render()
         finally:
             self._is_updating = False
@@ -1946,7 +1944,7 @@ class WHTVisualizer:
     def _on_range_mode_changed(self, mode):
         """[User Request] Handles transition between Auto, Robust, and Fixed ranges."""
         # Spinboxes removed from main panel as requested; Adjust dialog covers details.
-        self._apply_colorbar_range()
+        self._apply_colorbar_range(show_stats=True)
 
     def _open_range_adjust_dialog(self):
         """[WHT] Range Dialog를 모달리스(Modeless)로 띄워 실시간 조작을 지원합니다."""
@@ -1986,7 +1984,7 @@ class WHTVisualizer:
             def set_robust_pct(self, pct): self.vis.robust_pct = pct
             def set_range(self, v_min, v_max):
                 self.vis.range_min, self.vis.range_max = v_min, v_max
-                self.vis._apply_colorbar_range()
+                self.vis._apply_colorbar_range(show_stats=True)
 
         self._range_dialog = WHTRangeDialog(self, field, DummyGroup(self), get_limits, get_robust)
         self._range_dialog.setWindowFlags(self._range_dialog.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
@@ -2045,7 +2043,7 @@ class WHTVisualizer:
                         if hasattr(actor.mapper.lookup_table, 'Build'):
                             actor.mapper.lookup_table.Build()
                     
-        self._apply_colorbar_range()
+        self._apply_colorbar_range(show_stats=True)
         print(f" -> [Visualizer] Switched result to: {name}")
         self.plotter.render()
 

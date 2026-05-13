@@ -16,9 +16,9 @@ import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QTabWidget, QHeaderView,
-    QComboBox, QLabel, QPushButton
+    QComboBox, QLabel, QPushButton, QSlider
 )
-from PySide6.QtCore import Signal, QObject, QThread
+from PySide6.QtCore import Signal, QObject, QThread, Qt
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 try:
@@ -105,6 +105,9 @@ class WHTMonitorWindow(QMainWindow):
         self._height_colorbar = None
         self.status_label = None
         self.stop_btn = None
+        self.height_slider = None
+        self.btn_prev_h = None
+        self.btn_next_h = None
 
         # ── 2. UI 초기화 ──
         self._init_ui()
@@ -153,9 +156,27 @@ class WHTMonitorWindow(QMainWindow):
         ctrl3 = QHBoxLayout()
         self.height_iter_combo = QComboBox()
         self.height_iter_combo.addItem("Latest")
-        self.height_iter_combo.currentIndexChanged.connect(self._update_height_plot)
+        self.height_iter_combo.currentIndexChanged.connect(self._on_height_combo_changed)
+        
+        self.btn_prev_h = QPushButton("<")
+        self.btn_prev_h.setFixedWidth(30)
+        self.btn_prev_h.clicked.connect(self._on_prev_height)
+        
+        self.btn_next_h = QPushButton(">")
+        self.btn_next_h.setFixedWidth(30)
+        self.btn_next_h.clicked.connect(self._on_next_height)
+
+        self.height_slider = QSlider(Qt.Horizontal)
+        self.height_slider.setMinimum(0)
+        self.height_slider.setMaximum(0)
+        self.height_slider.valueChanged.connect(self._on_height_slider_changed)
+
         ctrl3.addWidget(QLabel("Iteration:"))
+        ctrl3.addWidget(self.btn_prev_h)
         ctrl3.addWidget(self.height_iter_combo)
+        ctrl3.addWidget(self.btn_next_h)
+        ctrl3.addWidget(QLabel("  Slider:"))
+        ctrl3.addWidget(self.height_slider)
         ctrl3.addStretch()
         lay3.addLayout(ctrl3)
         self.height_canvas = PlotCanvas(tab3)
@@ -278,6 +299,13 @@ class WHTMonitorWindow(QMainWindow):
                     self.height_iter_combo.blockSignals(True)
                     self.height_iter_combo.insertItem(1, f"Iter {it:03d}")
                     self.height_iter_combo.blockSignals(False)
+                    
+                if self.height_slider:
+                    self.height_slider.blockSignals(True)
+                    self.height_slider.setMaximum(it + 1) # 0:Latest, 1:Iter0, ..., N+1:IterN
+                    if self.height_iter_combo.currentIndex() == 0:
+                        self.height_slider.setValue(it + 1)
+                    self.height_slider.blockSignals(False)
 
             # ── 테이블 행 추가 ──
             if self.table and self.table.columnCount() > 0:
@@ -403,6 +431,48 @@ class WHTMonitorWindow(QMainWindow):
     # ────────────────────────────────────────────────────────────────────────
     # Height Distribution 탭
     # ────────────────────────────────────────────────────────────────────────
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Height Distribution 제어 핸들러
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _on_height_combo_changed(self, idx):
+        """콤보박스 변경 시 슬라이더 동기화 및 그래프 갱신."""
+        if self.height_slider and not self.height_slider.signalsBlocked():
+            self.height_slider.blockSignals(True)
+            # 콤보박스 인덱스 0: Latest -> 슬라이더 최대값
+            # 콤보박스 인덱스 1: Iter N -> 슬라이더 N+1
+            # 콤보박스 인덱스 M: Iter N-M+1 -> 슬라이더 N-M+2
+            # 슬라이더 값 = (최대값) - idx + (일부 오프셋)? 
+            # 규칙: 슬라이더 0 = 최신(Latest), 1 = Iter 0, 2 = Iter 1 ... 이면 직관적임.
+            # 하지만 현재 콤보박스는 0:Latest, 1:Iter N, 2:Iter N-1 ... 임.
+            # 직관적으로 슬라이더 오른쪽이 최신이게 하려면:
+            # 슬라이더 값 0: Iter 0, 1: Iter 1 ... N: Iter N, N+1: Latest
+            max_val = self.height_slider.maximum()
+            self.height_slider.setValue(max_val - idx)
+            self.height_slider.blockSignals(False)
+        self._update_height_plot()
+
+    def _on_height_slider_changed(self, val):
+        """슬라이더 변경 시 콤보박스 동기화 및 그래프 갱신."""
+        if self.height_iter_combo and not self.height_iter_combo.signalsBlocked():
+            self.height_iter_combo.blockSignals(True)
+            max_val = self.height_slider.maximum()
+            self.height_iter_combo.setCurrentIndex(max_val - val)
+            self.height_iter_combo.blockSignals(False)
+        self._update_height_plot()
+
+    def _on_prev_height(self):
+        """이전 이터레이션 (슬라이더 감소/콤보박스 인덱스 증가)"""
+        idx = self.height_iter_combo.currentIndex()
+        if idx < self.height_iter_combo.count() - 1:
+            self.height_iter_combo.setCurrentIndex(idx + 1)
+
+    def _on_next_height(self):
+        """다음 이터레이션 (슬라이더 증가/콤보박스 인덱스 감소)"""
+        idx = self.height_iter_combo.currentIndex()
+        if idx > 0:
+            self.height_iter_combo.setCurrentIndex(idx - 1)
 
     def _update_height_plot(self):
         if not self.height_canvas or not self.height_snapshots:
