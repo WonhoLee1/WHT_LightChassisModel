@@ -278,10 +278,26 @@ class WHTMonitorWindow(QMainWindow):
                             elif h_text.startswith("S_"):
                                 h_item.setToolTip(f"[{h_text[2:]}] 하중 케이스의 최대 폰-미세스 응력 [MPa]")
 
+            n_iters_so_far = len(self.history["iter"])  # 이미 append된 후의 길이
             for name, res in cases_data.items():
+                if name not in self.history["cases"]:
+                    # 반복 ESL 모드: 이터레이션마다 ESL 케이스 이름이 바뀜 → 동적 등록
+                    # 이전 이터레이션분을 0으로 패딩
+                    self.history["cases"][name] = {
+                        "U":          [0.0] * (n_iters_so_far - 1),
+                        "max_disp":   [0.0] * (n_iters_so_far - 1),
+                        "max_stress": [0.0] * (n_iters_so_far - 1),
+                    }
                 self.history["cases"][name]["U"].append(res["U"])
                 self.history["cases"][name]["max_disp"].append(res["max_disp"])
                 self.history["cases"][name]["max_stress"].append(res["max_stress"])
+
+            # 이번 이터레이션에 없는 케이스는 0으로 패딩 (길이 불일치 방지)
+            for name, hist in self.history["cases"].items():
+                if len(hist["U"]) < n_iters_so_far:
+                    hist["U"].append(0.0)
+                    hist["max_disp"].append(0.0)
+                    hist["max_stress"].append(0.0)
 
             # ── Height Distribution 스냅샷 저장 ──
             coords = data.get("coords")

@@ -1,12 +1,11 @@
 import numpy as np
-import jax
 import jax.numpy as jnp
 from typing import Dict, Tuple, List
 from wht_modeler.wht_selector import WHTSelector
 from wht_modeler.wht_mesh_model import WHTMeshModel
-from wht_solver.load_cases import WHTLoadCase, LoadCaseLibrary
+from wht_solver.load_cases import WHTLoadCase
 from wht_solver.wht_dynamic_solver import WHTDynamicSolver
-from wht_solver.wht_dynamic_common import DynamicLoadGroup, DampingSpec
+from wht_solver.wht_dynamic_common import DampingSpec
 from wht_modeler.wht_dynamic_utils import (
     find_corner_nodes, 
     calculate_local_z_history, 
@@ -361,7 +360,7 @@ class StochasticLoadManager:
             # 리프팅 가중치를 4개 케이스로 나누어 적용 (전체 비중 유지)
             load_cases.append((lc_lift, weights["lifting"] / 4.0))
 
-        return load_cases
+        return [(lc, w) for lc, w in load_cases if w != 0.0]
 
 
     def generate_random_load_case(self, 

@@ -11,11 +11,44 @@ Topography Optimization Solver — wht_solver 기반 정밀 구현.
 
 핵심 아키텍처:
     - 설계 변수 : 바닥면 노드별 비드 높이 h_n ∈ [0, h_max]
-    - 목적 함수 : 멀티 케이스 가중 컴플라이언스 C = Σ w_i * F_i^T u_i 최소화
+    - 목적 함수 : 멀티 케이스 가중 컴플라이언스 최소화 (3가지 변형 지원, 아래 참조)
     - 민감도    : ∂C/∂h_n = Σ_{e∈N(n)} u_e^T (∂K_e/∂z_n) u_e  (Adjoint)
                   — QUAD4/TRIA3 모두 JAX Auto-Diff (vmap), 전체 K 재조립 불필요
     - 필터링    : 공간 필터(rmin)로 최소 비드 폭 제어
     - 업데이트  : MMA (Method of Moving Asymptotes)
+
+[목적함수 변형 — obj_type / normalize_obj / freq_weight]
+
+  ① 기본 가중 합산 (obj_type='sum', normalize_obj=False, 기본값)
+       f = (Σ w_i · C_i) / C_0
+       · C_0 = 초기 총 컴플라이언스 (이터레이션 0 기준, 스케일 정규화용)
+       · 민감도: df/dh = (Σ w_i · ∂C_i/∂h) / C_0
+       · 주의: 하중 크기가 케이스마다 크게 다르면 큰 케이스가 목적함수를 지배.
+
+  ② 케이스별 정규화 가중 합산 (normalize_obj=True)
+       f = Σ w_i · (C_i / C_i0)
+       · C_i0 = 이터레이션 0에서 케이스 i의 컴플라이언스 (케이스별 정규화)
+       · 서로 다른 크기의 정적·동적 ESL 케이스를 균등하게 반영할 때 사용.
+       · 민감도: df/dh = Σ (w_i/C_i0) · ∂C_i/∂h
+
+  ③ Softmax 최악 케이스 (obj_type='max')
+       f = (1/α) · log(Σ exp(α · w_i · C_i/C_i0))
+       · α = obj_alpha (softmax 온도). 클수록 hard-max에 수렴, 작을수록 부드러운 평균.
+       · 가장 나쁜 케이스에 집중 최적화 → Min-Max 강성화 효과.
+       · 민감도: df/dh = Σ (softmax_weight_i · (w_i/C_i0) · ∂C_i/∂h)
+         softmax_weight_i = exp(α·w_i·C_i/C_i0) / Σ exp(...)  (수치 안정: max-trick)
+
+  ④ 혼합 목적함수 (obj_type='sum+max')
+       f = 0.5 · f_sum + 0.5 · f_max
+       · 평균 성능(sum)과 최악 케이스 방어(max)를 동시에 고려.
+
+  ⑤ 고유진동수 패널티 (freq_weight > 0, freq_target > 0)
+       P = freq_weight · max(0, freq_target - f₁)² / freq_target²
+       · f₁ = 현재 비드 형상의 첫 번째 탄성 고유진동수 [Hz]
+       · 위의 어떤 목적함수와도 병합 가능: f_total = f_obj + P
+       · 민감도: dP/dh = -2·freq_weight·deficit/freq_target² · df₁/dh
+         df₁/dh ≈ φ₁ᵀ(∂K/∂h)φ₁ / (4π²f₁)   — 단위 모달 질량 가정
+         (φ₁ = 첫 번째 탄성 모드 형상, 동일한 JAX vmap 민감도 인프라 재사용)
 
 wht_solver 활용:
     - WHTSolver.solve_static(WHTLoadCase)  → 각 하중 케이스별 변위 해석
@@ -30,8 +63,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
-from typing import List, Dict, Optional, Tuple, Union
-from copy import deepcopy
+from typing import List, Dict, Optional, Tuple
 
 from wht_modeler.wht_mesh_model import WHTMeshModel
 from wht_solver.wht_solver import WHTSolver
@@ -110,6 +142,24 @@ class WHTopographySolver:
         민감도 계산 시 Z 방향 중앙차분 섭동량 [mm]. 기본값 0.5.
     sym_x : bool
         좌우 대칭 제약 조건 활성화 여부. 기본값 False.
+    normalize_obj : bool
+        True 이면 케이스별 초기 컴플라이언스(C_i0)로 각 케이스를 정규화.
+        f = Σ w_i·(C_i/C_i0). 정적·동적 ESL 케이스의 크기가 달라도 균등 반영.
+        기본값 False (초기 총 컴플라이언스 C_0으로 단순 스케일링).
+    obj_type : str
+        목적함수 유형. 'sum'(기본), 'max'(softmax 최악 케이스), 'sum+max'(혼합).
+        - 'sum'    : f = Σ w_i·C_i  (또는 normalize_obj=True 시 Σ w_i·C_i/C_i0)
+        - 'max'    : f = (1/α)·log(Σ exp(α·w_i·C_i/C_i0))  — 최악 케이스 집중 최적화
+        - 'sum+max': f = 0.5·f_sum + 0.5·f_max             — 평균+최악 균형
+    obj_alpha : float
+        Softmax 온도 파라미터 (obj_type='max'/'sum+max' 시 유효). 기본값 10.0.
+        클수록 hard-max에 수렴(가장 나쁜 케이스만 반영), 작을수록 soft-average.
+    freq_weight : float
+        고유진동수 패널티 가중치 λ. 0이면 비활성. 기본값 0.0.
+        P = λ·max(0, freq_target-f₁)²/freq_target²
+    freq_target : float
+        목표 최저 탄성 고유진동수 [Hz]. f₁ < freq_target 인 경우 패널티 부과.
+        민감도는 JAX vmap을 통해 모드 형상 φ₁로 계산: df₁/dh ≈ φ₁ᵀ∂K/∂h φ₁/(4π²f₁).
     """
 
     # wht_solver와 동일한 쉘 요소 타입 집합
@@ -134,6 +184,13 @@ class WHTopographySolver:
         connect_gap: float = 80.0,
         bead_steps: int = 0,
         load_cases: Optional[List[Tuple["WHTLoadCase", float]]] = None,
+        load_case_provider=None,
+        out_dir=None,
+        normalize_obj: bool = False,
+        obj_type: str = "sum",
+        obj_alpha: float = 10.0,
+        freq_weight: float = 0.0,
+        freq_target: float = 0.0,
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -144,10 +201,18 @@ class WHTopographySolver:
         self.fd_dz          = fd_dz
         self.sym_x          = sym_x
         self.bead_connect   = bead_connect
-        self.connect_gap    = connect_gap 
-        self.bead_steps     = bead_steps  
+        self.connect_gap    = connect_gap
+        self.bead_steps     = bead_steps
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
-        self.load_cases_input = load_cases # 외부 주입 하중 케이스
+        self.load_cases_input    = load_cases
+        self._load_case_provider = load_case_provider
+        self._out_dir            = out_dir  # results/D날짜_시간/ — None이면 자동 생성
+        self.normalize_obj       = normalize_obj
+        self.obj_type            = obj_type   # "sum" | "max" | "sum+max"
+        self.obj_alpha           = obj_alpha  # softmax 온도 (클수록 hard-max에 가까움)
+        self.freq_weight         = freq_weight
+        self.freq_target         = freq_target  # Hz
+        self._C_0_cases: Dict[str, float] = {}  # 케이스별 기준 컴플라이언스 (정규화용)
 
         # ... (중략) ...
         self._beta = 1.0
@@ -190,19 +255,27 @@ class WHTopographySolver:
         # 공간 필터 행렬 (최소 비드 폭 제어)
         self._H = self._build_filter()
 
-        # 하중 케이스 생성 (하중별 개별 BC 포함)
-        if self.load_cases_input:
-            print(f" -> [Solver] 외부 주입 하중 케이스 {len(self.load_cases_input)}개 로드됨.")
-            self._load_cases = self.load_cases_input
+        # 정적 하중 케이스 초기화 (이터레이션 간 고정)
+        # load_cases_input is not None: 외부에서 명시적으로 주입 (빈 리스트 포함 — --no-static)
+        if self.load_cases_input is not None:
+            self._static_load_cases = list(self.load_cases_input)
+            print(f" -> [Solver] 외부 주입 정적 하중 케이스 {len(self._static_load_cases)}개 로드됨"
+                  f"{'  (--no-static: 정적 하중 없음)' if len(self._static_load_cases) == 0 else ''}.")
         elif self.load_manager:
             print(" -> [Solver] 하중 케이스 생성 중 (하중별 개별 BC 적용)...")
-            self._load_cases = self.load_manager.get_load_cases(
+            self._static_load_cases = self.load_manager.get_load_cases(
                 mesh_size_z=mesh_size_z,
                 weights=self.weights,
             )
         else:
             print(" -> [Error] 하중 케이스 정보가 없습니다.")
-            self._load_cases = []
+            self._static_load_cases = []
+
+        if self._load_case_provider is not None:
+            print(" -> [Solver] 동적 ESL provider 등록됨 — 매 이터레이션 재추출.")
+            self._load_cases = list(self._static_load_cases)  # 초기값: 정적만
+        else:
+            self._load_cases = list(self._static_load_cases)
 
         # 좌우 대칭 매핑 (X-mid plane 기준)
         self._sym_map = None
@@ -616,7 +689,9 @@ class WHTopographySolver:
 
     # ─────────────── 컴플라이언스 및 민감도 ───────────────
 
-    def _compute_total_compliance(self, solver) -> Tuple[float, dict, np.ndarray]:
+    def _compute_total_compliance(
+        self, solver
+    ) -> Tuple[float, dict, np.ndarray, Dict[str, np.ndarray]]:
         """
         현재 비드 형상에서의 총 컴플라이언스 및 설계 변수별 민감도를 계산합니다.
 
@@ -632,17 +707,31 @@ class WHTopographySolver:
 
         Returns
         -------
-        total_C : float, case_responses : dict, total_sens : (n_design,)
+        total_C : float
+            가중 합산 컴플라이언스 Σ w_i·C_i. 이터레이션 출력·수렴 판정에 사용.
+        case_responses : dict
+            {name: {'C': C_i, 'max_disp': ..., 'max_stress': ..., 'result': ...}}
+        total_sens : (n_design,) ndarray
+            가중 합산 민감도 Σ w_i·(∂C_i/∂h). obj_type='sum' 기본 경로에서 직접 사용.
+        per_case_sens : dict[str, ndarray]
+            케이스별 비가중 민감도 {name: ∂C_i/∂h (n_design,)}.
+            정규화·softmax·패널티 목적함수 계산 시 solve() 에서 가중치를 별도 적용.
+
+        Notes
+        -----
+        - 노드 좌표 배열 self._last_quad_c_jnp / self._last_tria_c_jnp 에 저장됨.
+          고유진동수 패널티의 모드 형상 민감도(solve() 내부)가 이를 재사용.
         """
         from scipy.sparse.linalg import spsolve
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from wht_solver.wht_stress_recovery import ElementStressRecovery
         from wht_solver.wht_result import WHTSolverResult
 
-        ndof       = len(self.sorted_nids) * 6
-        total_C    = 0.0
+        ndof           = len(self.sorted_nids) * 6
+        total_C        = 0.0
         case_responses = {}
-        total_sens = np.zeros(self._n_design)
+        total_sens     = np.zeros(self._n_design)
+        per_case_sens: Dict[str, np.ndarray] = {}
 
         # ── 1. K_base 1회 조립 (BC 없는 기하학 전용) ─────────────────────────
         jm_base, _snids, _nidx = solver._build_jaxsso_model(load_case=None)
@@ -720,6 +809,10 @@ class WHTopographySolver:
                 solve_results[i] = (w, future.result())
 
         # ── 5. 결과 수집 + JAX 민감도 (순차 — JAX GIL 이슈) ──────────────────
+        # 좌표 배열을 인스턴스에 저장 → solve()의 주파수 민감도 계산에서 재사용
+        self._last_quad_c_jnp = quad_c_jnp if self._n_quad > 0 else None
+        self._last_tria_c_jnp = tria_c_jnp if self._n_tria > 0 else None
+
         for weight, (name, C_i, u_full, displacement, cell_data_r, result) in solve_results:
             total_C += weight * C_i
             stress_vals = cell_data_r["Stress"][0]
@@ -729,6 +822,9 @@ class WHTopographySolver:
                 "max_stress": _von_mises_max(stress_vals),
                 "result":     result,
             }
+
+            # 케이스별 비가중 민감도 (∂C_i/∂h, 가중치 미포함)
+            case_sens = np.zeros(self._n_design)
 
             if self._n_quad > 0:
                 quad_ue = u_full[self._quad_dof_idx]
@@ -742,7 +838,7 @@ class WHTopographySolver:
                 proj = np.einsum('qnd,d->qn', grad_stack, self.bead_dir)
                 mask = self._quad_node_design_idx >= 0
                 valid_design_idx = np.where(mask, self._quad_node_design_idx, 0)
-                np.add.at(total_sens, valid_design_idx, np.where(mask, -weight * proj, 0.0))
+                np.add.at(case_sens, valid_design_idx, np.where(mask, -proj, 0.0))
 
             if self._n_tria > 0:
                 tria_ue = u_full[self._tria_dof_idx]
@@ -755,9 +851,12 @@ class WHTopographySolver:
                 proj_t = np.einsum('qnd,d->qn', grad_stack_t, self.bead_dir)
                 mask_t = self._tria_node_design_idx >= 0
                 valid_design_idx_t = np.where(mask_t, self._tria_node_design_idx, 0)
-                np.add.at(total_sens, valid_design_idx_t, np.where(mask_t, -weight * proj_t, 0.0))
+                np.add.at(case_sens, valid_design_idx_t, np.where(mask_t, -proj_t, 0.0))
 
-        return total_C, case_responses, total_sens
+            per_case_sens[name] = case_sens
+            total_sens += weight * case_sens
+
+        return total_C, case_responses, total_sens, per_case_sens
 
     # ─────────────── 메인 최적화 루프 ───────────────
 
@@ -800,8 +899,11 @@ class WHTopographySolver:
         from wht_converter.wht_models import WHTMetadata
         from wht_converter.wht_exporters import VTKHDFExporter
 
-        stamp = datetime.now().strftime("D%Y%m%d_%H%M%S")
-        export_dir = os.path.join("results", stamp)
+        if self._out_dir is not None:
+            export_dir = str(self._out_dir / "paraview")
+        else:
+            stamp = datetime.now().strftime("D%Y%m%d_%H%M%S")
+            export_dir = os.path.join("results", stamp)
         os.makedirs(export_dir, exist_ok=True)
         exporter = VTKHDFExporter()
         meta = WHTMetadata(
@@ -834,12 +936,24 @@ class WHTopographySolver:
             h_filtered = self._H @ h_phys
             self._apply_heights(h_filtered)
 
+            # 동적 ESL 재추출 (provider 등록 시 매 이터레이션 실행)
+            if self._load_case_provider is not None:
+                dyn_cases = self._load_case_provider(i)
+                self._load_cases = list(self._static_load_cases) + list(dyn_cases)
+                print(f"  │  하중 케이스: 정적 {len(self._static_load_cases)}개 "
+                      f"+ 동적 ESL {len(dyn_cases)}개 = 총 {len(self._load_cases)}개")
+
             # 컴플라이언스 및 민감도 계산 (솔버 인스턴스 공유)
-            C_total, C_responses, dC_dh = self._compute_total_compliance(fea_solver)
-            
+            C_total, C_responses, dC_dh_base, per_case_sens = self._compute_total_compliance(fea_solver)
+            ndof = len(self.sorted_nids) * 6
+
             # 초기값 저장 및 정규화 (수렴 안정성 강화)
             if C_0 is None:
-                C_0 = float(C_total) if float(C_total) > 1e-6 else 1.0
+                C_0 = max(abs(float(C_total)), 1e-6)
+                self._C_0_cases = {
+                    name: max(abs(C_responses[name]['C']), 1e-10)
+                    for name in C_responses
+                }
 
             # ── 고유진동수 해석 (10차 모드) ──
             try:
@@ -891,12 +1005,148 @@ class WHTopographySolver:
                 # 파일 출력 (모든 필드를 1개 파일에 병합)
                 out_path = os.path.join(export_dir, f"iter_{i:03d}.hdf")
                 exporter.export(wht_data, out_path)
+
+                # LS-DYNA .k 저장 (이터레이션별 비드 패턴 기록)
+                lsdyna_path = os.path.join(export_dir, f"iter_{i:03d}.k")
+                try:
+                    self.model.export_to_solver('lsdyna', lsdyna_path, reorder=True)
+                except Exception as _ke:
+                    print(f"    [경고] LS-DYNA .k 저장 실패 (Iter {i}): {_ke}")
             except Exception as e:
                 print(f"    [경고] 해석 결과 저장 실패: {e}")
 
-            # 목적 함수 및 민감도 정규화 (MMA 엔진이 제약 조건을 더 잘 인식하도록 함)
-            f0val = float(C_total) / C_0
-            
+            # ── 목적함수 값 및 민감도 계산 (obj_type / normalize_obj 분기) ──────
+            # weights_map: {케이스명 → w_i}  (self._load_cases에서 추출)
+            # C0_cases   : {케이스명 → C_i0} (첫 이터레이션에서 고정)
+            weights_map = {lc.name: w for lc, w in self._load_cases}
+            C0_cases    = self._C_0_cases
+
+            if self.obj_type == 'sum' and not self.normalize_obj:
+                # ① 기본 가중 합산: f = (Σ w_i·C_i) / C_0
+                #    C_0 = Iter 0의 총 컴플라이언스 → 이터레이션 간 스케일 안정화
+                f0val = float(C_total) / C_0
+                dC_dh = dC_dh_base / C_0
+
+            elif self.obj_type == 'sum' and self.normalize_obj:
+                # ② 케이스별 정규화 가중 합산: f = Σ w_i·(C_i/C_i0)
+                #    C_i0 = 케이스 i의 Iter 0 컴플라이언스 → 케이스 간 크기 차이 보정
+                #    하중이 서로 다른 정적·동적 ESL 케이스를 동등하게 최적화할 때 사용
+                f0val = sum(
+                    weights_map.get(n, 1.0) * (C_responses[n]['C'] / C0_cases.get(n, 1.0))
+                    for n in C_responses
+                )
+                dC_dh = np.zeros(self._n_design)
+                for n, cs in per_case_sens.items():
+                    # df/dh = Σ (w_i/C_i0) · ∂C_i/∂h
+                    dC_dh += weights_map.get(n, 1.0) / C0_cases.get(n, 1.0) * cs
+
+            else:  # 'max' or 'sum+max' — softmax approximation
+                # ③ Softmax 최악 케이스: f = (1/α)·log(Σ exp(α·w_i·C_i/C_i0))
+                #    α→∞ : hard-max (최악 케이스만 반영)
+                #    α→0 : 단순 합산에 수렴
+                #    log-sum-exp max-trick으로 exp 오버플로 방지
+                alpha     = self.obj_alpha
+                names_ord = list(C_responses.keys())
+                vals      = np.array([
+                    weights_map.get(n, 1.0) * C_responses[n]['C'] / C0_cases.get(n, 1.0)
+                    for n in names_ord
+                ])
+                v_shift = np.max(vals)                           # 수치 안정용 shift
+                exps    = np.exp(alpha * (vals - v_shift))
+                sum_exp = np.sum(exps)
+                f0_max  = float(v_shift + (1.0 / alpha) * np.log(sum_exp + 1e-300))
+
+                # 민감도: df/dh = Σ softmax_w_i · (w_i/C_i0) · ∂C_i/∂h
+                #   softmax_w_i = exp(α·val_i) / Σ exp(α·val_j)
+                sens_max = np.zeros(self._n_design)
+                for k, n in enumerate(names_ord):
+                    sw = exps[k] / (sum_exp + 1e-300)   # softmax weight for case i
+                    sens_max += (weights_map.get(n, 1.0) / C0_cases.get(n, 1.0)) * sw * per_case_sens[n]
+
+                if self.obj_type == 'max':
+                    f0val = f0_max
+                    dC_dh = sens_max
+                else:  # ④ 'sum+max': f = 0.5·f_sum + 0.5·f_max
+                    #    평균 성능(sum)과 최악 케이스 방어(max) 동시 고려
+                    f0_sum = float(sum(
+                        weights_map.get(n, 1.0) * (C_responses[n]['C'] / C0_cases.get(n, 1.0))
+                        for n in C_responses
+                    ))
+                    sens_sum = np.zeros(self._n_design)
+                    for n, cs in per_case_sens.items():
+                        sens_sum += weights_map.get(n, 1.0) / C0_cases.get(n, 1.0) * cs
+                    f0val = 0.5 * f0_sum + 0.5 * f0_max
+                    dC_dh = 0.5 * sens_sum + 0.5 * sens_max
+
+            # ── ⑤ 고유진동수 패널티 (∂K/∂h 기반 모드 형상 민감도) ──────────────
+            # P = freq_weight · max(0, freq_target - f₁)² / freq_target²
+            # 위 ①~④ 중 어떤 목적함수와도 병합: f_total = f_obj + P
+            # 민감도: dP/dh = -2·λ·deficit/T² · df₁/dh
+            #   df₁/dh ≈ φ₁ᵀ(∂K/∂h)φ₁ / (4π²f₁)   [단위 모달 질량 가정]
+            #   φ₁(∂K/∂h)φ₁ 계산: compliance 민감도와 동일한 JAX vmap 재사용
+            #                      (u_e → phi_e 대입만 변경)
+            if (self.freq_weight > 0.0 and self.freq_target > 0.0
+                    and modal_results is not None and len(elastic_freqs) > 0):
+                f1      = elastic_freqs[0]
+                deficit = max(0.0, self.freq_target - f1)
+                if deficit > 0.0:
+                    try:
+                        # 첫 번째 탄성 모드 형상 → 전체 DOF 벡터 φ (ndof,)
+                        # modal_results.mode_shapes: (n_modes, N, 6), sorted_nids 순
+                        phi_node = modal_results.mode_shapes[0]
+                        phi = np.zeros(ndof)
+                        for ii, nid in enumerate(self.sorted_nids):
+                            phi[self.nid_to_idx[nid] * 6:self.nid_to_idx[nid] * 6 + 6] = phi_node[ii]
+                        phi /= (np.linalg.norm(phi) + 1e-12)  # 단위 정규화
+
+                        # φ^T (∂K_e/∂z_n) φ 계산 — vmap_element_grad_jax 재사용
+                        # (compliance 민감도와 동일 구조, u_e 자리에 phi_e 대입)
+                        phi_sens = np.zeros(self._n_design)
+                        if self._n_quad > 0 and self._last_quad_c_jnp is not None:
+                            quad_phie = phi[self._quad_dof_idx]
+                            gp = vmap_element_grad_jax(
+                                self._last_quad_c_jnp[:, 0], self._last_quad_c_jnp[:, 1],
+                                self._last_quad_c_jnp[:, 2], self._last_quad_c_jnp[:, 3],
+                                jnp.array(quad_phie),
+                                jnp.array(self._quad_t), jnp.array(self._quad_E),
+                                jnp.array(self._quad_nu),
+                            )
+                            gps = np.stack([np.array(g) for g in gp], axis=1)
+                            prj = np.einsum('qnd,d->qn', gps, self.bead_dir)
+                            mq  = self._quad_node_design_idx >= 0
+                            vq  = np.where(mq, self._quad_node_design_idx, 0)
+                            np.add.at(phi_sens, vq, np.where(mq, prj, 0.0))
+                        if self._n_tria > 0 and self._last_tria_c_jnp is not None:
+                            tria_phie = phi[self._tria_dof_idx]
+                            gpt = vmap_element_grad_tria3_jax(
+                                self._last_tria_c_jnp[:, 0], self._last_tria_c_jnp[:, 1],
+                                self._last_tria_c_jnp[:, 2],
+                                jnp.array(tria_phie),
+                                jnp.array(self._tria_t), jnp.array(self._tria_E),
+                                jnp.array(self._tria_nu),
+                            )
+                            gpst = np.stack([np.array(g) for g in gpt], axis=1)
+                            prjt = np.einsum('qnd,d->qn', gpst, self.bead_dir)
+                            mt   = self._tria_node_design_idx >= 0
+                            vt   = np.where(mt, self._tria_node_design_idx, 0)
+                            np.add.at(phi_sens, vt, np.where(mt, prjt, 0.0))
+
+                        # df1/dh ≈ phi_sens / (4π²f1)  [단위 모달 질량 가정]
+                        df1_dh = phi_sens / (4.0 * np.pi**2 * f1 + 1e-12)
+
+                        # P = freq_weight * (deficit/freq_target)²
+                        # dP/dh = -2 * freq_weight * deficit / freq_target² * df1/dh
+                        t2 = self.freq_target**2 + 1e-12
+                        P_norm = self.freq_weight * (deficit / (self.freq_target + 1e-12))**2
+                        dP_dh  = -self.freq_weight * 2.0 * deficit / t2 * df1_dh
+
+                        f0val += float(P_norm)
+                        dC_dh  = dC_dh + dP_dh
+                        print(f"  │  freq_penalty: f1={f1:.2f}Hz  target={self.freq_target:.2f}Hz"
+                              f"  deficit={deficit:.2f}Hz  P={P_norm:.4f}")
+                    except Exception as _fe:
+                        print(f"    [경고] 고유진동수 민감도 계산 실패: {_fe}")
+
             # 필터 및 투사 역전파 (Chain-rule)
             # dC/dx = (dx_proj/dx) * (dh/dx_proj) * (dH/dh) * (dC/dH)
             # 1. 필터 역전파: dC/dh_phys = H^T @ dC/dh_filtered
@@ -983,9 +1233,6 @@ class WHTopographySolver:
                     [self.model.nodes[nid].x, self.model.nodes[nid].y, self.model.nodes[nid].z]
                     for nid in self._design_nids
                 ])
-                # 비드 점유 면적 비율: 정규화 변수 x > 0.1 인 노드 비율
-                area_ratio = float(np.mean(x > 0.1))
-                
                 # 변형 에너지는 컴플라이언스의 절반 (U = 0.5 * C)
                 case_data = {}
                 for name, res in C_responses.items():
@@ -1009,23 +1256,35 @@ class WHTopographySolver:
                 }
                 callback(data)
 
-            if i % 5 == 0:
-                print(f"  Iter {i:3d}: C_total={C_total:.4e}  ", end="")
-                # 대표 진동수 출력
-                elastic_freqs = [f for f in freqs if f > 0.1]
-                if elastic_freqs:
-                    print(f"F1={elastic_freqs[0]:.1f}Hz ", end="")
-                
-                for name, res in C_responses.items():
-                    # 에너지(J), 최대 변위(mm), 최대 응력(MPa) 순차 출력
-                    print(f"[{name}: {0.5*res['C']:.1e}J, {res['max_disp']:.1f}mm, {res['max_stress']:.0f}MPa] ", end="")
-                print(f"Avg_h={np.mean(x*self.h_max):.2f}mm dx={change:.4f}")
-            if change < tol:
-                print(f"  -> 수렴 달성 (Iter {i})")
-                break
-                
-            if stop_event and stop_event.is_set():
-                print(f"  -> 사용자 중단 요청에 의한 조기 종료 (Iter {i})")
+            # ── 이터레이션 요약 출력 ──────────────────────────────────────────
+            # 박스 폭 _SW = 76: "  ┌"(3) + content + "┐"(1) = 76 → content = 72
+            _SW = 76
+            elastic_freqs = [f for f in freqs if f > 0.1]
+            f1_str = f"F1={elastic_freqs[0]:.1f}Hz" if elastic_freqs else "F1=--"
+            converged = change < tol
+            stop_req  = stop_event and stop_event.is_set()
+
+            # 상단: "  ┌─ Iter NNN " = 14 cols, dashes = 76-14-1=61, "┐"
+            obj_tag = (f"[{self.obj_type}{'·N' if self.normalize_obj else ''}]"
+                       if self.obj_type != 'sum' or self.normalize_obj else "")
+            print(f"\n  ┌─ Iter {i:03d} {'─' * (_SW - 15)}┐")
+            print(f"  │  C={C_total:.4e}  f0={f0val:.4f}{obj_tag}"
+                  f"   {f1_str}   Avg_h={np.mean(x*self.h_max):.2f}mm   dx={change:.4f}")
+            for name, res in C_responses.items():
+                print(f"  │  [{name:28s}]  U={0.5*res['C']:.3e}J"
+                      f"  u={res['max_disp']:.1f}mm  sv={res['max_stress']:.0f}MPa")
+            if len(elastic_freqs) >= 3:
+                freq_str = "  ".join(f"f{k+1}={elastic_freqs[k]:.1f}Hz"
+                                     for k in range(min(5, len(elastic_freqs))))
+                print(f"  │  Freq: {freq_str}")
+            if converged:
+                print(f"  │  >> Converged  (dx={change:.2e} < tol={tol:.2e})")
+            elif stop_req:
+                print(f"  │  >> Stop requested")
+            # 하단: "  └"(3) + dashes(_SW-4=72) + "┘"(1) = 76
+            print(f"  └{'─' * (_SW - 4)}┘")
+
+            if converged or stop_req:
                 break
 
         # 원본 좌표 복원 후 최종 형상 적용
