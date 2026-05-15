@@ -588,10 +588,11 @@ class TopographyPipeline:
         if not getattr(self.cfg, 'dynamic_opts', None):
             return None
 
-        weights      = self._weights()
         load_manager = StochasticLoadManager(self.model)
         static_cases = load_manager.get_load_cases(
-            mesh_size_z=self.cfg.mesh_size, weights=weights
+            mesh_size_z=self.cfg.mesh_size,
+            weights=self._weights(),
+            loads=self._loads(),
         )
 
         opts    = [s.strip() for s in self.cfg.dynamic_opts.split(',')]
@@ -693,13 +694,25 @@ class TopographyPipeline:
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
 
     def _weights(self) -> dict:
+        """각 하중 케이스의 목적 함수 가중치 (nargs=2 인자의 첫 번째 값)."""
         return {
-            "bending":       self.cfg.w_bending,
-            "bending_xspan": self.cfg.w_bending_xspan,
-            "bending_yspan": self.cfg.w_bending_yspan,
-            "twisting":      self.cfg.w_twisting,
-            "twisting_alt":  self.cfg.w_twisting_alt,
-            "lifting":       self.cfg.w_lifting,
+            "bending":       self.cfg.w_bending[0],
+            "bending_xspan": self.cfg.w_bending_xspan[0],
+            "bending_yspan": self.cfg.w_bending_yspan[0],
+            "twisting":      self.cfg.w_twisting[0],
+            "twisting_alt":  self.cfg.w_twisting_alt[0],
+            "lifting":       self.cfg.w_lifting[0],
+        }
+
+    def _loads(self) -> dict:
+        """각 하중 케이스의 적용 하중 크기 N (nargs=2 인자의 두 번째 값)."""
+        return {
+            "bending":       self.cfg.w_bending[1],
+            "bending_xspan": self.cfg.w_bending_xspan[1],
+            "bending_yspan": self.cfg.w_bending_yspan[1],
+            "twisting":      self.cfg.w_twisting[1],
+            "twisting_alt":  self.cfg.w_twisting_alt[1],
+            "lifting":       self.cfg.w_lifting[1],
         }
 
 
@@ -755,9 +768,7 @@ def main():
 [모드 D] 산업용 고신뢰성 완전 제약 설계
 
   [권장] 낙하 충격 + 관성 하중 + 대칭 + 비드 연결 + 이산화
-    python wht_topo/run_topo.py \\
-      --dynamic-opts "data.csv" --add-inertia \\
-      --sym-x --bead-connect --height-steps 2 --export final.k
+    python wht_topo/run_topo.py --dynamic-opts "structural_dynamics.csv" --add-inertia --sym-x --bead-connect --height-steps 2 --export final.k
 
   [권장] 서버/헤드리스 + 결과 저장
     python wht_topo/run_topo.py \\
@@ -839,14 +850,22 @@ def main():
     g.add_argument("--n-windows",    type=int, default=30,    help="시간 이력 분할 수 (기본: 30)")
     g.add_argument("--use-global-z", action="store_true",     help="글로벌 Z 궤적 직접 사용")
 
-    # 하중 케이스 가중치
-    g = parser.add_argument_group("정적 하중 케이스 가중치 (Weighted Sum)")
-    g.add_argument("--w-bending",       type=float, default=1.0, help="중앙 굽힘 (기본: 1.0)")
-    g.add_argument("--w-bending-xspan", type=float, default=0.8, help="X방향 스팬 굽힘 (기본: 0.8)")
-    g.add_argument("--w-bending-yspan", type=float, default=0.8, help="Y방향 스팬 굽힘 (기본: 0.8)")
-    g.add_argument("--w-twisting",      type=float, default=1.5, help="대각 비틀림 (기본: 1.5)")
-    g.add_argument("--w-twisting-alt",  type=float, default=1.5, help="반전 대각 비틀림 (기본: 1.5)")
-    g.add_argument("--w-lifting",       type=float, default=1.2, help="4코너 리프팅 합산 (기본: 1.2)")
+    # 하중 케이스 가중치 + 하중 크기 (W LOAD_N 두 값 입력)
+    g = parser.add_argument_group(
+        "정적 하중 케이스 설정 (가중치 하중N, 예: --w-bending 1.0 -5000)"
+    )
+    g.add_argument("--w-bending",       type=float, nargs=2, default=[1.0, -5000.0],
+                   metavar=("W", "F_N"), help="중앙 굽힘        가중치·하중 (기본: 1.0 -5000)")
+    g.add_argument("--w-bending-xspan", type=float, nargs=2, default=[0.8, -5000.0],
+                   metavar=("W", "F_N"), help="X스팬 굽힘       가중치·하중 (기본: 0.8 -5000)")
+    g.add_argument("--w-bending-yspan", type=float, nargs=2, default=[0.8, -5000.0],
+                   metavar=("W", "F_N"), help="Y스팬 굽힘       가중치·하중 (기본: 0.8 -5000)")
+    g.add_argument("--w-twisting",      type=float, nargs=2, default=[1.5, -3000.0],
+                   metavar=("W", "F_N"), help="대각 비틀림      가중치·하중 (기본: 1.5 -3000)")
+    g.add_argument("--w-twisting-alt",  type=float, nargs=2, default=[1.5, -3000.0],
+                   metavar=("W", "F_N"), help="반전 대각 비틀림 가중치·하중 (기본: 1.5 -3000)")
+    g.add_argument("--w-lifting",       type=float, nargs=2, default=[1.2,  3000.0],
+                   metavar=("W", "F_N"), help="4코너 리프팅     가중치·하중 (기본: 1.2  3000)")
 
     # 출력 및 시각화
     g = parser.add_argument_group("출력 및 시각화")

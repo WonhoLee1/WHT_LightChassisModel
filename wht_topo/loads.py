@@ -200,10 +200,8 @@ class StochasticLoadManager:
     def get_load_cases(
         self,
         mesh_size_z: float = 10.0,
-        bending_load_z: float = -5000.0,
-        twisting_load_z: float = -3000.0,
-        lifting_load_z: float = 3000.0,
         weights: Dict[str, float] = None,
+        loads: Dict[str, float] = None,
     ) -> List[Tuple[WHTLoadCase, float]]:
         """
         Bending, Twisting, Lifting 하중 케이스를 각각의 물리적으로 타당한
@@ -215,14 +213,12 @@ class StochasticLoadManager:
         ----------
         mesh_size_z : float
             메시 크기(Z방향), 플랜지 노드 탐색 허용 오차 계산에 사용 [mm]
-        bending_load_z : float
-            굽힘 하중 (중앙 바닥면, 하향) [N]
-        twisting_load_z : float
-            비틀림 하중 (대각선 코너, 하향) [N]
-        lifting_load_z : float
-            리프팅 하중 (코너 리프팅, 상향) [N]
         weights : Dict[str, float]
             각 하중 케이스의 목적 함수 가중치.
+            키: "bending", "bending_xspan", "bending_yspan",
+                "twisting", "twisting_alt", "lifting"
+        loads : Dict[str, float]
+            각 하중 케이스의 적용 하중 크기 [N].
             키: "bending", "bending_xspan", "bending_yspan",
                 "twisting", "twisting_alt", "lifting"
 
@@ -233,13 +229,28 @@ class StochasticLoadManager:
         """
         if weights is None:
             weights = {
-                "bending":      1.0,
+                "bending":       1.0,
                 "bending_xspan": 0.8,
                 "bending_yspan": 0.8,
-                "twisting":     1.5,
-                "twisting_alt": 1.5,
-                "lifting":      1.2,
+                "twisting":      1.5,
+                "twisting_alt":  1.5,
+                "lifting":       1.2,
             }
+        if loads is None:
+            loads = {
+                "bending":       -5000.0,
+                "bending_xspan": -5000.0,
+                "bending_yspan": -5000.0,
+                "twisting":      -3000.0,
+                "twisting_alt":  -3000.0,
+                "lifting":        3000.0,
+            }
+        bending_load_z  = loads.get("bending",       -5000.0)
+        bx_load_z       = loads.get("bending_xspan", bending_load_z)
+        by_load_z       = loads.get("bending_yspan", bending_load_z)
+        twisting_load_z = loads.get("twisting",      -3000.0)
+        tw_alt_load_z   = loads.get("twisting_alt",  twisting_load_z)
+        lifting_load_z  = loads.get("lifting",         3000.0)
 
         flange_nids = self.get_boundary_nodes(mesh_size_z=mesh_size_z)
         center_nids = self.get_load_nodes()
@@ -288,9 +299,9 @@ class StochasticLoadManager:
         lc_bending_x.add_bc(ymin_nids + ymax_nids, dofs=(0, 1, 2, 3, 4, 5))
         if center_nids:
             lc_bending_x.add_force(center_nids, dofs=(2,),
-                                    values=(bending_load_z,), distribute=True)
+                                    values=(bx_load_z,), distribute=True)
         print(f" -> [LoadCase] Bending_Xspan: Y-min({len(ymin_nids)}) + Y-max({len(ymax_nids)})개 고정, "
-              f"X방향 {self.x_max - self.x_min:.0f}mm 스팬")
+              f"X방향 {self.x_max - self.x_min:.0f}mm 스팬, 하중={bx_load_z:.0f}N")
         load_cases.append((lc_bending_x, weights.get("bending_xspan", 0.8)))
 
         # ── Case 4: Bending Y-span (Y 방향 스팬 굽힘) ──────────────────────────
@@ -302,9 +313,9 @@ class StochasticLoadManager:
         lc_bending_y.add_bc(xmin_nids + xmax_nids, dofs=(0, 1, 2, 3, 4, 5))
         if center_nids:
             lc_bending_y.add_force(center_nids, dofs=(2,),
-                                    values=(bending_load_z,), distribute=True)
+                                    values=(by_load_z,), distribute=True)
         print(f" -> [LoadCase] Bending_Yspan: X-min({len(xmin_nids)}) + X-max({len(xmax_nids)})개 고정, "
-              f"Y방향 {self.y_max - self.y_min:.0f}mm 스팬")
+              f"Y방향 {self.y_max - self.y_min:.0f}mm 스팬, 하중={by_load_z:.0f}N")
         load_cases.append((lc_bending_y, weights.get("bending_yspan", 0.8)))
 
         # ── Case 5: Twisting Alt (반전 대각선 비틀림) ───────────────────────────
@@ -315,12 +326,12 @@ class StochasticLoadManager:
         lc_twist_alt.add_bc(corner1 + corner2, dofs=(0, 1, 2, 3, 4, 5))
         if corner0:
             lc_twist_alt.add_force(corner0, dofs=(2,),
-                                    values=(-twisting_load_z,), distribute=True)
+                                    values=(-tw_alt_load_z,), distribute=True)
         if corner3:
             lc_twist_alt.add_force(corner3, dofs=(2,),
-                                    values=(twisting_load_z,), distribute=True)
+                                    values=(tw_alt_load_z,), distribute=True)
         print(f" -> [LoadCase] Twisting_Alt: 반전 대각(corner1+corner2) 고정, "
-              f"corner0↑/corner3↓ ±{abs(twisting_load_z):.0f}N")
+              f"corner0↑/corner3↓ ±{abs(tw_alt_load_z):.0f}N")
         load_cases.append((lc_twist_alt, weights.get("twisting_alt", 1.5)))
 
         # ── Case 6~9: Lifting (4개 코너 개별 리프팅) ──────────────────────────
