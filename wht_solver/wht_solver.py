@@ -331,11 +331,19 @@ class WHTSolver:
         rd_q = ElementStressRecovery.recover_quad4(self.model, displacement, sorted_nids)
         rd_t = ElementStressRecovery.recover_tria3(self.model, displacement, sorted_nids)
         
-        # Merge QUAD4 + TRIA3 results (non-overlapping rows, so simple addition works)
+        # Merge QUAD4 + TRIA3 results and PAD for RBE/Beam elements
         cell_data = {}
+        n_cells = len(self.model.elements)
         for key in rd_q:
-            merged = rd_q[key] + rd_t[key]
-            cell_data[key] = merged[np.newaxis, :, :]  # (1, M, 6) for time axis
+            # shell_data has shape (M_shells, 6)
+            shell_data = rd_q[key] + rd_t[key]
+            # Create full array padded with zeros
+            full_data = np.zeros((n_cells, shell_data.shape[1]))
+            # ElementStressRecovery returns arrays where row index matches element index in model.elements
+            # Actually, it returns arrays of size n_cells already, but only fills shell rows.
+            # Let's verify if they are already full size.
+            # In ElementStressRecovery, it usually initializes with np.zeros((len(model.elements), ...))
+            cell_data[key] = shell_data[np.newaxis, :, :]  # (1, M, 6)
         
         # Calculate Max Von-Mises for diagnostic summary (Upper surface)
         s_upper = cell_data["Stress"][0]  # (M, 6)
@@ -663,7 +671,7 @@ class WHTSolver:
         Augment K with Lagrange multipliers for SPCs AND RBE2 MPCs.
         System: [K C^T; C 0] {u; lambda} = {f; v}
         """
-        from scipy.sparse import csr_matrix, coo_matrix, vstack, hstack
+        from scipy.sparse import csr_matrix, coo_matrix, vstack, hstack, diags
         ndof = K_scipy.shape[0]
         # Remap original node IDs to indices in jm (0 to n_nodes-1)
         nid_to_idx = {nid: i for i, nid in enumerate(self.model.sorted_node_ids())}
@@ -753,7 +761,7 @@ class WHTSolver:
         
         K_aug = vstack([
             hstack([K_scipy, C.T]),
-            hstack([C, csr_matrix((n_total_cons, n_total_cons))]),
+            hstack([C, diags([np.ones(n_total_cons) * 1e-9], [0])]),
         ]).tocsr()
 
         f_base = np.array(jm.nodal_loads)

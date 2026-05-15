@@ -323,8 +323,9 @@ class WHTSolverResult:
         # Get base geometry IR
         base_rd = mesh_model.to_wht_result_data(metadata)
 
-        # Attach result arrays
+        # Attach result arrays with padding for expanded elements (e.g. rigid lines)
         point_data: Dict[str, np.ndarray] = {}
+        processed_cell_data: Dict[str, np.ndarray] = {}
         field_data: Dict[str, np.ndarray] = {}
 
         if self.analysis_type == "static" and self.displacement is not None:
@@ -341,6 +342,18 @@ class WHTSolverResult:
                 point_data["ModeRotation"] = self.mode_shapes[:, :, 3:]
             field_data["Frequency_Hz"]   = self.frequencies           # (T,)
 
+        # Pad cell_data to match base_rd.n_cells (Rigids expansion)
+        if self.cell_data:
+            n_cells_ir = base_rd.n_cells
+            for key, val in self.cell_data.items():
+                if val.shape[1] < n_cells_ir:
+                    # Pad with zeros at the end
+                    padded = np.zeros((val.shape[0], n_cells_ir, val.shape[2]))
+                    padded[:, :val.shape[1], :] = val
+                    processed_cell_data[key] = padded
+                else:
+                    processed_cell_data[key] = val
+
         return WHTResultData(
             nodes       = base_rd.nodes,
             connectivity= base_rd.connectivity,
@@ -349,7 +362,7 @@ class WHTSolverResult:
             node_sets   = base_rd.node_sets,
             element_sets= base_rd.element_sets,
             point_data  = point_data,
-            cell_data   = self.cell_data if self.cell_data is not None else {},
+            cell_data   = processed_cell_data,
             field_data  = field_data,
             time_values = (self.frequencies if self.analysis_type == "modal"
                            else np.array([0.0])),

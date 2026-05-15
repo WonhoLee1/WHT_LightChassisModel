@@ -697,7 +697,7 @@ class WHTDynamicSolver(WHTSolver):
         include_peak: bool = True,
     ) -> List[WHTLoadCase]:
         """
-        동해석 결과로부터 등가 정하중(ESL) 추출.
+        동해석 결과로부터 등가 정하중(ESL) 추출 (기존 방식: 균등 시점).
 
         f_ESL(t*) = K · u(t*)  for selected time points t*
 
@@ -709,7 +709,7 @@ class WHTDynamicSolver(WHTSolver):
 
         Returns
         -------
-        list of WHTLoadCase  — WHTopographySolver에 직접 주입 가능
+        list of WHTLoadCase
         """
         jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
         K    = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
@@ -730,7 +730,7 @@ class WHTDynamicSolver(WHTSolver):
             u_flat = dynamic_result.u[si].flatten()[:ndof]   # (ndof,)
             f_esl  = K @ u_flat                               # (ndof,)
 
-            lc = WHTLoadCase(name=f"ESL_t{t_val:.5f}s")
+            lc = WHTLoadCase(name=f"ESL_Uniform_t{t_val:.5f}s")
             for i, nid in enumerate(sorted_nids):
                 f_node = f_esl[i * 6: i * 6 + 6]
                 if np.max(np.abs(f_node)) < 1e-12:
@@ -738,13 +738,111 @@ class WHTDynamicSolver(WHTSolver):
                 lc.forces.append(WHTForceEntry(nid, tuple(float(v) for v in f_node)))
             load_cases.append(lc)
 
-        peak_t = dynamic_result.t_saved[peak_idx]
-        print(
-            f" -> [ESL] {len(load_cases)} load cases extracted "
-            f"(peak @ t={peak_t:.4f}s, u_max="
-            f"{float(np.max(np.abs(dynamic_result.u[peak_idx]))):.3e} mm)",
-            flush=True,
-        )
+        return load_cases
+
+    def extract_esl_advanced(
+        self,
+        dynamic_result: DynamicResult,
+        n_windows: int = 30,
+        n_top: int = 10,
+        diversity_weight: float = 0.5,
+    ) -> List[WHTLoadCase]:
+        """
+        [Method A+] 동해석 결과로부터 다양성을 고려한 고급 ESL 로드케이스 추출.
+        
+        1. 시계열을 n_windows로 분할하여 각 구간의 변형 에너지 피크(Candidate)를 추출합니다.
+        2. Candidate들 중 서로 물리적인 변형 형상(Displacement Vector)이 가장 이질적인(Diverse) 
+           상위 n_top개를 선택하여 정하중 케이스로 변환합니다. (Cosine Similarity 기반)
+
+        Parameters
+        ----------
+        dynamic_result : DynamicResult
+            동해석 결과
+        n_windows : int
+            시간 이력을 분할할 구간 수 (기본 30)
+        n_top : int
+            최종 추출할 로드케이스 수 (기본 10)
+        diversity_weight : float
+            다양성 가중치 (미사용, 현재는 Greedy Max-Min Similarity 방식 사용)
+
+        Returns
+        -------
+        List[WHTLoadCase]
+        """
+        print(f"\n [ESL Advanced] Extracting {n_top} diverse snapshots from {n_windows} windows...")
+        
+        # 1. 기본 정보 및 Candidate 준비
+        jm, sorted_nids, nid_to_idx = self._build_jaxsso_model()
+        K = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
+        ndof = jm.ndof
+        n_saved = dynamic_result.n_save
+        
+        # Strain Energy 계산 및 Binning
+        strain_energies = np.zeros(n_saved)
+        u_vectors = [] # Normalized displacement vectors for similarity check
+        for i in range(n_saved):
+            u_flat = dynamic_result.u[i].flatten()[:ndof]
+            se = 0.5 * np.dot(u_flat, K @ u_flat)
+            strain_energies[i] = se
+            
+            # Similarity 계산용 정규화 벡터 (L2 norm)
+            norm = np.linalg.norm(u_flat)
+            u_vectors.append(u_flat / (norm + 1e-12))
+            
+        # 2. 구간별 피크(Candidate Pool) 추출
+        window_size = max(1, n_saved // n_windows)
+        candidates = []
+        for w in range(n_windows):
+            start = w * window_size
+            end = (w + 1) * window_size if w < n_windows - 1 else n_saved
+            if start >= n_saved: break
+            idx = start + np.argmax(strain_energies[start:end])
+            candidates.append(idx)
+        
+        candidates = sorted(list(set(candidates))) # 중복 제거
+        
+        # 3. 다양성 기반 Greedy 선택 알고리즘 (Greedy Max-Min Similarity)
+        # 목적: 이미 선택된 세트와 가장 '안 닮은' (Similarity가 가장 낮은) 후보를 순차적으로 추가
+        
+        # 첫 번째 선택: 전체 변형 에너지가 가장 큰 시점
+        selected_indices = [candidates[np.argmax([strain_energies[c] for c in candidates])]]
+        remaining = [c for c in candidates if c not in selected_indices]
+        
+        while len(selected_indices) < n_top and remaining:
+            # 남은 후보들 중, 현재 선택된 세트와의 '최대 유사도'가 가장 '낮은' 후보 선택
+            similarities = []
+            for r_idx in remaining:
+                u_r = u_vectors[r_idx]
+                # 이미 선택된 것들과의 코사인 유사도 중 최댓값 (가장 닮은 정도)
+                max_sim = max([np.dot(u_r, u_vectors[s_idx]) for s_idx in selected_indices])
+                similarities.append(max_sim)
+            
+            # 유사도의 최댓값이 가장 작은 (즉, 가장 이질적인) 후보 선정
+            best_idx = np.argmin(similarities)
+            selected_indices.append(remaining.pop(best_idx))
+            
+        selected_indices = sorted(selected_indices)
+        
+        # 4. 로드케이스 생성 (Prescribed Displacement 적용)
+        load_cases = []
+        from .load_cases import WHTBCEntry
+        for si in selected_indices:
+            t_val = dynamic_result.t_saved[si]
+            se_val = strain_energies[si]
+            u_snap = dynamic_result.u[si]
+            
+            lc = WHTLoadCase(name=f"ESL_Peak_t{t_val:.5f}s_SE{se_val:.1e}")
+            for i, nid in enumerate(sorted_nids):
+                u_node = u_snap[i]
+                lc.add_bc(nid, dofs=(0, 1, 2, 3, 4, 5), value=0.0)
+                for d in range(6):
+                    val = float(u_node[d])
+                    if abs(val) > 1e-15:
+                        lc.bcs.append(WHTBCEntry(nid, (d,), val))
+            
+            load_cases.append(lc)
+            print(f"    - Selected Snapshot: t={t_val:.4f}s, SE={se_val:.3e}")
+
         return load_cases
 
     # ─────────────────────────────────────────────────────────────────────────

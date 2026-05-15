@@ -281,6 +281,10 @@ class WHTMeshModel:
         """Returns {nid: 0-based index} mapping for sorted node IDs."""
         return {nid: i for i, nid in enumerate(self.sorted_node_ids())}
 
+    def nodes_array_dict(self) -> Dict[int, List[float]]:
+        """Returns {nid: [x, y, z]} for all nodes."""
+        return {nid: [n.x, n.y, n.z] for nid, n in self.nodes.items()}
+
     def get_adjacency(self) -> Dict[int, List[int]]:
         """Returns {nid: [neighbor_nids]} mapping based on element connectivity."""
         adj = {nid: set() for nid in self.nodes.keys()}

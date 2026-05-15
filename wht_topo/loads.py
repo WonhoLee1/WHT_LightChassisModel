@@ -5,6 +5,14 @@ from typing import Dict, Tuple, List
 from wht_modeler.wht_selector import WHTSelector
 from wht_modeler.wht_mesh_model import WHTMeshModel
 from wht_solver.load_cases import WHTLoadCase, LoadCaseLibrary
+from wht_solver.wht_dynamic_solver import WHTDynamicSolver
+from wht_solver.wht_dynamic_common import DynamicLoadGroup, DampingSpec
+from wht_modeler.wht_dynamic_utils import (
+    find_corner_nodes, 
+    calculate_local_z_history, 
+    calculate_corner_accelerations,
+    InterpLoadGroup
+)
 
 class StochasticLoadManager:
     """
@@ -419,6 +427,119 @@ class StochasticLoadManager:
         dist_sq = (self.coords[:, 0] - kx)**2 + (self.coords[:, 1] - ky)**2
         loads[:, 2] = 1200.0 * np.exp(-dist_sq / (0.1 * (self.width**2)))
         return loads
+
+    def get_esl_load_cases_from_csv(
+        self,
+        csv_path: str,
+        t_start: float = 0.0,
+        add_inertia: bool = True,
+        n_windows: int = 10,
+        n_top: int = 5,
+        solver_method: str = "scipy"
+    ) -> List[Tuple[WHTLoadCase, float]]:
+        """
+        [Advanced] CSV 궤적 데이터로부터 동해석을 수행하고, ESL(Method A) 로드케이스를 추출합니다.
+
+        Parameters
+        ----------
+        csv_path : str
+            실측 궤적 데이터 CSV 경로
+        t_start : float
+            데이터 시작 오프셋 [s]
+        add_inertia : bool
+            관성 하중(-ma) 포함 여부
+        n_windows : int
+            시간 분할 구간 수
+        n_top : int
+            추출할 상위 로드케이스 수
+        solver_method : str
+            'scipy' 또는 'jax'
+
+        Returns
+        -------
+        List[Tuple[WHTLoadCase, float]]
+            (LoadCase, Weight) 리스트. 가중치는 균등 배분(1.0)으로 시작.
+        """
+        import pandas as pd
+        from pathlib import Path
+        
+        print(f"\n -> [LoadManager] ESL Generation from CSV: {csv_path}")
+        df = pd.read_csv(csv_path, encoding='utf-8')
+        if t_start > 0:
+            df = df[df['Time'] >= t_start].copy()
+            
+        time_arr_raw = df['Time'].to_numpy()
+        time_arr = time_arr_raw - time_arr_raw[0]
+        dt = float(np.mean(np.diff(time_arr)))
+        t_total = float(time_arr[-1])
+        
+        # 1. 코너 노드 탐색 및 로컬 변위 추출
+        bot_groups = find_corner_nodes(
+            self.model.nodes_array_dict(), self.width, self.length, radius=100.0, z_min=0.0, z_max=2.0
+        )
+        corner_z_data, traj_mm = calculate_local_z_history(df, time_arr)
+        
+        load_groups = []
+        corner_map = {0: 'C5', 1: 'C6', 2: 'C7', 3: 'C8'}
+        
+        # SPCD 하중 구성
+        for idx, (_, corner_nids) in enumerate(bot_groups):
+            cn_label = corner_map[idx]
+            z_vals = corner_z_data[cn_label]
+            
+            # Master Node & RBE3 (동적으로 추가)
+            pts = np.array([self.model.nodes[nid].coords() for nid in corner_nids])
+            center = np.mean(pts, axis=0)
+            master_nid = 990000 + idx
+            self.model.add_node(master_nid, center[0], center[1], center[2])
+            self.model.add_rbe3(990000 + idx, master_nid, corner_nids, dofs=(0, 1, 2))
+            
+            lg = InterpLoadGroup([master_nid], 2, time_arr, z_vals, load_type="SPCD")
+            load_groups.append(lg)
+
+        # 관성 하중
+        if add_inertia:
+            accels_4 = calculate_corner_accelerations(traj_mm, dt)
+            all_pts = self.model.nodes_array()
+            x_min, x_max = all_pts[:, 0].min(), all_pts[:, 0].max()
+            y_min, y_max = all_pts[:, 1].min(), all_pts[:, 1].max()
+            dx, dy = max(1.0, x_max - x_min), max(1.0, y_max - y_min)
+
+            # 질량 산출을 위한 임시 솔버
+            temp_solver = WHTDynamicSolver(self.model)
+            jm, _, nid_to_idx = temp_solver._build_jaxsso_model()
+            m_diag = temp_solver._assemble_lumped_mass(jm, jm.ndof, sorted(self.model.nodes.keys()), nid_to_idx)
+            
+            for nid, node in self.model.nodes.items():
+                if nid >= 990000: continue
+                idx = nid_to_idx.get(nid)
+                if idx is None: continue
+                
+                nx = (node.x - x_min) / dx
+                ny = (node.y - y_min) / dy
+                a_local = (
+                    accels_4[:, 2] * (1-nx)*(1-ny) + # C7
+                    accels_4[:, 1] * (nx)*(1-ny)   + # C6
+                    accels_4[:, 0] * (nx)*(ny)     + # C5
+                    accels_4[:, 3] * (1-nx)*(ny)     # C8
+                )
+                node_mass = m_diag[idx * 6 + 2]
+                if node_mass > 0:
+                    lg_i = InterpLoadGroup([nid], 2, time_arr, -node_mass * a_local, load_type="FORCE")
+                    load_groups.append(lg_i)
+
+        # 2. 동해석 실행
+        solver = WHTDynamicSolver(self.model)
+        damping = DampingSpec(mode="zeta", zeta=0.02)
+        dyn_res = solver.solve_direct_dynamic(
+            load_groups=load_groups, dt=dt, T=t_total, 
+            damping=damping, n_save=100, method=solver_method
+        )
+        
+        # 3. ESL 추출 (Method A)
+        esl_cases = solver.extract_esl_advanced(dyn_res, n_windows=n_windows, n_top=n_top)
+        
+        return [(lc, 1.0) for lc in esl_cases]
 
 if __name__ == "__main__":
     # 간단한 테스트 코드

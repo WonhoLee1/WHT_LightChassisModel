@@ -17,7 +17,10 @@
       "Bash(git commit -m ' *)",
       "Bash(C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe *)",
       "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -m py_compile D:/PythonCodeStudy/WHT_LightChassisModel/wht_topo/loads.py)",
-      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -m py_compile D:/PythonCodeStudy/WHT_LightChassisModel/wht_topo/run_topo.py)"
+      "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -m py_compile D:/PythonCodeStudy/WHT_LightChassisModel/wht_topo/run_topo.py)",
+      "PowerShell(cd \"D:\\\\PythonCodeStudy\\\\WHT_LightChassisModel\"; $proc = Start-Process -FilePath \"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -ArgumentList \"wht_topo/run_topo.py --dynamic-opts `\"test_jaxSSO/sample_pos.csv,1.6`\" --add-inertia --no-gui --no-viz --iters 3\" -RedirectStandardOutput \"C:\\\\Temp\\\\topo_out.txt\" -RedirectStandardError \"C:\\\\Temp\\\\topo_err.txt\" -PassThru -NoNewWindow; Write-Host \"PID: $\\($proc.Id\\)\"; Start-Sleep 60; Get-Content \"C:\\\\Temp\\\\topo_out.txt\" -Tail 50; Get-Content \"C:\\\\Temp\\\\topo_err.txt\" -Tail 20)",
+      "Bash(python -c ' *)",
+      "Bash(git push *)"
     ]
   }
 }
