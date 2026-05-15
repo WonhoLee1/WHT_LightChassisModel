@@ -10,11 +10,13 @@ Topography Optimization Solver — wht_solver 기반 정밀 구현.
       → SIMP 불필요, WHTSolver.solve_static()을 그대로 사용 가능
 
 핵심 아키텍처:
-    - 설계 변수 : 바닥면 노드별 비드 높이 h_n ∈ [0, h_max]
-    - 목적 함수 : 멀티 케이스 가중 컴플라이언스 최소화 (3가지 변형 지원, 아래 참조)
-    - 민감도    : ∂C/∂h_n = Σ_{e∈N(n)} u_e^T (∂K_e/∂z_n) u_e  (Adjoint)
+    - 설계 변수 : 바닥면 요소별 비드 높이 h_e ∈ [0, h_max]  (요소 기반)
+                  요소의 4 노드가 동일 높이로 이동 → 평탄한 비드 평면 보장
+                  노드 높이 = 인접 설계 요소 높이의 평균: h_n = mean(h_e for e adj n)
+    - 민감도    : ∂C/∂h_e = Σ_{n∈e} (∂C/∂h_n) / n_adj(n)  (Chain-rule)
+                  ∂C/∂h_n = Σ_{e∈N(n)} u_e^T (∂K_e/∂z_n) u_e  (Adjoint)
                   — QUAD4/TRIA3 모두 JAX Auto-Diff (vmap), 전체 K 재조립 불필요
-    - 필터링    : 공간 필터(rmin)로 최소 비드 폭 제어
+    - 필터링    : 공간 필터(rmin)로 최소 비드 폭 제어 (요소 도심 기반)
     - 업데이트  : MMA (Method of Moving Asymptotes)
 
 [목적함수 변형 — obj_type / normalize_obj / freq_weight]
@@ -117,8 +119,9 @@ class WHTopographySolver:
     """
     물리적으로 올바른 Topography Optimization 엔진.
 
-    설계 변수는 노드별 비드 높이 h_n이며, SIMP/밀도 개념은 사용하지 않습니다.
-    WHTSolver.solve_static()을 통해 각 하중 케이스를 직접 해석합니다.
+    설계 변수는 요소별 비드 높이 h_e이며, 요소 내 4 노드가 동일 높이로 이동합니다.
+    노드 높이는 인접 설계 요소 높이의 평균으로 결정 → 울퉁불퉁한 형상 방지.
+    SIMP/밀도 개념은 사용하지 않으며, WHTSolver.solve_static()을 직접 사용합니다.
 
     Parameters
     ----------
@@ -242,15 +245,32 @@ class WHTopographySolver:
             for nid in self.sorted_nids
         }
 
-        # 설계 노드 식별 (바닥면 노드에서 플랜지 제외)
-        print(" -> [Solver] 설계 노드(비드 적용 가능 바닥면) 탐색 중...")
-        self._design_nids   = self._find_design_nodes()
-        self._n_design      = len(self._design_nids)
-        self._design_nid_to_idx = {nid: i for i, nid in enumerate(self._design_nids)}
-        print(f"    - 설계 노드 수: {self._n_design}개")
+        # 설계 요소 식별 (바닥면 쉘 요소에서 플랜지 포함 요소 제외)
+        # 설계 변수 = 요소별 비드 높이 h_e → 요소 4 노드가 동일 높이로 이동
+        print(" -> [Solver] 설계 요소(비드 적용 가능 바닥면) 탐색 중...")
+        self._design_elems, self._design_nids = self._find_design_elements()
+        self._n_design          = len(self._design_elems)
+        self._design_elem_to_idx = {eid: i for i, eid in enumerate(self._design_elems)}
+        self._design_nid_to_idx  = {nid: i for i, nid in enumerate(self._design_nids)}
+        n_int = len(self._design_nids)
+        print(f"    - 설계 요소 수: {self._n_design}개  /  내부 노드 수: {n_int}개")
 
-        # 노드 → 인접 요소 인덱스 매핑 (민감도 계산 최적화용)
-        self._node_to_elem_idx = self._build_node_elem_adjacency()
+        # 집합(Aggregation) 배열 사전 구축
+        # (elem_idx, node_internal_idx) 쌍 → elem→node 높이 분배, node→elem 민감도 집계
+        aggr_src_list, aggr_dst_list = [], []
+        node_adj_count = np.zeros(n_int, dtype=np.float64)
+        for eidx, eid in enumerate(self._design_elems):
+            for nid in self.model.elements[eid].node_ids:
+                nidx = self._design_nid_to_idx.get(nid, -1)
+                if nidx >= 0:
+                    aggr_src_list.append(nidx)    # 내부 노드 인덱스
+                    aggr_dst_list.append(eidx)    # 설계 요소 인덱스
+                    node_adj_count[nidx] += 1.0
+        self._aggr_src          = np.array(aggr_src_list, dtype=int)
+        self._aggr_dst          = np.array(aggr_dst_list, dtype=int)
+        self._node_adj_count_arr = node_adj_count
+        # aggr_w[k] = 1 / n_adj(node) — 민감도 집계 및 노드 높이 역산에 사용
+        self._aggr_w = 1.0 / (node_adj_count[self._aggr_src] + 1e-12)
 
         # 공간 필터 행렬 (최소 비드 폭 제어)
         self._H = self._build_filter()
@@ -375,15 +395,19 @@ class WHTopographySolver:
             for elem in self.model.elements.values():
                 elem.pid = 1
 
-    def _find_design_nodes(self) -> List[int]:
+    def _find_design_elements(self) -> Tuple[List[int], List[int]]:
         """
-        비드 적용이 가능한 바닥면 노드를 탐색합니다.
-        플랜지/경계 노드(최상단 고정 노드)는 제외합니다.
+        비드 적용 가능한 바닥면 쉘 요소를 탐색합니다.
+
+        선택 기준:
+          - 쉘 요소(QUAD4/TRIA3)만 대상
+          - 요소 도심 Z ≤ z_threshold (바닥면 기준)
+          - 플랜지 노드를 하나라도 포함한 요소는 제외
 
         Returns
         -------
-        List[int]
-            설계 변수로 사용할 노드 ID 리스트
+        design_elems : List[int]  — 설계 요소 ID 리스트 (정렬됨)
+        design_nids  : List[int]  — 설계 요소에 속한 고유 노드 ID 리스트 (정렬됨)
         """
         if self.load_manager is not None:
             flange_nids = set(self.load_manager.get_boundary_nodes(
@@ -392,52 +416,70 @@ class WHTopographySolver:
         else:
             flange_nids = set()
 
-        # 바닥면 노드 = Z가 최소에 가까운 노드
         all_z = [self.model.nodes[nid].z for nid in self.sorted_nids]
         z_min = min(all_z)
         z_threshold = z_min + max(self.mesh_size_z * 0.5, 5.0)
 
-        design_nids = [
-            nid for nid in self.sorted_nids
-            if self.model.nodes[nid].z <= z_threshold and nid not in flange_nids
-        ]
-        return design_nids
+        design_elems: List[int] = []
+        all_design_nids: set = set()
+
+        for eid in self.elem_ids:
+            elem = self.model.elements[eid]
+            if elem.type.upper() not in self._SHELL_TYPES:
+                continue
+            nids = elem.node_ids
+            if any(nid in flange_nids for nid in nids):
+                continue
+            z_centroid = float(np.mean([self.model.nodes[nid].z for nid in nids]))
+            if z_centroid <= z_threshold:
+                design_elems.append(eid)
+                all_design_nids.update(nids)
+
+        return design_elems, sorted(all_design_nids)
+
+    def _elem_centroids(self) -> np.ndarray:
+        """설계 요소 도심 좌표 배열 (n_design, 3)을 반환합니다."""
+        return np.array([
+            np.mean([[self._coords_orig[nid][0],
+                      self._coords_orig[nid][1],
+                      self._coords_orig[nid][2]]
+                     for nid in self.model.elements[eid].node_ids], axis=0)
+            for eid in self._design_elems
+        ])
 
     def _build_symmetry_map(self) -> np.ndarray:
         """
-        X-mid plane을 기준으로 대칭 노드 인덱스 맵을 생성합니다.
+        X-mid plane을 기준으로 대칭 요소 인덱스 맵을 생성합니다.
         """
-        print(" -> [Solver] 좌우 대칭(Sym-X) 노드 매핑 중...")
-        coords = np.array([self._coords_orig[nid] for nid in self._design_nids])
-        x_mid = (coords[:, 0].min() + coords[:, 0].max()) / 2.0
-        
+        print(" -> [Solver] 좌우 대칭(Sym-X) 요소 매핑 중...")
+        centroids = self._elem_centroids()
+        x_mid = (centroids[:, 0].min() + centroids[:, 0].max()) / 2.0
+
         from scipy.spatial import KDTree
-        tree = KDTree(coords)
-        
+        tree = KDTree(centroids)
+
         sym_map = np.arange(self._n_design)
         for i in range(self._n_design):
-            # 대칭 점 계산: (x, y, z) -> (2*x_mid - x, y, z)
-            target = coords[i].copy()
+            target = centroids[i].copy()
             target[0] = 2.0 * x_mid - target[0]
-            
             dist, idx = tree.query(target)
-            if dist < 1.0: # 1mm 이내이면 대칭점으로 인정
+            if dist < 5.0:  # 5mm 이내이면 대칭 요소로 인정
                 sym_map[i] = idx
-        
+
         return sym_map
 
     def _build_connect_grid(self) -> dict:
         """
         Morphological Closing 연산을 위한 2D 그리드 인덱스를 사전 구축합니다.
 
-        설계 노드의 X, Y 좌표를 정규 격자에 매핑하여, 클로징 연산 시
+        설계 요소 도심의 X, Y 좌표를 정규 격자에 매핑하여, 클로징 연산 시
         반복적인 좌표 변환 없이 O(1)으로 접근할 수 있게 합니다.
 
         Returns
         -------
         dict : {"gi": ndarray, "gj": ndarray, "nx": int, "ny": int, "spacing": float}
         """
-        coords = np.array([self._coords_orig[nid] for nid in self._design_nids])
+        coords = self._elem_centroids()
 
         xs = np.sort(np.unique(np.round(coords[:, 0], 0)))
         ys = np.sort(np.unique(np.round(coords[:, 1], 0)))
@@ -567,26 +609,6 @@ class WHTopographySolver:
             
         return grad
 
-    def _build_node_elem_adjacency(self) -> Dict[int, List[int]]:
-        """
-        설계 노드별로 인접한 요소의 인덱스 리스트를 사전 계산합니다.
-        민감도 계산 시 전체 K 재조립 없이 요소별 국부 계산에 사용합니다.
-
-        Returns
-        -------
-        Dict[int, List[int]]
-            {노드 ID : [인접 요소의 elem_ids 인덱스 리스트]}
-        """
-        design_nid_set = set(self._design_nids)
-        node_to_eidx: Dict[int, List[int]] = {nid: [] for nid in self._design_nids}
-
-        for eidx, eid in enumerate(self.elem_ids):
-            for nid in self.model.elements[eid].node_ids:
-                if nid in design_nid_set:
-                    node_to_eidx[nid].append(eidx)
-
-        return node_to_eidx
-
     def _build_filter(self) -> np.ndarray:
         """
         설계 노드 간 공간 필터 행렬 H를 조립합니다 (최소 비드 폭 제어).
@@ -596,12 +618,9 @@ class WHTopographySolver:
         np.ndarray
             (n_design, n_design) 필터 가중치 행렬
         """
-        print(f" -> [Solver] 공간 필터 행렬 ({self.rmin}mm) 조립 중...")
+        print(f" -> [Solver] 공간 필터 행렬 ({self.rmin}mm) 조립 중 (요소 도심 기준)...")
         n = self._n_design
-        coords = np.array([
-            [self.model.nodes[nid].x, self.model.nodes[nid].y, self.model.nodes[nid].z]
-            for nid in self._design_nids
-        ])
+        coords = self._elem_centroids()
         W = np.zeros((n, n))
         for i in range(n):
             dists = np.linalg.norm(coords - coords[i], axis=1)
@@ -612,17 +631,26 @@ class WHTopographySolver:
 
     # ─────────────── 노드 좌표 조작 ───────────────
 
-    def _apply_heights(self, h: np.ndarray):
+    def _apply_heights(self, h_elem: np.ndarray):
         """
-        비드 높이 배열 h를 설계 노드의 3D 좌표에 반영합니다.
+        요소별 비드 높이 h_elem을 설계 노드 좌표에 반영합니다.
+
+        노드 높이 = 인접 설계 요소 높이의 평균:
+            h_n = (Σ_{e adj n} h_e) / n_adj(n)
+        → 요소 내 모든 노드가 동일 높이로 이동(평탄 비드 보장).
 
         Parameters
         ----------
-        h : (n_design,) 비드 높이 배열 [mm]
+        h_elem : (n_design,) 요소별 비드 높이 배열 [mm]
         """
+        n_int = len(self._design_nids)
+        h_node_sum = np.zeros(n_int)
+        np.add.at(h_node_sum, self._aggr_src, h_elem[self._aggr_dst])
+        h_node = h_node_sum / (self._node_adj_count_arr + 1e-12)
+
         for i, nid in enumerate(self._design_nids):
             orig_xyz = self._coords_orig[nid]
-            move_vec = float(h[i]) * self.bead_dir
+            move_vec = float(h_node[i]) * self.bead_dir
             self.model.nodes[nid].x = orig_xyz[0] + move_vec[0]
             self.model.nodes[nid].y = orig_xyz[1] + move_vec[1]
             self.model.nodes[nid].z = orig_xyz[2] + move_vec[2]
@@ -823,8 +851,10 @@ class WHTopographySolver:
                 "result":     result,
             }
 
-            # 케이스별 비가중 민감도 (∂C_i/∂h, 가중치 미포함)
-            case_sens = np.zeros(self._n_design)
+            # 케이스별 비가중 민감도 — 노드 공간에서 계산 후 요소 공간으로 집계
+            # ∂C_i/∂h_n : 내부 노드별 민감도 (n_int_nodes,)
+            n_int = len(self._design_nids)
+            case_sens_node = np.zeros(n_int)
 
             if self._n_quad > 0:
                 quad_ue = u_full[self._quad_dof_idx]
@@ -837,8 +867,8 @@ class WHTopographySolver:
                 grad_stack = np.stack([np.array(g) for g in grads], axis=1)  # (n_quad, 4, 3)
                 proj = np.einsum('qnd,d->qn', grad_stack, self.bead_dir)
                 mask = self._quad_node_design_idx >= 0
-                valid_design_idx = np.where(mask, self._quad_node_design_idx, 0)
-                np.add.at(case_sens, valid_design_idx, np.where(mask, -proj, 0.0))
+                valid_nidx = np.where(mask, self._quad_node_design_idx, 0)
+                np.add.at(case_sens_node, valid_nidx, np.where(mask, -proj, 0.0))
 
             if self._n_tria > 0:
                 tria_ue = u_full[self._tria_dof_idx]
@@ -850,8 +880,13 @@ class WHTopographySolver:
                 grad_stack_t = np.stack([np.array(g) for g in grads_t], axis=1)  # (n_tria, 3, 3)
                 proj_t = np.einsum('qnd,d->qn', grad_stack_t, self.bead_dir)
                 mask_t = self._tria_node_design_idx >= 0
-                valid_design_idx_t = np.where(mask_t, self._tria_node_design_idx, 0)
-                np.add.at(case_sens, valid_design_idx_t, np.where(mask_t, -proj_t, 0.0))
+                valid_nidx_t = np.where(mask_t, self._tria_node_design_idx, 0)
+                np.add.at(case_sens_node, valid_nidx_t, np.where(mask_t, -proj_t, 0.0))
+
+            # ∂C_i/∂h_e = Σ_{n∈e} (∂C_i/∂h_n) / n_adj(n)  (Chain-rule: h_n = mean h_e)
+            case_sens = np.zeros(self._n_design)
+            np.add.at(case_sens, self._aggr_dst,
+                      case_sens_node[self._aggr_src] * self._aggr_w)
 
             per_case_sens[name] = case_sens
             total_sens += weight * case_sens
@@ -975,10 +1010,13 @@ class WHTopographySolver:
                 wht_data.point_data.pop("Displacement", None)
                 wht_data.cell_data.pop("Stress", None)
                 
-                # 1. 비드 높이 (Bead Height) 추가
+                # 1. 비드 높이 (Bead Height) 추가 — 요소 높이를 노드로 집계
+                h_node_sum_e = np.zeros(len(self._design_nids))
+                np.add.at(h_node_sum_e, self._aggr_src, h_filtered[self._aggr_dst])
+                h_node_arr = h_node_sum_e / (self._node_adj_count_arr + 1e-12)
                 h_current_full = np.zeros(len(self.sorted_nids))
-                for idx_design, nid in enumerate(self._design_nids):
-                    h_current_full[self.nid_to_idx[nid]] = h_filtered[idx_design]
+                for i_dn, nid in enumerate(self._design_nids):
+                    h_current_full[self.nid_to_idx[nid]] = h_node_arr[i_dn]
                 wht_data.point_data["Bead_Height"] = h_current_full.reshape(1, -1, 1).astype(np.float32)
 
                 # 2. 하중 케이스별 결과 병합
@@ -1101,7 +1139,9 @@ class WHTopographySolver:
 
                         # φ^T (∂K_e/∂z_n) φ 계산 — vmap_element_grad_jax 재사용
                         # (compliance 민감도와 동일 구조, u_e 자리에 phi_e 대입)
-                        phi_sens = np.zeros(self._n_design)
+                        # 결과는 노드 공간에서 집계 후 요소 공간으로 변환
+                        n_int_phi = len(self._design_nids)
+                        phi_sens_node = np.zeros(n_int_phi)
                         if self._n_quad > 0 and self._last_quad_c_jnp is not None:
                             quad_phie = phi[self._quad_dof_idx]
                             gp = vmap_element_grad_jax(
@@ -1115,7 +1155,7 @@ class WHTopographySolver:
                             prj = np.einsum('qnd,d->qn', gps, self.bead_dir)
                             mq  = self._quad_node_design_idx >= 0
                             vq  = np.where(mq, self._quad_node_design_idx, 0)
-                            np.add.at(phi_sens, vq, np.where(mq, prj, 0.0))
+                            np.add.at(phi_sens_node, vq, np.where(mq, prj, 0.0))
                         if self._n_tria > 0 and self._last_tria_c_jnp is not None:
                             tria_phie = phi[self._tria_dof_idx]
                             gpt = vmap_element_grad_tria3_jax(
@@ -1129,7 +1169,11 @@ class WHTopographySolver:
                             prjt = np.einsum('qnd,d->qn', gpst, self.bead_dir)
                             mt   = self._tria_node_design_idx >= 0
                             vt   = np.where(mt, self._tria_node_design_idx, 0)
-                            np.add.at(phi_sens, vt, np.where(mt, prjt, 0.0))
+                            np.add.at(phi_sens_node, vt, np.where(mt, prjt, 0.0))
+                        # 노드 → 요소 공간 집계
+                        phi_sens = np.zeros(self._n_design)
+                        np.add.at(phi_sens, self._aggr_dst,
+                                  phi_sens_node[self._aggr_src] * self._aggr_w)
 
                         # df1/dh ≈ phi_sens / (4π²f1)  [단위 모달 질량 가정]
                         df1_dh = phi_sens / (4.0 * np.pi**2 * f1 + 1e-12)
@@ -1228,10 +1272,13 @@ class WHTopographySolver:
             
             # 모니터링 콜백 호출
             if callback:
-                # 설계 노드 좌표 추출 (2D 시각화용)
+                # 설계 요소 도심 좌표 추출 (2D 시각화용)
                 coords = np.array([
-                    [self.model.nodes[nid].x, self.model.nodes[nid].y, self.model.nodes[nid].z]
-                    for nid in self._design_nids
+                    np.mean([[self.model.nodes[nid].x,
+                              self.model.nodes[nid].y,
+                              self.model.nodes[nid].z]
+                             for nid in self.model.elements[eid].node_ids], axis=0)
+                    for eid in self._design_elems
                 ])
                 # 변형 에너지는 컴플라이언스의 절반 (U = 0.5 * C)
                 case_data = {}
@@ -1248,11 +1295,16 @@ class WHTopographySolver:
                     "area_ratio": float(np.mean(x_proj > 0.1)), # 투사된 변수 기준 면적
                     "cases": case_data,
                     "frequencies": freqs.tolist(),
-                    "avg_h": float(np.mean(h_filtered)),
-                    "max_h": float(np.max(h_filtered)),
+                    "avg_h": float(np.mean(h_phys)),
+                    "max_h": float(np.max(h_phys)),
                     "dx": change,
                     "coords": coords,
-                    "heights": h_filtered.copy() # 시각화 시에도 필터링/투사된 최종 높이 전달
+                    # 모니터에는 필터 이전 투사값(h_phys = x_proj × h_max)을 전달:
+                    # h_filtered는 공간 필터로 블러되어 이산 패턴이 사라짐.
+                    # bead_dir 주 축 부호를 곱해 방향도 반영 (coolwarm: 음=안쪽, 양=바깥쪽).
+                    "heights": h_phys * float(np.sign(
+                        self.bead_dir[int(np.argmax(np.abs(self.bead_dir)))]
+                    )),
                 }
                 callback(data)
 
@@ -1314,12 +1366,17 @@ class WHTopographySolver:
     def get_full_heights(self, skip_filter: bool = False) -> np.ndarray:
         """
         시각화용 전체 노드(sorted_nids 기준) 비드 높이 배열을 반환합니다.
+
+        요소별 높이를 인접 요소 평균으로 노드에 집계합니다.
         """
+        h_elem = self.heights if skip_filter else self._H @ self.heights
+        h_node_sum = np.zeros(len(self._design_nids))
+        np.add.at(h_node_sum, self._aggr_src, h_elem[self._aggr_dst])
+        h_node = h_node_sum / (self._node_adj_count_arr + 1e-12)
+
         h_full = np.zeros(len(self.sorted_nids))
-        h = self.heights if skip_filter else self._H @ self.heights
         for i, nid in enumerate(self._design_nids):
-            idx = self.nid_to_idx[nid]
-            h_full[idx] = h[i]
+            h_full[self.nid_to_idx[nid]] = h_node[i]
         return h_full
 
 

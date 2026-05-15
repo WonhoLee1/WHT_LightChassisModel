@@ -175,7 +175,7 @@ from wht_modeler.wht_dynamic_utils import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 TRAY_W, TRAY_L, TRAY_H = 1800.0, 1200.0, 35.0
-MESH_XY, MESH_Z        = 40.0, 10.0
+MESH_XY, MESH_Z        = 30.0, 10.0
 DRAFT_ANGLE            = 25.0
 HOOK_SEQUENCE          = [(0.0, 12.0), (-5.0, 0.0), (0.0, -10.0), (-10.0, 0.0)]
 MAT                    = dict(E=210000.0, nu=0.3, rho=7.85e-9, t=0.6)
@@ -189,7 +189,7 @@ G_MM_S2                = 9_810.0  # mm/s² per g
 # 터미널 출력 유틸 — 한글/CJK 2칸 표시 폭 보정
 # ─────────────────────────────────────────────────────────────────────────────
 
-_W = 76  # 박스 전체 표시 폭 (테두리 포함)
+_W = 100  # 박스 전체 표시 폭 (테두리 포함)
 #
 # 박스 폭 공식 검증 (단일 폭 문자 기준):
 #   상단  : "  ┌" (3) + dashes + "┐" (1) = _W  →  dashes = _W - 4
@@ -242,11 +242,18 @@ def _endsec() -> None:
     print(f"  └{'─' * (_W - 4)}┘")
 
 
-def _row(label: str, value: str = "", lw: int = 24) -> None:
+def _row(label: str, value: str = "", lw: int = 30) -> None:
     """박스 행: │  <label padded lw> <value> <spaces> │  (총 _W 표시 폭).
     lw: 레이블 표시 폭 기준 (한글 포함)."""
     inner = f"  │  {_rpad(label, lw)} {value}"
     # inner(_dw) + spaces + │(1) = _W  →  spaces = _W - _dw(inner) - 1
+    n = max(0, _W - _dw(inner) - 1)
+    print(f"{inner}{' ' * n}│")
+
+
+def _row_raw(content: str) -> None:
+    """박스 행: 미리 구성된 문자열을 출력하고 우측 테두리를 맞춤."""
+    inner = f"  │  {content}"
     n = max(0, _W - _dw(inner) - 1)
     print(f"{inner}{' ' * n}│")
 
@@ -406,12 +413,12 @@ class ESLExtractor:
     def extract(self) -> List[Tuple[WHTLoadCase, float]]:
         """ESL 추출 전체 파이프라인을 실행하고 (WHTLoadCase, weight) 리스트를 반환합니다."""
         iter_tag = f"  Iter {self.iteration}" if self.iteration >= 0 else ""
-        print(f"\n  {'─'*(_W-2)}")
+        print(f"\n  {'─'*(_W-4)}")
         print(_hdr(f"ESL Extraction{iter_tag}  [{self.n_windows}win / top-{self.n_top}]", "─"))
         print(f"  CSV : {self.csv_path}")
         print(f"  관성 : {'포함 (--add-inertia)' if self.add_inertia else '제외'}"
               f"   변위 기준 : {'글로벌 Z' if self.use_global_z else '로컬 프레임 (강체 회전 제거)'}")
-        print(f"  {'─'*(_W-2)}")
+        print(f"  {'─'*(_W-4)}")
 
         self._load_csv()
         self._find_corners()
@@ -639,8 +646,9 @@ class ESLExtractor:
                           float(np.max(se_win)) if len(se_win) else 0.0,
                           float(np.sum(se_win)) if len(se_win) else 0.0))
 
-        print(f"  │  {'Win':>3}  {'T_mid(s)':>9}  {'SE_Peak(J)':>12}  {'SE_Sum(J)':>12}"
-              f"   {'Win':>3}  {'T_mid(s)':>9}  {'SE_Peak(J)':>12}  {'SE_Sum(J)':>12}")
+        h_fmt = f"{'Win':>3}  {'T_mid(s)':>9}  {'SE_Peak(J)':>12}  {'SE_Sum(J)':>12}"
+        _row_raw(f"{h_fmt}   {h_fmt}")
+
         half = (len(rows) + 1) // 2
         for i in range(half):
             r0 = rows[i]
@@ -648,18 +656,18 @@ class ESLExtractor:
             left  = f"{r0[0]:>3}  {r0[1]:>9.4f}  {r0[2]:>12.4e}  {r0[3]:>12.4e}"
             right = (f"   {r1[0]:>3}  {r1[1]:>9.4f}  {r1[2]:>12.4e}  {r1[3]:>12.4e}"
                      if r1 else "")
-            print(f"  │  {left}{right}")
+            _row_raw(f"{left}{right}")
         _sep()
 
         # Top-N 요약
-        print(f"  │  Top-{self.n_top} ESL 로드케이스 (Diversity-aware Greedy Max-Min Cosine)")
-        print(f"  │  {'Rank':>4}  {'Time(s)':>9}  {'SE(J)':>12}  케이스명")
+        _row_raw(f"Top-{self.n_top} ESL 로드케이스 (Diversity-aware Greedy Max-Min Cosine)")
+        _row_raw(f"{'Rank':>4}  {'Time(s)':>9}  {'SE(J)':>12}  케이스명")
         for i, lc in enumerate(self._esl_cases):
             m_t  = re.search(r"t(\d+\.\d+)s",        lc.name)
             m_se = re.search(r"SE(\d+\.\d+e[+-]\d+)", lc.name)
             t_v  = float(m_t.group(1))  if m_t  else 0.0
             se_v = float(m_se.group(1)) if m_se else 0.0
-            print(f"  │  {i+1:>4}  {t_v:>9.4f}  {se_v:>12.4e}  {lc.name}")
+            _row_raw(f"{i+1:>4}  {t_v:>9.4f}  {se_v:>12.4e}  {lc.name}")
         _endsec()
         self._plot_se_report(se)
 
@@ -1270,7 +1278,7 @@ class TopographyPipeline:
             bead_height_max   = self.cfg.bead_height,
             bead_height_ratio = self.cfg.bead_area,
             min_width         = self.cfg.min_width,
-            draw_dir          = self.cfg.draw_dir,
+            draw_dir          = [float(v) for v in self.cfg.draw_dir.split(',')],
             weights           = self._weights(),
             mesh_size_z       = self.cfg.mesh_size,
             sym_x             = self.cfg.sym_x,
@@ -1465,7 +1473,8 @@ def main():
       --w-dynamic 1.0 --w-peak 0.5 \\
       --sym-x --bead-connect --height-steps 2
     
-python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia --no-static   --w-dynamic 1.0 --w-peak 0.5    --sym-x --bead-connect --height-steps 2
+python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia --w-dynamic 1.0 --w-peak 1.0  --sym-x --bead-connect --connect-gap 121 --height-steps 2 --bead-area 0.3 --min-width 90 --draw-dir (0, 0, -1) --bead-height 20
+# --no-static
 
   헤드리스 서버 실행
     python wht_topo/run_topo.py \\
@@ -1621,7 +1630,8 @@ python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --
     g.add_argument("--no-bead-connect",action="store_false", dest="bead_connect", help="비드 연결 비활성화")
     g.add_argument("--connect-gap",    type=float, default=120.0, help="비드 연결 최대 갭 mm (기본: 120.0)")
     g.add_argument("--height-steps",   type=int,   default=1,    help="비드 이산화 단계 (기본: 2 → {0, h_max})")
-    g.add_argument("--draw-dir",       type=float, nargs=3, default=[0.0, 0.0, -1.0], help="비드 돌출 방향 (기본: 0 0 1)")
+    g.add_argument("--draw-dir", type=str, default="0,0,-1",
+                   help="비드 돌출 방향 (쉼표 구분, 기본: 0,0,-1 = 아래). 예: 0,0,1  또는  0,0,-1")
 
     # CSV 단독 동적 해석 (모드 B)
     g = parser.add_argument_group("CSV 단독 동적 응답 해석 (모드 B, 최적화 생략)")
@@ -1680,7 +1690,7 @@ python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --
         TopographyPipeline(args).run()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
     multiprocessing.freeze_support()
     try:
         multiprocessing.set_start_method('spawn', force=True)

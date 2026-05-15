@@ -21,10 +21,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, QObject, QThread, Qt
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-try:
-    import koreanize_matplotlib
-except ImportError:
-    pass
 
 plt.rcParams['font.size'] = 9
 plt.rcParams['font.family'] = 'Segoe UI'
@@ -112,6 +108,53 @@ class WHTMonitorWindow(QMainWindow):
         # ── 2. UI 초기화 ──
         self._init_ui()
 
+        # ── 3. 단축키 설정 ──
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        """단축키 설정 (예: Ctrl+T -> 항상 위 토글)"""
+        from PySide6.QtGui import QShortcut, QKeySequence
+        self.top_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
+        self.top_shortcut.activated.connect(self._toggle_always_on_top)
+
+    def _toggle_always_on_top(self):
+        """창의 '항상 위' 속성을 토글합니다."""
+        is_on_top = bool(self.windowFlags() & Qt.WindowStaysOnTopHint)
+        if is_on_top:
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+            if self.top_btn:
+                self.top_btn.setText("Stay on Top: OFF")
+                self.top_btn.setStyleSheet("")
+        else:
+            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+            if self.top_btn:
+                self.top_btn.setText("Stay on Top: ON")
+                self.top_btn.setStyleSheet("background-color: #ffcccc; font-weight: bold;")
+        
+        # WindowFlags 변경 후 반드시 show()를 다시 호출해야 반영됨 (Windows)
+        self.show()
+        print(f" -> [Monitor] Stay on Top: {'ON' if not is_on_top else 'OFF'}")
+
+    def _on_stop_clicked(self):
+        """솔버에 중단 신호를 보냅니다."""
+        if self.stop_event:
+            self.stop_event.set()
+            if self.status_label:
+                self.status_label.setText("Status: STOP Requested...")
+                self.status_label.setStyleSheet("color: #cc6600; font-weight: bold; font-size: 13px;")
+            self.stop_btn.setEnabled(False)
+            print(" -> [Monitor] STOP event set.")
+        else:
+            print(" -> [Monitor] STOP event not available.")
+
+    def _on_reset_clicked(self):
+        """UI와 히스토리 데이터를 강제로 초기화합니다."""
+        self._clear_history()
+        # 캔버스 강제 갱신
+        if self.curve_canvas: self.curve_canvas.draw()
+        if self.height_canvas: self.height_canvas.draw()
+        print(" -> [Monitor] UI and History Reset by user.")
+
     # ────────────────────────────────────────────────────────────────────────
     # UI 구성
     # ────────────────────────────────────────────────────────────────────────
@@ -120,6 +163,34 @@ class WHTMonitorWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(5, 5, 5, 5)
+        root_layout.setSpacing(5)
+
+        # ── Top Control Bar ───────────────────────────────────────────────
+        top_bar = QHBoxLayout()
+        self.status_label = QLabel("Status: Ready")
+        self.status_label.setStyleSheet("font-weight: bold; color: #444; font-size: 13px;")
+        
+        self.stop_btn = QPushButton("Request STOP")
+        self.stop_btn.setFixedWidth(120)
+        self.stop_btn.setStyleSheet("background-color: #fdd; color: #c00; font-weight: bold;")
+        self.stop_btn.clicked.connect(self._on_stop_clicked)
+        
+        self.top_btn = QPushButton("Stay on Top: OFF")
+        self.top_btn.setFixedWidth(120)
+        self.top_btn.clicked.connect(self._toggle_always_on_top)
+        
+        self.reset_btn = QPushButton("Reset UI")
+        self.reset_btn.setFixedWidth(100)
+        self.reset_btn.clicked.connect(self._on_reset_clicked)
+        
+        top_bar.addWidget(self.status_label)
+        top_bar.addStretch()
+        top_bar.addWidget(self.top_btn)
+        top_bar.addWidget(self.reset_btn)
+        top_bar.addWidget(self.stop_btn)
+        root_layout.addLayout(top_bar)
+
         self.tabs = QTabWidget()
         root_layout.addWidget(self.tabs)
 
@@ -215,10 +286,18 @@ class WHTMonitorWindow(QMainWindow):
                 self.status_label.setStyleSheet("color: green; font-weight: bold; font-size: 14px;")
             if self.stop_btn:
                 self.stop_btn.setEnabled(False)
-            return
+            # 마지막 상태 반영을 위해 조기 리턴하지 않고 갱신 수행 (데이터가 함께 왔을 경우)
+            if "iter" not in data:
+                return
 
         try:
             it = data["iter"]
+
+            # ── 리셋(Reset) 감지 ──
+            # iter=0인데 이미 히스토리가 있다면 새로운 해석 시작으로 간주하고 초기화
+            if it == 0 and len(self.history["iter"]) > 0:
+                print(" -> [Monitor] Reset detected (Iter 0). Clearing history.")
+                self._clear_history()
 
             # ── 히스토리 축적 ──
             self.history["iter"].append(it)
@@ -353,6 +432,55 @@ class WHTMonitorWindow(QMainWindow):
 
         except Exception as e:
             print(f" -> [Monitor Error] {e}")
+
+    def _clear_history(self):
+        """모든 데이터와 UI 테이블/그래프를 초기화합니다."""
+        self.history = {
+            "iter": [], "compliance": [], "avg_h": [], "max_h": [], "dx": [],
+            "area_ratio": [], "frequencies": [], "cases": {},
+        }
+        self.height_snapshots = []
+        self.ref_freqs = None
+        self.case_names = []
+        
+        if self.table:
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+        
+        if self.modal_table:
+            for i in range(10):
+                self.modal_table.setItem(i, 1, QTableWidgetItem(""))
+                self.modal_table.setItem(i, 2, QTableWidgetItem(""))
+        
+        if self.height_iter_combo:
+            self.height_iter_combo.blockSignals(True)
+            self.height_iter_combo.clear()
+            self.height_iter_combo.addItem("Latest")
+            self.height_iter_combo.blockSignals(False)
+        
+        if self.height_slider:
+            self.height_slider.blockSignals(True)
+            self.height_slider.setMinimum(0)
+            self.height_slider.setMaximum(0)
+            self.height_slider.setValue(0)
+            self.height_slider.blockSignals(False)
+        
+        if self.status_label:
+            self.status_label.setText("Status: Running (Reset)")
+            self.status_label.setStyleSheet("font-weight: bold; color: blue;")
+        
+        if self.stop_btn:
+            self.stop_btn.setEnabled(True)
+            self.stop_btn.setText("Request STOP")
+
+        # 그래프 축 초기화
+        if self.curve_canvas: self.curve_canvas.ax.clear()
+        if self.height_canvas: 
+            self.height_canvas.ax.clear()
+            if self._height_colorbar:
+                try: self._height_colorbar.remove()
+                except: pass
+                self._height_colorbar = None
 
     # ────────────────────────────────────────────────────────────────────────
     # 수렴 커브 탭
@@ -551,7 +679,7 @@ class WHTMonitorWindow(QMainWindow):
         # 컬러바 관리 (중복 생성 방지)
         if self._height_colorbar is None:
             self._height_colorbar = fig.colorbar(sc, ax=ax)
-            self._height_colorbar.set_label("Bead Height (mm)")
+            self._height_colorbar.set_label("Bead Height (mm)  [+: outward / −: inward]")
         else:
             self._height_colorbar.update_normal(sc)
 
@@ -561,6 +689,7 @@ class WHTMonitorWindow(QMainWindow):
         ax.set_ylabel("Y (mm)")
         fig.tight_layout()
         self.height_canvas.draw()
+        self.height_canvas.draw_idle()  # 강제 갱신 보장
 
 
 # ────────────────────────────────────────────────────────────────────────────
