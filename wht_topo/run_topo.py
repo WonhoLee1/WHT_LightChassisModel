@@ -18,7 +18,8 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
     매 이터레이션 현재 비드 형상에서 동해석을 재실행하여 ESL을 갱신.
     구조가 강성화될수록 동적 응답이 바뀌고 ESL도 함께 진화 → 정식 반복 ESL 절차.
     정적 하중(굽힘·비틀림·리프팅) + 동적 ESL이 함께 목적 함수에 반영됨.
-    실행: python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia
+    단일 시나리오: python wht_topo/run_topo.py --dynamic-opts "data.csv" --add-inertia
+    복수 시나리오: python wht_topo/run_topo.py --dynamic-opts "drop.csv,1.6" "bump.csv,0.5" --w-dynamic 1.0 0.8
 
   모드 C' | 동적 충격 통합 최적화 — 1회 ESL (--no-iterative-esl)
     최적화 전 초기 형상에서 ESL을 1회 추출하여 전체 최적화에 고정.
@@ -36,7 +37,7 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
 
   하중 케이스 = 정적 케이스(w>0인 것)  +  동적 ESL 케이스
                 ──────────────────────    ───────────────────────────
-                --w-bending  W  F         시간분할 ESL (--w-dynamic)
+                --w-bending  W  F         시간분할 ESL (--w-dynamic W1 [W2 ...])
                 --w-twisting W  F         요소별 피크 ESL (--w-peak)
                 --w-lifting  W  F
                 ...
@@ -1213,9 +1214,21 @@ class TopographyPipeline:
         if not getattr(self.cfg, 'dynamic_opts', None):
             return None, None
 
-        opts     = [s.strip() for s in self.cfg.dynamic_opts.split(',')]
-        csv_path = opts[0]
-        t_start  = float(opts[1]) if len(opts) > 1 else None
+        # CSV 엔트리 파싱: "path,t_start" 또는 "path" 형식
+        def _parse_entry(s: str):
+            parts = [p.strip() for p in s.split(',')]
+            return parts[0], (float(parts[1]) if len(parts) > 1 else None)
+
+        entries = [_parse_entry(e) for e in self.cfg.dynamic_opts]
+
+        # --w-dynamic 가중치 목록: CSV 수보다 적으면 마지막 값으로 채움
+        w_list_raw = list(self.cfg.w_dynamic)
+        w_list = w_list_raw + [w_list_raw[-1]] * max(0, len(entries) - len(w_list_raw))
+
+        if len(entries) > 1:
+            print(f"\n [3] 동적 CSV 시나리오 {len(entries)}개:")
+            for i, ((csv_path, t_start), w) in enumerate(zip(entries, w_list)):
+                print(f"     [{i+1}] {csv_path}  t_start={t_start}  w={w}")
 
         if getattr(self.cfg, 'no_static', False):
             static_cases = []
@@ -1230,21 +1243,24 @@ class TopographyPipeline:
             print(f"\n [3] 정적 하중 케이스 {len(static_cases)}개 구성 완료.")
 
         def _run_esl(iteration: int):
-            snaps = ESLExtractor(
-                model        = self.model,
-                node_db      = self.node_db,
-                csv_path     = csv_path,
-                t_start      = t_start,
-                n_windows    = self.cfg.n_windows,
-                n_top        = self.cfg.n_top,
-                add_inertia  = self.cfg.add_inertia,
-                use_global_z = self.cfg.use_global_z,
-                esl_weight   = self.cfg.w_dynamic,
-                w_peak       = self.cfg.w_peak,
-                iteration    = iteration,
-                out_dir      = self.out_dir,
-            ).extract()
-            return snaps
+            all_snaps = []
+            for (csv_path, t_start), w_dyn in zip(entries, w_list):
+                snaps = ESLExtractor(
+                    model        = self.model,
+                    node_db      = self.node_db,
+                    csv_path     = csv_path,
+                    t_start      = t_start,
+                    n_windows    = self.cfg.n_windows,
+                    n_top        = self.cfg.n_top,
+                    add_inertia  = self.cfg.add_inertia,
+                    use_global_z = self.cfg.use_global_z,
+                    esl_weight   = w_dyn,
+                    w_peak       = self.cfg.w_peak,
+                    iteration    = iteration,
+                    out_dir      = self.out_dir,
+                ).extract()
+                all_snaps.extend(snaps)
+            return all_snaps
 
         if getattr(self.cfg, 'iterative_esl', False):
             # ── 반복 추출 모드: provider를 solver에 전달 ──────────────────────
@@ -1506,6 +1522,8 @@ python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --
                 미지정 → CSV 헤더 start_time 자동 적용 → 없으면 0.0.
 
 --dynamic-opts  "CSV경로" 또는 "CSV경로,시작시간(s)" (모드 C/D).
+                복수 충격 시나리오 지정 가능 (공백 구분):
+                  --dynamic-opts "drop.csv,1.6" "bump.csv,0.5" "sine.csv"
                 시간 미지정 → CSV 헤더 start_time 자동 적용.
 
 [ESL 추출 방식]
@@ -1527,7 +1545,10 @@ python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --
 --add-inertia   관성 하중 F=-ma 전 노드 분포 인가.
                 낙하·충격 하중 케이스에 반드시 사용.
 
---w-dynamic     시간분할 ESL 가중치 (기본: 1.0 / 0.0=비활성).
+--w-dynamic     시간분할 ESL 가중치 (기본: 1.0).
+                복수 CSV 지정 시 CSV별 가중치를 공백 구분으로 입력:
+                  --w-dynamic 1.0 0.8 0.5
+                CSV 수보다 가중치 수가 적으면 마지막 값으로 나머지를 채움.
                 출력: esl_se_report[_iterNNN].png
                       SE 이력 + 윈도우 분할 + 선택 시점 마킹
 
@@ -1644,12 +1665,16 @@ python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --
 
     # 동적 ESL 통합 최적화 (모드 C/D)
     g = parser.add_argument_group("동적 ESL 통합 최적화 (모드 C/D)")
-    g.add_argument("--dynamic-opts", type=str, default=None,  help="'CSV경로,시작시간(s)'")
+    g.add_argument("--dynamic-opts", type=str, nargs='+', default=None,
+                   metavar="CSV[,T_START]",
+                   help="'CSV경로' 또는 'CSV경로,시작시간(s)'. 복수 시나리오 지원: --dynamic-opts drop.csv,1.6 bump.csv,0.5")
     g.add_argument("--add-inertia",  action="store_true",     help="관성 하중(-ma) 인가")
     g.add_argument("--n-top",        type=int, default=10,    help="추출 ESL 개수 (기본: 10)")
     g.add_argument("--n-windows",    type=int, default=30,    help="시간 이력 분할 수 (기본: 30)")
     g.add_argument("--use-global-z",    action="store_true",      help="글로벌 Z 궤적 직접 사용")
-    g.add_argument("--w-dynamic",       type=float, default=1.0,  help="시간분할 ESL 스냅샷 가중치 (기본: 1.0)")
+    g.add_argument("--w-dynamic",       type=float, nargs='+', default=[1.0],
+                   metavar="W",
+                   help="시간분할 ESL 스냅샷 가중치 (기본: 1.0). CSV별 복수 지정 가능: --w-dynamic 1.0 0.8")
     g.add_argument("--w-peak",          type=float, default=0.0,  help="요소별 최대SE 피크 ESL 가중치 (기본: 0.0=비활성)")
     g.add_argument("--iterative-esl",   action="store_true", default=True,
                    help="매 이터레이션 ESL 재추출 (기본: 활성)")
