@@ -194,6 +194,7 @@ class WHTopographySolver:
         obj_alpha: float = 10.0,
         freq_weight: float = 0.0,
         freq_target: float = 0.0,
+        exclude_zones: Optional[List[dict]] = None,
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -216,6 +217,7 @@ class WHTopographySolver:
         self.freq_weight         = freq_weight
         self.freq_target         = freq_target  # Hz
         self._C_0_cases: Dict[str, float] = {}  # 케이스별 기준 컴플라이언스 (정규화용)
+        self.exclude_zones       = exclude_zones or []  # 비드 배제 영역 목록
 
         # ... (중략) ...
         self._beta = 1.0
@@ -395,6 +397,41 @@ class WHTopographySolver:
             for elem in self.model.elements.values():
                 elem.pid = 1
 
+    def _in_exclusion_zone(self, cx: float, cy: float) -> bool:
+        """
+        XY 평면상의 점 (cx, cy)이 배제 영역 중 하나에 포함되는지 판정합니다.
+
+        지원 영역 유형
+        --------------
+        rect  : {'type':'rect', 'cx':, 'cy':, 'w':, 'h':}
+                  cx±w/2, cy±h/2 사각형 내부 여부
+        poly  : {'type':'poly', 'vertices': [(x,y), ...]}
+                  임의 다각형 내부 여부 (Ray-casting)
+        """
+        for zone in self.exclude_zones:
+            ztype = zone.get('type', '')
+            if ztype == 'rect':
+                if (abs(cx - zone['cx']) <= zone['w'] / 2.0 and
+                        abs(cy - zone['cy']) <= zone['h'] / 2.0):
+                    return True
+            elif ztype == 'poly':
+                verts = zone['vertices']
+                n = len(verts)
+                if n < 3:
+                    continue
+                inside = False
+                j = n - 1
+                for i in range(n):
+                    xi, yi = verts[i]
+                    xj, yj = verts[j]
+                    if ((yi > cy) != (yj > cy)) and (
+                            cx < (xj - xi) * (cy - yi) / (yj - yi + 1e-12) + xi):
+                        inside = not inside
+                    j = i
+                if inside:
+                    return True
+        return False
+
     def _find_design_elements(self) -> Tuple[List[int], List[int]]:
         """
         비드 적용 가능한 바닥면 쉘 요소를 탐색합니다.
@@ -422,6 +459,7 @@ class WHTopographySolver:
 
         design_elems: List[int] = []
         all_design_nids: set = set()
+        n_excluded = 0
 
         for eid in self.elem_ids:
             elem = self.model.elements[eid]
@@ -430,10 +468,20 @@ class WHTopographySolver:
             nids = elem.node_ids
             if any(nid in flange_nids for nid in nids):
                 continue
-            z_centroid = float(np.mean([self.model.nodes[nid].z for nid in nids]))
-            if z_centroid <= z_threshold:
-                design_elems.append(eid)
-                all_design_nids.update(nids)
+            coords = [self.model.nodes[nid] for nid in nids]
+            z_centroid = float(np.mean([n.z for n in coords]))
+            if z_centroid > z_threshold:
+                continue
+            cx = float(np.mean([n.x for n in coords]))
+            cy = float(np.mean([n.y for n in coords]))
+            if self.exclude_zones and self._in_exclusion_zone(cx, cy):
+                n_excluded += 1
+                continue
+            design_elems.append(eid)
+            all_design_nids.update(nids)
+
+        if n_excluded:
+            print(f"    - 배제 영역 필터: {n_excluded}개 요소 제외됨 ({len(self.exclude_zones)}개 영역)")
 
         return design_elems, sorted(all_design_nids)
 

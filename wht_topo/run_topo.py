@@ -324,6 +324,36 @@ def _build_tray(
     return model, node_db
 
 
+def _parse_exclude_zones(
+    rect_args: Optional[List[str]],
+    poly_args: Optional[List[str]],
+) -> List[dict]:
+    """
+    --exclude-rect / --exclude-poly CLI 인자를 solver가 소비하는 dict 리스트로 변환합니다.
+
+    rect_args : ["cx,cy,w,h", ...]   — 중심점 + 크기
+    poly_args : ["x1,y1,x2,y2,..."]  — 꼭짓점 나열 (짝수 개)
+
+    Returns
+    -------
+    [{'type':'rect', 'cx':, 'cy':, 'w':, 'h':}, ...]
+    [{'type':'poly', 'vertices':[(x,y),...]}, ...]
+    """
+    zones: List[dict] = []
+    for s in (rect_args or []):
+        v = [float(x) for x in s.split(',')]
+        if len(v) != 4:
+            raise ValueError(f"--exclude-rect 형식 오류 (cx,cy,w,h 4개 필요): '{s}'")
+        zones.append({'type': 'rect', 'cx': v[0], 'cy': v[1], 'w': v[2], 'h': v[3]})
+    for s in (poly_args or []):
+        v = [float(x) for x in s.split(',')]
+        if len(v) < 6 or len(v) % 2 != 0:
+            raise ValueError(f"--exclude-poly 형식 오류 (짝수 개 좌표 ≥ 6 필요): '{s}'")
+        verts = [(v[i], v[i + 1]) for i in range(0, len(v), 2)]
+        zones.append({'type': 'poly', 'vertices': verts})
+    return zones
+
+
 def _load_csv(
     path_str: str,
     t_start: Optional[float] = None,
@@ -1323,6 +1353,10 @@ class TopographyPipeline:
             print("     ESL 방식: [1회 추출] 최적화 전 고정 하중 케이스로 진행.")
         load_manager = StochasticLoadManager(self.model)
         freq_w, freq_f0 = getattr(self.cfg, 'freq_penalty', [0.0, 0.0])
+        exclude_zones = _parse_exclude_zones(
+            getattr(self.cfg, 'exclude_rect', None),
+            getattr(self.cfg, 'exclude_poly', None),
+        )
         self.solver  = WHTopographySolver(
             self.model, load_manager,
             bead_height_max   = self.cfg.bead_height,
@@ -1343,6 +1377,7 @@ class TopographyPipeline:
             obj_alpha         = self.cfg.obj_alpha,
             freq_weight       = freq_w,
             freq_target       = freq_f0,
+            exclude_zones     = exclude_zones,
         )
 
     def _run_optimizer(self) -> None:
@@ -1534,12 +1569,7 @@ def main():
       --sym-x --bead-connect --height-steps 2
 
   동적 ESL 전용 (정적 비활성)
-    python wht_topo/run_topo.py \\
-      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
-                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
-                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
-      --no-static --w-dynamic 1.0 --w-peak 0.5 --add-inertia \\
-      --sym-x --bead-connect --height-steps 2
+    python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" "wht_topo/structural_dynamics_c125.csv,1.5,1.8" "wht_topo/structural_dynamics_c235.csv,1.5,1.8"  --no-static --w-dynamic 1.0 --w-peak 1.0 --add-inertia  --sym-x --bead-connect --height-steps 2 --min-width 40 --normalize-obj
 
   헤드리스 서버 실행
     python wht_topo/run_topo.py \\
@@ -1625,6 +1655,24 @@ def main():
 --bead-area                 비드 점유 면적 비율 0~1 (기본: 0.35)
 --min-width                 최소 비드 폭 mm (기본: 30)
 
+[비드 배제 영역]
+--exclude-rect CX,CY,W,H    중심(CX,CY) 기준 W×H mm 사각형 영역 내 비드 생성 금지.
+                            반복 지정으로 복수 영역 추가 가능:
+                              --exclude-rect 500,300,100,80 --exclude-rect 200,400,60,60
+
+--exclude-poly X1,Y1,X2,Y2,...
+                            꼭짓점 좌표 나열(mm)로 정의한 임의 다각형 영역 내 비드 생성 금지.
+                            꼭짓점은 순서대로 나열 (자동 닫힘), 최소 3개 꼭짓점(6개 좌표):
+                              --exclude-poly 100,200,300,200,300,350,100,350
+                            복수 영역: --exclude-poly "..." --exclude-poly "..."
+
+  사용 예)
+    구멍/마운팅 보스 주변 제외 (사각형 2개):
+      --exclude-rect 450,250,120,120 --exclude-rect 1350,250,120,120
+
+    장공/슬롯 주변 제외 (다각형):
+      --exclude-poly 600,400,900,400,900,500,600,500
+
 [출력]
 결과 디렉토리: results/D날짜_시간/ (실행 시작 시 자동 생성)
   paraview/iter_NNN.hdf  — 이터레이션별 변위·응력·고유모드 (ParaView)
@@ -1679,7 +1727,7 @@ def main():
     g.add_argument("--iters",       type=int,   default=15,   help="최대 반복 횟수 (기본: 15)")
     g.add_argument("--bead-height", type=float, default=10.0, help="최대 비드 높이 mm (기본: 10.0)")
     g.add_argument("--min-width",   type=float, default=30.0, help="최소 비드 폭 mm (기본: 30.0)")
-    g.add_argument("--bead-area",   type=float, default=0.35, help="비드 점유 면적 비율 0~1 (기본: 0.35)")
+    g.add_argument("--bead-area",   type=float, default=0.30, help="비드 점유 면적 비율 0~1 (기본: 0.35)")
 
     # 목적함수 옵션
     g = parser.add_argument_group("목적함수 옵션")
@@ -1709,6 +1757,14 @@ def main():
     g.add_argument("--height-steps",   type=int,   default=1,    help="비드 이산화 단계 (기본: 2 → {0, h_max})")
     g.add_argument("--draw-dir", type=str, default="0,0,-1",
                    help="비드 돌출 방향 (쉼표 구분, 기본: 0,0,-1 = 아래). 예: 0,0,1  또는  0,0,-1")
+    g.add_argument("--exclude-rect", type=str, action='append', default=None,
+                   metavar="CX,CY,W,H",
+                   help="비드 배제 사각형 영역 (중심 X,Y + 가로W 세로H, mm). "
+                        "여러 영역: --exclude-rect 500,300,100,80 --exclude-rect 200,400,60,60")
+    g.add_argument("--exclude-poly", type=str, action='append', default=None,
+                   metavar="X1,Y1,X2,Y2,...",
+                   help="비드 배제 다각형 영역 (꼭짓점 XY 좌표 나열, mm). "
+                        "여러 영역: --exclude-poly 100,200,150,200,150,250,100,250")
 
     # CSV 단독 동적 해석 (모드 B)
     g = parser.add_argument_group("CSV 단독 동적 응답 해석 (모드 B, 최적화 생략)")
