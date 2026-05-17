@@ -18,8 +18,8 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
     매 이터레이션 현재 비드 형상에서 동해석을 재실행하여 ESL을 갱신.
     구조가 강성화될수록 동적 응답이 바뀌고 ESL도 함께 진화 → 정식 반복 ESL 절차.
     정적 하중(굽힘·비틀림·리프팅) + 동적 ESL이 함께 목적 함수에 반영됨.
-    단일 시나리오: python wht_topo/run_topo.py --dynamic-opts "data.csv" --add-inertia
-    복수 시나리오: python wht_topo/run_topo.py --dynamic-opts "drop.csv,1.6" "bump.csv,0.5" --w-dynamic 1.0 0.8
+    단일 시나리오: python wht_topo/run_topo.py --dynamic-opts "data.csv,1.6,3.0" --add-inertia
+    복수 시나리오: python wht_topo/run_topo.py --dynamic-opts "drop.csv,1.6,3.0" "bump.csv,0.5,2.5" --w-dynamic 1.0 0.8
 
   모드 C' | 동적 충격 통합 최적화 — 1회 ESL (--no-iterative-esl)
     최적화 전 초기 형상에서 ESL을 1회 추출하여 전체 최적화에 고정.
@@ -314,12 +314,14 @@ def _build_tray(
 def _load_csv(
     path_str: str,
     t_start: Optional[float] = None,
+    t_end: Optional[float] = None,
 ) -> Tuple[pd.DataFrame, np.ndarray, dict]:
     """
-    CSV를 로드하고 'Chassis_' 접두사를 제거한 뒤 t_start 필터를 적용합니다.
+    CSV를 로드하고 'Chassis_' 접두사를 제거한 뒤 시간 범위 필터를 적용합니다.
 
     # 주석 헤더에서 코너 기준 좌표와 start_time을 파싱합니다.
     t_start 우선순위: 인자 > CSV 헤더 > 0.0
+    t_end   미지정 시: CSV 마지막 프레임까지 사용
 
     Returns
     -------
@@ -344,6 +346,11 @@ def _load_csv(
         if df.empty:
             raise ValueError(f"CSV에 t >= {t_start}s 데이터가 없습니다.")
 
+    if t_end is not None:
+        df = df[df['Time'] <= t_end].reset_index(drop=True)
+        if df.empty:
+            raise ValueError(f"CSV에 t <= {t_end}s 데이터가 없습니다.")
+
     time_raw = df['Time'].to_numpy(dtype=float)
     return df, time_raw - time_raw[0], header
 
@@ -364,7 +371,8 @@ class ESLExtractor:
     model       : WHTMeshModel     대상 모델 (직접 수정 → 복구)
     node_db     : dict             {nid: (x, y, z)}
     csv_path    : str
-    t_start     : float            충격 시작 시간 (s)
+    t_start     : float            분석 시작 시간 (s). None → CSV 헤더 start_time 자동 적용
+    t_end       : float | None     분석 종료 시간 (s). None → CSV 마지막 프레임
     n_windows   : int              SE 이력 분할 수
     n_top       : int              최종 ESL 개수
     add_inertia : bool
@@ -377,6 +385,7 @@ class ESLExtractor:
         node_db: dict,
         csv_path: str,
         t_start: Optional[float] = None,
+        t_end: Optional[float] = None,
         n_windows: int = 30,
         n_top: int = 10,
         add_inertia: bool = True,
@@ -390,6 +399,7 @@ class ESLExtractor:
         self.node_db      = node_db
         self.csv_path     = csv_path
         self.t_start      = t_start   # None → CSV 헤더 start_time 자동 적용
+        self.t_end        = t_end     # None → CSV 마지막 프레임까지
         self.n_windows    = n_windows
         self.n_top        = n_top
         self.add_inertia  = add_inertia
@@ -443,14 +453,18 @@ class ESLExtractor:
     # ── 단계별 private 메서드 ────────────────────────────────────────────────
 
     def _load_csv(self) -> None:
-        self._df, self._time_arr, self._csv_header = _load_csv(self.csv_path, self.t_start)
+        self._df, self._time_arr, self._csv_header = _load_csv(
+            self.csv_path, self.t_start, self.t_end
+        )
         if self.t_start is None:
             self.t_start = self._csv_header.get('start_time') or 0.0
         dt   = self._time_arr[1] - self._time_arr[0] if len(self._time_arr) > 1 else 1e-4
         T    = float(self._time_arr[-1])
+        t_end_actual = self.t_start + T
+        t_end_str = f"{self.t_end:.3f} s (지정)" if self.t_end is not None else f"{t_end_actual:.3f} s"
         _section("CSV 로드 및 코너 변위 분석", "ESL-0")
         _row("파일", str(Path(self.csv_path).name))
-        _row("기간", f"{self.t_start:.3f} s ~ {self.t_start + T:.3f} s  "
+        _row("기간", f"{self.t_start:.3f} s ~ {t_end_str}  "
                      f"({len(self._time_arr):,} frames,  dt={dt:.2e} s)")
 
         # 코너 변위 통계 (로컬 Z 기준)
@@ -1028,12 +1042,14 @@ class PosDynamicPipeline:
         """CSV 읽기 → 코너 탐색 → 마스터 노드 + RBE3 + SPCD 구성."""
         # CSV 로드 (t_start: CLI 인자 우선, 없으면 헤더, 없으면 0.0)
         t_start_arg = getattr(self.cfg, 't_start', None)
+        t_end_arg   = getattr(self.cfg, 't_end',   None)
         print(f"\n [2] CSV 로드: {self.cfg.pos_data}")
-        df, time_arr, header = _load_csv(self.cfg.pos_data, t_start_arg)
+        df, time_arr, header = _load_csv(self.cfg.pos_data, t_start_arg, t_end_arg)
         t_start_used = t_start_arg if t_start_arg is not None else (header.get('start_time') or 0.0)
         dt_val  = float(time_arr[1] - time_arr[0]) if len(time_arr) > 1 else self.cfg.dt
         T_total = float(time_arr[-1])
-        print(f"     t_start={t_start_used}s, 프레임={len(time_arr)}, "
+        t_end_str = f"{t_end_arg}s" if t_end_arg is not None else "end"
+        print(f"     t=[{t_start_used}s ~ {t_end_str}], 프레임={len(time_arr)}, "
               f"총 시간={T_total:.4f}s, dt={dt_val:.2e}s")
 
         # 코너 탐색: CSV 헤더 기준 좌표 → 최근접 3개 노드
@@ -1214,10 +1230,13 @@ class TopographyPipeline:
         if not getattr(self.cfg, 'dynamic_opts', None):
             return None, None
 
-        # CSV 엔트리 파싱: "path,t_start" 또는 "path" 형식
+        # CSV 엔트리 파싱: "path" / "path,t_start" / "path,t_start,t_end"
         def _parse_entry(s: str):
             parts = [p.strip() for p in s.split(',')]
-            return parts[0], (float(parts[1]) if len(parts) > 1 else None)
+            csv_path = parts[0]
+            t_start  = float(parts[1]) if len(parts) > 1 else None
+            t_end    = float(parts[2]) if len(parts) > 2 else None
+            return csv_path, t_start, t_end
 
         entries = [_parse_entry(e) for e in self.cfg.dynamic_opts]
 
@@ -1227,8 +1246,9 @@ class TopographyPipeline:
 
         if len(entries) > 1:
             print(f"\n [3] 동적 CSV 시나리오 {len(entries)}개:")
-            for i, ((csv_path, t_start), w) in enumerate(zip(entries, w_list)):
-                print(f"     [{i+1}] {csv_path}  t_start={t_start}  w={w}")
+            for i, ((csv_path, t_start, t_end), w) in enumerate(zip(entries, w_list)):
+                t_range = f"{t_start if t_start is not None else 'auto'} ~ {t_end if t_end is not None else 'end'}"
+                print(f"     [{i+1}] {csv_path}  t=[{t_range}]s  w={w}")
 
         if getattr(self.cfg, 'no_static', False):
             static_cases = []
@@ -1244,12 +1264,13 @@ class TopographyPipeline:
 
         def _run_esl(iteration: int):
             all_snaps = []
-            for (csv_path, t_start), w_dyn in zip(entries, w_list):
+            for (csv_path, t_start, t_end), w_dyn in zip(entries, w_list):
                 snaps = ESLExtractor(
                     model        = self.model,
                     node_db      = self.node_db,
                     csv_path     = csv_path,
                     t_start      = t_start,
+                    t_end        = t_end,
                     n_windows    = self.cfg.n_windows,
                     n_top        = self.cfg.n_top,
                     add_inertia  = self.cfg.add_inertia,
@@ -1489,7 +1510,7 @@ def main():
       --w-dynamic 1.0 --w-peak 0.5 \\
       --sym-x --bead-connect --height-steps 2
     
-python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia --w-dynamic 1.0 --w-peak 1.0  --sym-x --bead-connect --connect-gap 121 --height-steps 2 --bead-area 0.3 --min-width 90 --draw-dir (0, 0, -1) --bead-height 20
+python wht_topo/run_topo.p7 --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia --w-dynamic 1.0 --w-peak 1.0  --sym-x --bead-connect --connect-gap 121 --height-steps 2 --bead-area 0.3 --min-width 90 --draw-dir (0, 0, -1) --bead-height 20
 # --no-static
 
   헤드리스 서버 실행
@@ -1520,11 +1541,15 @@ python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --
 
 --t-start       CSV 분석 시작 시점 s (모드 B 전용).
                 미지정 → CSV 헤더 start_time 자동 적용 → 없으면 0.0.
+--t-end         CSV 분석 종료 시점 s (모드 B 전용).
+                미지정 → CSV 마지막 프레임까지 사용.
 
---dynamic-opts  "CSV경로" 또는 "CSV경로,시작시간(s)" (모드 C/D).
-                복수 충격 시나리오 지정 가능 (공백 구분):
-                  --dynamic-opts "drop.csv,1.6" "bump.csv,0.5" "sine.csv"
-                시간 미지정 → CSV 헤더 start_time 자동 적용.
+--dynamic-opts  시간 범위 지정 형식 (콤마 구분):
+                  "CSV경로"                → t_start: 헤더/0.0,  t_end: 마지막 프레임
+                  "CSV경로,시작(s)"        → t_start 지정,        t_end: 마지막 프레임
+                  "CSV경로,시작(s),종료(s)"→ t_start/t_end 모두 지정
+                복수 충격 시나리오 (공백 구분):
+                  --dynamic-opts "drop.csv,1.6,3.0" "bump.csv,0.5,2.5" "sine.csv"
 
 [ESL 추출 방식]
 --iterative-esl    (기본: 활성) 매 이터레이션 현재 비드 형상에서 동해석 재실행.
@@ -1659,6 +1684,8 @@ python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --
     g.add_argument("--pos-data",  type=str,   default=None,  help="CSV 경로: 지정 시 동적 해석만 실행")
     g.add_argument("--t-start",   type=float, default=None,
                    help="분석 시작 시점 s (기본: CSV 헤더 start_time 자동 적용)")
+    g.add_argument("--t-end",     type=float, default=None,
+                   help="분석 종료 시점 s (기본: CSV 마지막 프레임)")
     g.add_argument("--dt",        type=float, default=1e-4,  help="적분 시간 스텝 s (기본: 1e-4)")
     g.add_argument("--zeta",      type=float, default=0.02,  help="Rayleigh 감쇠비 (기본: 0.02)")
     g.add_argument("--corner-r",  type=float, default=150.0, help="코너 탐색 반경 mm (fallback 전용)")
@@ -1666,8 +1693,9 @@ python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --
     # 동적 ESL 통합 최적화 (모드 C/D)
     g = parser.add_argument_group("동적 ESL 통합 최적화 (모드 C/D)")
     g.add_argument("--dynamic-opts", type=str, nargs='+', default=None,
-                   metavar="CSV[,T_START]",
-                   help="'CSV경로' 또는 'CSV경로,시작시간(s)'. 복수 시나리오 지원: --dynamic-opts drop.csv,1.6 bump.csv,0.5")
+                   metavar="CSV[,T_START[,T_END]]",
+                   help="'CSV경로' / 'CSV경로,시작(s)' / 'CSV경로,시작(s),종료(s)'. "
+                        "복수 시나리오 지원: --dynamic-opts drop.csv,1.6,3.0 bump.csv,0.5")
     g.add_argument("--add-inertia",  action="store_true",     help="관성 하중(-ma) 인가")
     g.add_argument("--n-top",        type=int, default=10,    help="추출 ESL 개수 (기본: 10)")
     g.add_argument("--n-windows",    type=int, default=30,    help="시간 이력 분할 수 (기본: 30)")
