@@ -18,17 +18,30 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
     매 이터레이션 현재 비드 형상에서 동해석을 재실행하여 ESL을 갱신.
     구조가 강성화될수록 동적 응답이 바뀌고 ESL도 함께 진화 → 정식 반복 ESL 절차.
     정적 하중(굽힘·비틀림·리프팅) + 동적 ESL이 함께 목적 함수에 반영됨.
-    단일 시나리오: python wht_topo/run_topo.py --dynamic-opts "data.csv,1.6,3.0" --add-inertia
-    복수 시나리오: python wht_topo/run_topo.py --dynamic-opts "drop.csv,1.6,3.0" "bump.csv,0.5,2.5" --w-dynamic 1.0 0.8
+    단일 시나리오: python wht_topo/run_topo.py \
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" --add-inertia
+    복수 시나리오: python wht_topo/run_topo.py \
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \
+      --w-dynamic 1.0 1.0 1.0 --add-inertia
 
   모드 C' | 동적 충격 통합 최적화 — 1회 ESL (--no-iterative-esl)
     최적화 전 초기 형상에서 ESL을 1회 추출하여 전체 최적화에 고정.
     계산 비용 낮음. 모드 C 결과와 비교 연구에 사용.
-    실행: python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia --no-iterative-esl
+    실행: python wht_topo/run_topo.py \
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \
+      --add-inertia --no-iterative-esl
 
   모드 D | 고신뢰성 산업용 완전 제약 설계
     반복 ESL + 관성 하중 + 좌우 대칭 + 비드 연결 + 이산화(0/h_max)
-    실행: python wht_topo/run_topo.py --dynamic-opts "data.csv" --add-inertia --sym-x --bead-connect --height-steps 2
+    실행: python wht_topo/run_topo.py \
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \
+      --add-inertia --sym-x --bead-connect --height-steps 2
 
 [하중 케이스 구성 원칙]
   정적 하중과 동적 ESL은 독립적으로 가중치를 설정하여 목적 함수에 합산됩니다.
@@ -1459,64 +1472,82 @@ def main():
 
 [모드 C] 동적 충격 통합 최적화 — 반복 ESL (기본)
   (정적 하중 + 동적 ESL 병합 / 매 이터레이션 ESL 재추출)
+  3개 충격 시나리오: rear(0.4~0.6s) / c125(1.5~1.8s) / c235(1.5~1.8s)
 
-  [권장] 반복 ESL + 관성 하중
+  [권장] 복수 시나리오 반복 ESL + 관성 하중
     python wht_topo/run_topo.py \\
-      --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia
-    -> 정적 케이스 유지, 매 이터레이션 동해석 재실행 → ESL 갱신
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --w-dynamic 1.0 1.0 1.0 --add-inertia
+    -> 정적 케이스 유지, 매 이터레이션 3개 CSV 동해석 재실행 → ESL 갱신
     -> 결과: results/D날짜_시간/{paraview/, esl_se_report_iter000.png, ...}
 
   [권장] 시간분할 ESL + 요소별 피크 ESL 병용
     python wht_topo/run_topo.py \\
-      --dynamic-opts "data.csv,1.6" --add-inertia \\
-      --w-dynamic 1.0 --w-peak 0.5
-    -> 시간분할 10개(w=1.0) + 피크 1개(w=0.5) 이터레이션마다 재추출
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --w-dynamic 1.0 1.0 1.0 --w-peak 0.5 --add-inertia
+    -> 시나리오별 시간분할 10개(w=1.0) + 피크 1개(w=0.5) 이터레이션마다 재추출
 
   동적 ESL만 사용 (정적 하중 비활성)
     python wht_topo/run_topo.py \\
-      --dynamic-opts "data.csv" --add-inertia \\
-      --no-static --w-dynamic 1.0 --w-peak 0.5
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --no-static --w-dynamic 1.0 --w-peak 0.5 --add-inertia
     -> 굽힘·비틀림·리프팅 정적 케이스 전체 제외
 
   피크 ESL만 단독 (시간분할 비활성)
     python wht_topo/run_topo.py \\
-      --dynamic-opts "data.csv" --add-inertia \\
-      --w-dynamic 0.0 --w-peak 1.0
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --w-dynamic 0.0 --w-peak 1.0 --add-inertia
 
   ESL 고밀도 탐색
     python wht_topo/run_topo.py \\
-      --dynamic-opts "data.csv,1.6" --add-inertia \\
-      --n-windows 50 --n-top 15 --w-peak 0.5
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --w-dynamic 1.0 --add-inertia --n-windows 50 --n-top 15 --w-peak 0.5
 
 [모드 C' — 비교용] 1회 ESL 추출 후 고정 (--no-iterative-esl)
 
   반복 ESL 결과와 비교 (동일 조건, ESL만 고정)
     python wht_topo/run_topo.py \\
-      --dynamic-opts "data.csv,1.6" --add-inertia \\
-      --no-iterative-esl --w-dynamic 1.0 --w-peak 0.5
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --no-iterative-esl --w-dynamic 1.0 --w-peak 0.5 --add-inertia
     -> 최적화 전 ESL 1회 추출, 이후 고정 / 계산 비용 낮음
 
 [모드 D] 산업용 고신뢰성 완전 제약 설계
 
   [권장] 반복 ESL + 관성 하중 + 대칭 + 비드 연결 + 이산화
     python wht_topo/run_topo.py \\
-      --dynamic-opts "structural_dynamics.csv" --add-inertia \\
-      --w-dynamic 1.0 --w-peak 0.5 \\
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --w-dynamic 1.0 --w-peak 0.5 --add-inertia \\
       --sym-x --bead-connect --height-steps 2
 
   동적 ESL 전용 (정적 비활성)
     python wht_topo/run_topo.py \\
-      --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia --no-static \\
-      --w-dynamic 1.0 --w-peak 0.5 \\
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --no-static --w-dynamic 1.0 --w-peak 0.5 --add-inertia \\
       --sym-x --bead-connect --height-steps 2
-    
-python wht_topo/run_topo.p7 --dynamic-opts "wht_topo/structural_dynamics.csv" --add-inertia --w-dynamic 1.0 --w-peak 1.0  --sym-x --bead-connect --connect-gap 121 --height-steps 2 --bead-area 0.3 --min-width 90 --draw-dir (0, 0, -1) --bead-height 20
-# --no-static
 
   헤드리스 서버 실행
     python wht_topo/run_topo.py \\
-      --dynamic-opts "data.csv" --add-inertia \\
-      --n-windows 50 --n-top 20 --w-peak 0.5 \\
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --w-dynamic 1.0 --w-peak 0.5 --add-inertia \\
+      --n-windows 50 --n-top 20 \\
       --sym-x --bead-connect --height-steps 2 \\
       --no-gui --no-viz
 
