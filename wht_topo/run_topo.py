@@ -12,7 +12,9 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
   모드 B | CSV 단독 동적 응답 해석 (최적화 생략)
     실측 4코너 위치 데이터로 과도 응답 해석 후 ParaView HDF 저장.
     하중: 각 코너 마스터 노드(#900000~#900003)에 로컬 Z-SPCD 적용(RBE3 연결).
-    실행: python wht_topo/run_topo.py --pos-data wht_topo/structural_dynamics.csv
+    실행: python wht_topo/run_topo.py \
+      --pos-data wht_topo/structural_dynamics_rear.csv \
+      --t-start 0.4 --t-end 0.6
 
   모드 C | 동적 충격 통합 최적화 — 반복 ESL (기본)
     매 이터레이션 현재 비드 형상에서 동해석을 재실행하여 ESL을 갱신.
@@ -36,12 +38,13 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
       --add-inertia --no-iterative-esl
 
   모드 D | 고신뢰성 산업용 완전 제약 설계
-    반복 ESL + 관성 하중 + 좌우 대칭 + 비드 연결 + 이산화(0/h_max)
+    반복 ESL + 관성 하중 + 좌우 대칭 + 비드 연결 + 이산화(0/h_max) + 배제 영역
     실행: python wht_topo/run_topo.py \
       --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \
                      "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \
                      "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \
-      --add-inertia --sym-x --bead-connect --height-steps 2
+      --add-inertia --sym-x --bead-connect --height-steps 2 \
+      --exclude-rect 450,250,120,120 --exclude-rect 1350,250,120,120
 
 [하중 케이스 구성 원칙]
   정적 하중과 동적 ESL은 독립적으로 가중치를 설정하여 목적 함수에 합산됩니다.
@@ -55,6 +58,24 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
                 --w-lifting  W  F
                 ...
                 --no-static 으로 전체 제외 가능
+
+[비드 배제 영역 — --exclude-rect / --exclude-poly]
+  마운팅 홀, 슬롯, 보스 등 비드를 생성하면 안 되는 영역을 지정합니다.
+  설계 요소의 도심 XY 좌표가 배제 영역 내에 포함되면 설계 변수에서 제외됩니다.
+
+  사각형 배제 (중심 CX,CY + 가로W × 세로H):
+    --exclude-rect CX,CY,W,H
+    예) 마운팅 보스 4개소:
+      --exclude-rect 450,250,120,120 --exclude-rect 1350,250,120,120 \
+      --exclude-rect 450,950,120,120 --exclude-rect 1350,950,120,120
+
+  다각형 배제 (꼭짓점 X1,Y1,X2,Y2,... 나열, 자동 닫힘):
+    --exclude-poly X1,Y1,X2,Y2,...
+    예) 장공/슬롯:
+      --exclude-poly 600,400,900,400,900,500,600,500
+
+  두 방식 혼용 가능:
+    --exclude-rect 450,250,120,120 --exclude-poly 600,400,900,400,900,500,600,500
 
 [목적함수 옵션 — --obj-type / --normalize-obj / --freq-penalty]
 
@@ -88,7 +109,7 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
     전면 산업 설계            : --obj-type sum+max --normalize-obj --freq-penalty 3.0 40
 
 [동적 ESL 알고리즘 — 시간분할 스냅샷 (--w-dynamic)]
-  1. CSV에서 t_start 이후 구간 추출 (t_start: 인자 > CSV 헤더 > 0.0 우선순위).
+  1. CSV에서 [t_start, t_end] 구간 추출 (t_start: 인자 > CSV 헤더 > 0.0 우선순위).
   2. 강체 회전 제거 → 로컬 Z 방향 순수 벤딩 변위 분리 (calculate_local_z_history).
   3. 4코너 마스터 노드(#900000~900003) + RBE3 → Z-SPCD 하중 그룹 구성.
      CSV # 헤더의 C5~C8 좌표로 가장 가까운 FEM 노드 3개씩 자동 탐색.
