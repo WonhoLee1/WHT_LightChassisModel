@@ -1399,6 +1399,7 @@ class TopographyPipeline:
             freq_weight       = freq_w,
             freq_target       = freq_f0,
             exclude_zones     = exclude_zones,
+            n_workers         = self.cfg.n_workers,
         )
 
     def _run_optimizer(self) -> None:
@@ -1590,8 +1591,8 @@ def main():
       --sym-x --bead-connect --height-steps 2
 
   동적 ESL 전용 (정적 비활성)
-    python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" "wht_topo/structural_dynamics_c125.csv,1.5,1.8" "wht_topo/structural_dynamics_c235.csv,1.5,1.8"  --no-static --w-dynamic 1.0 --w-peak 1.0 --add-inertia  --sym-x --bead-connect --height-steps 2 --min-width 40 --normalize-obj
-
+    python wht_topo/run_topo.py --n-workers 4 --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" "wht_topo/structural_dynamics_c125.csv,1.5,1.8" "wht_topo/structural_dynamics_c235.csv,1.5,1.8"  --w-dynamic 1.0 --w-peak 1.0 --add-inertia  --sym-x --bead-connect --height-steps 2 --min-width 40 --normalize-obj  --exclude-rect 500,300,100,80 --exclude-rect 200,400,60,60 
+    
   헤드리스 서버 실행
     python wht_topo/run_topo.py \\
       --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
@@ -1767,6 +1768,13 @@ def main():
                    metavar=("W", "F0_HZ"),
                    help="고유진동수 패널티: W·(max(0,F0-f1)/F0)². "
                         "예: --freq-penalty 5.0 50  → f1 < 50Hz 시 패널티 부과")
+
+    # 병렬 해석 옵션
+    g = parser.add_argument_group("병렬 해석 옵션")
+    g.add_argument("--n-workers", type=int, default=4,
+                   help="하중 케이스 병렬 해석 스레드 수 (기본: 4). "
+                        "케이스 수보다 크게 지정해도 케이스 수로 자동 제한. "
+                        "BLAS 멀티스레드와 충돌 방지를 위해 CPU 코어 수의 절반 권장.")
 
     # 비드 형상 및 제조 제약
     g = parser.add_argument_group("비드 형상 및 제조 제약")

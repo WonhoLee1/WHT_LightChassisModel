@@ -38,28 +38,6 @@ class PlotCanvas(FigureCanvas):
         self.fig.tight_layout()
 
 
-def _estimate_node_spacing(coords: np.ndarray) -> float:
-    """
-    노드 좌표 배열로부터 평균 이웃 노드 간격을 추정합니다.
-
-    Parameters
-    ----------
-    coords : (N, 3) ndarray
-        노드 좌표 배열 (XYZ)
-
-    Returns
-    -------
-    float : 추정 평균 노드 간격 [mm]
-    """
-    if len(coords) < 2:
-        return 40.0
-    # X, Y 방향 최솟값을 간격의 근사치로 사용 (정렬된 메시 가정)
-    xs = np.sort(np.unique(np.round(coords[:, 0], 1)))
-    ys = np.sort(np.unique(np.round(coords[:, 1], 1)))
-    dx = float(np.median(np.diff(xs))) if len(xs) > 1 else 40.0
-    dy = float(np.median(np.diff(ys))) if len(ys) > 1 else 40.0
-    return min(dx, dy)
-
 
 # ────────────────────────────────────────────────────────────────────────────
 # Main Monitor Window
@@ -637,44 +615,22 @@ class WHTMonitorWindow(QMainWindow):
         heights = snap["heights"]
         it_label = snap["iter"]
 
-        # 노드 간격 기반 마커 크기 계산 (사각형, data 좌표 기준)
-        spacing = _estimate_node_spacing(coords)
-
         ax = self.height_canvas.ax
         ax.clear()
-
-        # scatter 마커 크기(s)는 포인트^2 단위 → 데이터 좌표 spacing을 포인트로 변환
-        # 피규어 DPI와 좌표 범위를 이용한 변환
         fig = self.height_canvas.fig
-        fig_w_inch = fig.get_figwidth()
-        data_range_x = coords[:, 0].max() - coords[:, 0].min() + spacing
-        pts_per_data = (fig_w_inch * fig.dpi) / data_range_x if data_range_x > 0 else 1.0
-        marker_pts = spacing * pts_per_data * 0.85  # 85%로 약간 여백
-        marker_pts = max(1.0, marker_pts - 1.0)     # 계산값에서 1픽셀(pt) 차감
-        marker_size_sq = marker_pts ** 2
 
         # 0을 중앙(보통 흰색)으로 두기 위한 대칭 범위(vmin, vmax) 설정
         max_abs_h = max(1e-5, float(np.max(np.abs(heights))))
 
-        sc = ax.scatter(
-            coords[:, 0], coords[:, 1],
-            c=heights, cmap='coolwarm',
-            marker='s',
-            s=marker_size_sq,
-            linewidths=0,
+        # tripcolor: 삼각 메시 기반 연속 채색 → 모자이크 없음
+        sc = ax.tripcolor(
+            coords[:, 0], coords[:, 1], heights,
+            cmap='coolwarm',
             vmin=-max_abs_h,
             vmax=max_abs_h,
+            shading='gouraud',
         )
 
-        # 등고선(Contour) 추가
-        if np.max(np.abs(heights)) > 1e-3:
-            try:
-                ax.tricontour(
-                    coords[:, 0], coords[:, 1], heights,
-                    levels=10, colors='black', linewidths=0.5, alpha=0.5
-                )
-            except Exception:
-                pass
 
         # 컬러바 관리 (중복 생성 방지)
         if self._height_colorbar is None:

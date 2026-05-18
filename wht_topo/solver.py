@@ -66,6 +66,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 from typing import List, Dict, Optional, Tuple
+from tqdm import tqdm
 
 from wht_modeler.wht_mesh_model import WHTMeshModel
 from wht_solver.wht_solver import WHTSolver
@@ -195,6 +196,7 @@ class WHTopographySolver:
         freq_weight: float = 0.0,
         freq_target: float = 0.0,
         exclude_zones: Optional[List[dict]] = None,
+        n_workers: int = 4,
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -218,6 +220,7 @@ class WHTopographySolver:
         self.freq_target         = freq_target  # Hz
         self._C_0_cases: Dict[str, float] = {}  # 케이스별 기준 컴플라이언스 (정규화용)
         self.exclude_zones       = exclude_zones or []  # 비드 배제 영역 목록
+        self.n_workers           = max(1, n_workers)
 
         # ... (중략) ...
         self._beta = 1.0
@@ -766,7 +769,7 @@ class WHTopographySolver:
     # ─────────────── 컴플라이언스 및 민감도 ───────────────
 
     def _compute_total_compliance(
-        self, solver
+        self, solver, iter_num: int = 0
     ) -> Tuple[float, dict, np.ndarray, Dict[str, np.ndarray]]:
         """
         현재 비드 형상에서의 총 컴플라이언스 및 설계 변수별 민감도를 계산합니다.
@@ -872,17 +875,19 @@ class WHTopographySolver:
 
         # ── 4. ThreadPoolExecutor 병렬 실행 ────────────────────────────────────
         # UMFPACK(spsolve)은 단일스레드 → 멀티코어에서 진정한 병렬화
-        # BLAS 과부하 방지를 위해 워커 수 4개 상한
-        n_workers = min(len(self._load_cases), 4)
+        n_workers = min(len(self._load_cases), self.n_workers)
         solve_results = [None] * len(self._load_cases)
         lc_list = [(i, lc, w) for i, (lc, w) in enumerate(self._load_cases)]
 
+        n_cases = len(lc_list)
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {executor.submit(_solve_one, lc): (i, w)
                        for i, lc, w in lc_list}
-            for future in as_completed(futures):
-                i, w = futures[future]
-                solve_results[i] = (w, future.result())
+            with tqdm(total=n_cases, desc=f"  Iter {iter_num:>3d} 하중 케이스 해석", unit="case", ncols=80) as pbar:
+                for future in as_completed(futures):
+                    i, w = futures[future]
+                    solve_results[i] = (w, future.result())
+                    pbar.update(1)
 
         # ── 5. 결과 수집 + JAX 민감도 (순차 — JAX GIL 이슈) ──────────────────
         # 좌표 배열을 인스턴스에 저장 → solve()의 주파수 민감도 계산에서 재사용
@@ -1027,7 +1032,7 @@ class WHTopographySolver:
                       f"+ 동적 ESL {len(dyn_cases)}개 = 총 {len(self._load_cases)}개")
 
             # 컴플라이언스 및 민감도 계산 (솔버 인스턴스 공유)
-            C_total, C_responses, dC_dh_base, per_case_sens = self._compute_total_compliance(fea_solver)
+            C_total, C_responses, dC_dh_base, per_case_sens = self._compute_total_compliance(fea_solver, iter_num=i)
             ndof = len(self.sorted_nids) * 6
 
             # 초기값 저장 및 정규화 (수렴 안정성 강화)
