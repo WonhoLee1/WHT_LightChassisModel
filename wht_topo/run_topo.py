@@ -419,6 +419,64 @@ def _load_csv(
     return df, time_raw - time_raw[0], header
 
 
+def _apply_inertia_loads(
+    df, time_arr, node_db, model, load_groups: list
+) -> tuple:
+    """
+    코너 가속도 쌍선형 보간으로 모든 내부 노드에 관성 하중 F = -m·a 를 인가합니다.
+
+    load_groups 리스트에 InterpLoadGroup(FORCE)을 직접 추가합니다.
+
+    Returns
+    -------
+    total_mass   : float   총 섀시 질량 (tonne)
+    corner_accels: ndarray (T, 4) 코너 가속도 [mm/s²]
+    n_inertia    : int     관성 하중 인가 노드 수
+    """
+    _, traj_mm = calculate_local_z_history(df, time_arr)
+    dt         = time_arr[1] - time_arr[0] if len(time_arr) > 1 else 1e-4
+    accels     = calculate_corner_accelerations(traj_mm, dt)  # (T, 4)
+
+    all_xyz = np.array(list(node_db.values()))
+    xmin, xmax = all_xyz[:, 0].min(), all_xyz[:, 0].max()
+    ymin, ymax = all_xyz[:, 1].min(), all_xyz[:, 1].max()
+    dx = max(xmax - xmin, 1.0)
+    dy = max(ymax - ymin, 1.0)
+
+    temp   = WHTDynamicSolver(model)
+    jm, s_nids, n2i = temp._build_jaxsso_model()
+    m_diag = temp._assemble_lumped_mass(jm, jm.ndof, s_nids, n2i)
+
+    total_mass = float(sum(
+        m_diag[n2i[nid] * 6 + 2]
+        for nid in node_db
+        if n2i.get(nid) is not None and nid < 900000
+        and m_diag[n2i[nid] * 6 + 2] > 1e-12
+    ))
+
+    n_inertia = 0
+    for nid in node_db:
+        ix = n2i.get(nid)
+        if ix is None or nid >= 900000:
+            continue
+        x, y, _ = node_db[nid]
+        nx, ny  = (x - xmin) / dx, (y - ymin) / dy
+        a_z = (
+            accels[:, 0] * (nx)     * (ny)      +  # C5: +X+Y
+            accels[:, 1] * (nx)     * (1 - ny)  +  # C6: +X-Y
+            accels[:, 2] * (1 - nx) * (1 - ny)  +  # C7: -X-Y
+            accels[:, 3] * (1 - nx) * (ny)         # C8: -X+Y
+        )
+        node_mass = m_diag[ix * 6 + 2]
+        if node_mass > 1e-12:
+            load_groups.append(
+                InterpLoadGroup([nid], 2, time_arr, -node_mass * a_z, "FORCE")
+            )
+            n_inertia += 1
+
+    return total_mass, accels, n_inertia
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ESL 추출기  (TopographyPipeline 내부에서 사용)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,50 +651,12 @@ class ESLExtractor:
 
     def _add_inertia_loads(self) -> None:
         """이선형 보간으로 모든 내부 노드에 관성 하중 F = -m·a 를 인가합니다."""
-        _, traj_mm = calculate_local_z_history(self._df, self._time_arr)
-        dt         = self._time_arr[1] - self._time_arr[0] if len(self._time_arr) > 1 else 1e-4
-        accels     = calculate_corner_accelerations(traj_mm, dt)  # (T, 4)
-
-        all_xyz = np.array(list(self.node_db.values()))
-        xmin, xmax = all_xyz[:, 0].min(), all_xyz[:, 0].max()
-        ymin, ymax = all_xyz[:, 1].min(), all_xyz[:, 1].max()
-        dx = max(xmax - xmin, 1.0)
-        dy = max(ymax - ymin, 1.0)
-
-        temp = WHTDynamicSolver(self.model)
-        jm, s_nids, n2i = temp._build_jaxsso_model()
-        m_diag = temp._assemble_lumped_mass(jm, jm.ndof, s_nids, n2i)
-
-        # 총 섀시 질량 (Z 방향 집중 질량 합)
-        self._total_mass = float(sum(
-            m_diag[n2i[nid] * 6 + 2]
-            for nid in self.node_db
-            if n2i.get(nid) is not None and nid < 900000
-            and m_diag[n2i[nid] * 6 + 2] > 1e-12
-        ))
-        # 코너 가속도 피크 → 충격력 지표
-        self._corner_accels = accels  # (T, 4) mm/s²
-        self._accel_dt      = dt
-
-        n_inertia = 0
-        for nid in self.node_db:
-            ix = n2i.get(nid)
-            if ix is None or nid >= 900000:
-                continue
-            x, y, _ = self.node_db[nid]
-            nx, ny  = (x - xmin) / dx, (y - ymin) / dy
-            a_z = (
-                accels[:, 0] * (nx)     * (ny)      +  # C5: +X+Y
-                accels[:, 1] * (nx)     * (1 - ny)  +  # C6: +X-Y
-                accels[:, 2] * (1 - nx) * (1 - ny)  +  # C7: -X-Y
-                accels[:, 3] * (1 - nx) * (ny)         # C8: -X+Y
-            )
-            node_mass = m_diag[ix * 6 + 2]
-            if node_mass > 1e-12:
-                self._load_groups.append(
-                    InterpLoadGroup([nid], 2, self._time_arr, -node_mass * a_z, "FORCE")
-                )
-                n_inertia += 1
+        total_mass, accels, n_inertia = _apply_inertia_loads(
+            self._df, self._time_arr, self.node_db, self.model, self._load_groups
+        )
+        self._total_mass    = total_mass
+        self._corner_accels = accels
+        self._accel_dt      = self._time_arr[1] - self._time_arr[0] if len(self._time_arr) > 1 else 1e-4
 
         _section("관성 하중 (F = -m·a) 인가", "ESL-0c")
         _row("총 섀시 질량", f"{self._total_mass*1e6:.2f} kg  ({self._total_mass:.4e} tonne)")
@@ -1071,6 +1091,15 @@ class PosDynamicPipeline:
             print(f"  {'─'*(_W-2)}\n")
             self._build_mesh()
             self._find_corners_and_load()
+            if getattr(self.cfg, 'add_inertia', False):
+                total_mass, accels, n_inertia = _apply_inertia_loads(
+                    self._df, self._time_arr,
+                    self.node_db, self.model, self._load_groups
+                )
+                _section("관성 하중 (F = -m·a) 인가", "B-inertia")
+                _row("총 섀시 질량", f"{total_mass*1e6:.2f} kg  ({total_mass:.4e} tonne)")
+                _row("관성 하중 인가 노드", f"{n_inertia:,}개")
+                _endsec()
             self._run_dynamic()
             self._export()
         finally:
@@ -1159,6 +1188,8 @@ class PosDynamicPipeline:
         self._load_groups = load_groups
         self._dt_val      = dt_val
         self._T_total     = T_total
+        self._df          = df
+        self._time_arr    = time_arr
 
     def _run_dynamic(self) -> None:
         print(f"\n [5] 과도 응답 해석 (Newmark-β, dt={self._dt_val:.2e}s, T={self._T_total:.4f}s)...")
@@ -1305,7 +1336,7 @@ class TopographyPipeline:
         entries = [_parse_entry(e) for e in self.cfg.dynamic_opts]
 
         # --w-dynamic 가중치 목록: CSV 수보다 적으면 마지막 값으로 채움
-        w_list_raw = list(self.cfg.w_dynamic)
+        w_list_raw = list(self.cfg.w_dynamic) or [1.0]
         w_list = w_list_raw + [w_list_raw[-1]] * max(0, len(entries) - len(w_list_raw))
 
         if len(entries) > 1:
@@ -1413,16 +1444,18 @@ class TopographyPipeline:
             queue      = multiprocessing.Queue()
             stop_event = multiprocessing.Event()
             ui_process = multiprocessing.Process(
-                target=start_monitor_ui, args=(queue, stop_event)
+                target=start_monitor_ui,
+                args=(queue, stop_event, str(self.out_dir))
             )
             ui_process.start()
             callback = queue.put
 
         print(f" [4] 최적화 실행 (max_iter={self.cfg.iters})...")
-        self.solver.solve(max_iter=self.cfg.iters, callback=callback, stop_event=stop_event)
-
-        if ui_process and ui_process.is_alive():
-            queue.put("STOP")
+        try:
+            self.solver.solve(max_iter=self.cfg.iters, callback=callback, stop_event=stop_event)
+        finally:
+            if ui_process and ui_process.is_alive():
+                queue.put("STOP")
 
     def _discretize(self) -> None:
         """height_steps >= 2 인 경우 비드 높이를 이산 레벨로 양자화합니다."""
@@ -1591,7 +1624,7 @@ def main():
       --sym-x --bead-connect --height-steps 2
 
   동적 ESL 전용 (정적 비활성)
-    python wht_topo/run_topo.py --n-workers 4 --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" "wht_topo/structural_dynamics_c125.csv,1.5,1.8" "wht_topo/structural_dynamics_c235.csv,1.5,1.8"  --w-dynamic 1.0 --w-peak 1.0 --add-inertia  --sym-x --bead-connect --height-steps 2 --min-width 40 --normalize-obj  --exclude-rect 500,300,100,80 --exclude-rect 200,400,60,60 
+    python wht_topo/run_topo.py --n-workers 4 --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" "wht_topo/structural_dynamics_c125.csv,1.5,1.8" "wht_topo/structural_dynamics_c235.csv,1.5,1.8"  --w-dynamic 1.0 --w-peak 1.0 --add-inertia  --sym-x --bead-connect --height-steps 2 --min-width 40 --normalize-obj  --exclude-rect 500,300,300,300 --exclude-rect 200,400,300,500
     
   헤드리스 서버 실행
     python wht_topo/run_topo.py \\
@@ -1834,15 +1867,15 @@ def main():
     g.add_argument("--w-bending",       type=float, nargs=2, default=[1.0, -10.0],
                    metavar=("W", "F_N"), help="중앙 굽힘        가중치·하중 (기본: 1.0 -10)")
     g.add_argument("--w-bending-xspan", type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="X스팬 굽힘       가중치·하중 (기본: 0.8 -10)")
+                   metavar=("W", "F_N"), help="X스팬 굽힘       가중치·하중 (기본: 1.0 -10)")
     g.add_argument("--w-bending-yspan", type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="Y스팬 굽힘       가중치·하중 (기본: 0.8 -10)")
+                   metavar=("W", "F_N"), help="Y스팬 굽힘       가중치·하중 (기본: 1.0 -10)")
     g.add_argument("--w-twisting",      type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="대각 비틀림      가중치·하중 (기본: 1.5 -10)")
+                   metavar=("W", "F_N"), help="대각 비틀림      가중치·하중 (기본: 1.0 -10)")
     g.add_argument("--w-twisting-alt",  type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="반전 대각 비틀림 가중치·하중 (기본: 1.5 -10)")
+                   metavar=("W", "F_N"), help="반전 대각 비틀림 가중치·하중 (기본: 1.0 -10)")
     g.add_argument("--w-lifting",       type=float, nargs=2, default=[1.0,  10.0],
-                   metavar=("W", "F_N"), help="4코너 리프팅     가중치·하중 (기본: 1.2 10)")
+                   metavar=("W", "F_N"), help="4코너 리프팅     가중치·하중 (기본: 1.0 10)")
 
     # 출력 및 시각화
     g = parser.add_argument_group("출력 및 시각화")

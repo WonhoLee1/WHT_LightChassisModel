@@ -61,10 +61,12 @@ Dependencies:
     wht_modeler, wht_solver, wht_topo.loads, wht_topo.mma
 """
 
+import pickle
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
 
@@ -1001,7 +1003,49 @@ class WHTopographySolver:
         )
         print(f" -> [Solver] 이터레이션별 통합 해석 결과 저장 디렉토리: {export_dir}")
 
-        C_0 = None 
+        # ── 스냅샷 디렉토리 ──────────────────────────────────────────────────
+        _snap_dir = Path(export_dir).parent / "snapshots"
+        _snap_dir.mkdir(parents=True, exist_ok=True)
+
+        # 설계 요소 메시 엣지 (Mesh View용 LineSegments: (E, 2, 2))
+        _edge_set: set = set()
+        for _eid in self._design_elems:
+            _enids = list(self.model.elements[_eid].node_ids)
+            for _k in range(len(_enids)):
+                _edge_set.add(tuple(sorted([_enids[_k], _enids[(_k+1) % len(_enids)]])))
+        mesh_edge_segs = np.array([
+            [[self.model.nodes[_n1].x, self.model.nodes[_n1].y],
+             [self.model.nodes[_n2].x, self.model.nodes[_n2].y]]
+            for _n1, _n2 in _edge_set
+        ], dtype=np.float32)
+
+        # init.pkl — 모델 + 집합 배열 + 하중 케이스 (모니터 re-solve 용)
+        _init_snap = {
+            "model":              self.model,
+            "static_load_cases":  list(self._static_load_cases),
+            "design_elems":       self._design_elems,
+            "design_nids":        self._design_nids,
+            "aggr_src":           self._aggr_src,
+            "aggr_dst":           self._aggr_dst,
+            "aggr_w":             self._aggr_w,
+            "sorted_nids":        self.sorted_nids,
+            "bead_dir":           self.bead_dir,
+            "h_max":              self.h_max,
+            "orig_coords":        {nid: (self.model.nodes[nid].x,
+                                         self.model.nodes[nid].y,
+                                         self.model.nodes[nid].z)
+                                   for nid in self._design_nids},
+            "mesh_edge_segs":     mesh_edge_segs,
+        }
+        try:
+            with open(_snap_dir / "init.pkl", "wb") as _f:
+                pickle.dump(_init_snap, _f)
+            print(f" -> [Snapshot] init.pkl 저장 완료: {_snap_dir}")
+        except Exception as _e:
+            print(f" -> [Snapshot] init.pkl 저장 실패: {_e}")
+
+        C_0 = None
+        _mesh_edge_segs_sent = False
 
         for i in range(max_iter):
             # 좌우 대칭 강제 (변수 동기화)
@@ -1051,6 +1095,7 @@ class WHTopographySolver:
                 print(f"    [경고] 고유진동수 해석 실패 (Iter {i}): {e}")
                 modal_results = None
                 freqs = np.zeros(10)
+            elastic_freqs = [f for f in freqs if f > 0.1]
 
             # ── 이터레이션 결과 저장 (ParaView 호환 VTKHDF) ──
             try:
@@ -1081,13 +1126,14 @@ class WHTopographySolver:
                         wht_data.cell_data[f"Stress_{name}"] = res_data.cell_data["Stress"]
 
                 # 3. 고유 모드 형상 추가 및 주파수 정보 명시
-                modal_data = modal_results.to_wht_result_data(meta, self.model)
-                if "Displacement" in modal_data.point_data:
-                    mode_disp = modal_data.point_data["Displacement"] # (num_modes, N, 3)
-                    for m_idx in range(mode_disp.shape[0]):
-                        freq_hz = freqs[m_idx]
-                        field_name = f"Mode_{m_idx+1}_{freq_hz:.2f}Hz"
-                        wht_data.point_data[field_name] = mode_disp[m_idx:m_idx+1]
+                if modal_results is not None:
+                    modal_data = modal_results.to_wht_result_data(meta, self.model)
+                    if "Displacement" in modal_data.point_data:
+                        mode_disp = modal_data.point_data["Displacement"] # (num_modes, N, 3)
+                        for m_idx in range(mode_disp.shape[0]):
+                            freq_hz = freqs[m_idx]
+                            field_name = f"Mode_{m_idx+1}_{freq_hz:.2f}Hz"
+                            wht_data.point_data[field_name] = mode_disp[m_idx:m_idx+1]
                 
                 if not hasattr(wht_data, "field_data") or wht_data.field_data is None:
                     wht_data.field_data = {}
@@ -1184,7 +1230,12 @@ class WHTopographySolver:
                     try:
                         # 첫 번째 탄성 모드 형상 → 전체 DOF 벡터 φ (ndof,)
                         # modal_results.mode_shapes: (n_modes, N, 6), sorted_nids 순
-                        phi_node = modal_results.mode_shapes[0]
+                        # elastic_freqs[0] 에 대응하는 실제 모드 인덱스를 찾아야 함
+                        # (rigid body 모드가 앞에 있을 수 있으므로 mode_shapes[0] 은 오류)
+                        _first_elastic_idx = next(
+                            (k for k, f in enumerate(freqs) if f > 0.1), 0
+                        )
+                        phi_node = modal_results.mode_shapes[_first_elastic_idx]
                         phi = np.zeros(ndof)
                         for ii, nid in enumerate(self.sorted_nids):
                             phi[self.nid_to_idx[nid] * 6:self.nid_to_idx[nid] * 6 + 6] = phi_node[ii]
@@ -1343,28 +1394,40 @@ class WHTopographySolver:
                     }
                     
                 data = {
-                    "iter": i,
+                    "iter":       i + 1,
                     "compliance": float(C_total),
-                    "area_ratio": float(np.mean(x_proj > 0.1)), # 투사된 변수 기준 면적
-                    "cases": case_data,
+                    "area_ratio": float(np.mean(x_proj > 0.1)),
+                    "cases":      case_data,
                     "frequencies": freqs.tolist(),
-                    "avg_h": float(np.mean(h_phys)),
-                    "max_h": float(np.max(h_phys)),
-                    "dx": change,
-                    "coords": coords,
-                    # 모니터에는 필터 이전 투사값(h_phys = x_proj × h_max)을 전달:
-                    # h_filtered는 공간 필터로 블러되어 이산 패턴이 사라짐.
-                    # bead_dir 주 축 부호를 곱해 방향도 반영 (coolwarm: 음=안쪽, 양=바깥쪽).
-                    "heights": h_phys * float(np.sign(
+                    "avg_h":      float(np.mean(h_phys)),
+                    "max_h":      float(np.max(h_phys)),
+                    "dx":         change,
+                    "coords":     coords,
+                    "heights":    h_phys * float(np.sign(
                         self.bead_dir[int(np.argmax(np.abs(self.bead_dir)))]
                     )),
+                    "snap_dir":   str(_snap_dir),
                 }
+                if not _mesh_edge_segs_sent:
+                    data["mesh_edge_segs"] = mesh_edge_segs
+                    _mesh_edge_segs_sent = True
                 callback(data)
+
+                # 이터레이션 스냅샷 저장
+                try:
+                    with open(_snap_dir / f"iter_{i+1:03d}.pkl", "wb") as _f:
+                        pickle.dump({
+                            "iter":       i + 1,
+                            "h_elem":     h_phys.copy(),
+                            "load_cases": [(lc.name, w, lc)
+                                           for lc, w in self._load_cases],
+                        }, _f)
+                except Exception:
+                    pass
 
             # ── 이터레이션 요약 출력 ──────────────────────────────────────────
             # 박스 폭 _SW = 76: "  ┌"(3) + content + "┐"(1) = 76 → content = 72
             _SW = 76
-            elastic_freqs = [f for f in freqs if f > 0.1]
             f1_str = f"F1={elastic_freqs[0]:.1f}Hz" if elastic_freqs else "F1=--"
             converged = change < tol
             stop_req  = stop_event and stop_event.is_set()
