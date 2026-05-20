@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QTabWidget, QHeaderView,
     QComboBox, QLabel, QPushButton, QSlider, QFileDialog,
-    QMessageBox,
+    QMessageBox, QSizePolicy,
 )
 from PySide6.QtCore import Signal, QObject, QThread, Qt
 from PySide6.QtGui import QPixmap
@@ -393,7 +393,11 @@ class WHTMonitorWindow(QMainWindow):
         root_lay.setSpacing(4)
 
         # ── 로고 + 상단 컨트롤 바 ────────────────────────────────────────
-        top_bar = QHBoxLayout()
+        top_widget = QWidget()
+        top_widget.setFixedHeight(100)
+        top_bar = QHBoxLayout(top_widget)
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.setSpacing(4)
 
         logo_label = QLabel()
         logo_label.setFixedSize(100, 100)
@@ -412,14 +416,12 @@ class WHTMonitorWindow(QMainWindow):
             )
         top_bar.addWidget(logo_label)
 
-        status_col = QVBoxLayout()
         self.status_label = QLabel("Status: Ready")
         self.status_label.setStyleSheet(
-            "font-weight:bold;color:#444;font-size:13px;"
+            "font-weight:bold;color:#ffffff;font-size:13px;"
         )
-        status_col.addWidget(self.status_label)
-        status_col.addStretch()
-        top_bar.addLayout(status_col)
+        self.status_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        top_bar.addWidget(self.status_label)
         top_bar.addStretch()
 
         for text, slot, style, w in [
@@ -439,7 +441,7 @@ class WHTMonitorWindow(QMainWindow):
             elif text == "Request STOP":
                 self.stop_btn = btn
 
-        root_lay.addLayout(top_bar)
+        root_lay.addWidget(top_widget)
 
         # ── 탭 ────────────────────────────────────────────────────────────
         self.tabs = QTabWidget()
@@ -476,10 +478,16 @@ class WHTMonitorWindow(QMainWindow):
         self.tabs.addTab(tab, "Convergence Curve")
 
     def _build_tab_height(self):
-        tab = QWidget(); lay = QVBoxLayout(tab)
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
 
         # ── 이터레이션 선택 행 ────────────────────────────────────────────
-        ctrl_iter = QHBoxLayout()
+        ctrl_iter_w = QWidget()
+        ctrl_iter_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        ctrl_iter = QHBoxLayout(ctrl_iter_w)
+        ctrl_iter.setContentsMargins(0, 0, 0, 0)
         self.height_iter_combo = QComboBox()
         self.height_iter_combo.addItem("Latest")
         self.height_iter_combo.currentIndexChanged.connect(self._on_height_combo_changed)
@@ -495,17 +503,23 @@ class WHTMonitorWindow(QMainWindow):
                   QLabel("  Slider:"), self.height_slider]:
             ctrl_iter.addWidget(w)
         ctrl_iter.addStretch()
-        lay.addLayout(ctrl_iter)
+        lay.addWidget(ctrl_iter_w)
 
         # ── 높이 분포 캔버스 ─────────────────────────────────────────────
         self.height_canvas = PlotCanvas(tab)
-        lay.addWidget(self.height_canvas)
+        lay.addWidget(self.height_canvas, stretch=1)
 
         # ── 액션 행: Mesh View / Run Analysis / Export ───────────────────
-        ctrl_action = QHBoxLayout()
+        ctrl_widget = QWidget()
+        ctrl_widget.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Fixed
+        )
+        ctrl_action = QHBoxLayout(ctrl_widget)
+        ctrl_action.setContentsMargins(0, 4, 0, 4)
+        ctrl_action.setSpacing(6)
 
         self.iter_mesh_btn = QPushButton("Mesh View")
-        self.iter_mesh_btn.setStyleSheet("background:#e8eaf6;font-weight:bold;")
+        self.iter_mesh_btn.setStyleSheet("font-weight:bold;")
         self.iter_mesh_btn.setToolTip("선택 이터레이션 메시를 wht_visualizer 창에 표시")
         self.iter_mesh_btn.clicked.connect(self._on_mesh_view_clicked)
         ctrl_action.addWidget(self.iter_mesh_btn)
@@ -516,19 +530,19 @@ class WHTMonitorWindow(QMainWindow):
         ctrl_action.addWidget(self.iter_case_combo)
 
         self.iter_run_btn = QPushButton("Run Analysis")
-        self.iter_run_btn.setStyleSheet("background:#c8e6c9;font-weight:bold;")
+        self.iter_run_btn.setStyleSheet("font-weight:bold;")
         self.iter_run_btn.setToolTip("선택 하중 케이스로 wht_solver 해석 후 결과를 visualizer에 표시")
         self.iter_run_btn.clicked.connect(self._on_run_analysis)
         ctrl_action.addWidget(self.iter_run_btn)
 
         self.iter_export_btn = QPushButton("Export OptiStruct .fem")
-        self.iter_export_btn.setStyleSheet("background:#bbdefb;font-weight:bold;")
+        self.iter_export_btn.setStyleSheet("font-weight:bold;")
         self.iter_export_btn.setToolTip("선택 이터레이션의 변형 메시 + 하중 케이스를 .fem 파일로 저장")
         self.iter_export_btn.clicked.connect(self._on_export_optistruct)
         ctrl_action.addWidget(self.iter_export_btn)
 
         ctrl_action.addStretch()
-        lay.addLayout(ctrl_action)
+        lay.addWidget(ctrl_widget)
 
         # ── 상태 표시줄 ──────────────────────────────────────────────────
         self.iter_status_label = QLabel("")
@@ -746,7 +760,7 @@ class WHTMonitorWindow(QMainWindow):
                     f"C={data.get('compliance', 0):.3e}"
                 )
                 self.status_label.setStyleSheet(
-                    "font-weight:bold;color:blue;font-size:13px;"
+                    "font-weight:bold;color:#ffffff;font-size:13px;"
                 )
 
         except Exception as e:
@@ -798,7 +812,7 @@ class WHTMonitorWindow(QMainWindow):
             self.height_slider.blockSignals(False)
         if self.status_label:
             self.status_label.setText("Status: Running (Reset)")
-            self.status_label.setStyleSheet("font-weight:bold;color:blue;")
+            self.status_label.setStyleSheet("font-weight:bold;color:#ffffff;")
         if self.stop_btn:
             self.stop_btn.setEnabled(True)
             self.stop_btn.setText("Request STOP")
@@ -946,30 +960,17 @@ class WHTMonitorWindow(QMainWindow):
         x, y = coords[:, 0], coords[:, 1]
         max_abs = max(1e-5, float(np.max(np.abs(heights))))
 
-        # 마커 크기: 요소 평균 간격을 추정해 화면 pt² 단위로 환산
-        # ax.transData.transform 을 쓰기 전 draw 호출이 필요하므로
-        # 간격 기반 고정 크기를 사용 (데이터 좌표 → 포인트 환산은 draw 이후)
-        if len(x) > 1:
-            span_x = float(np.ptp(x)) or 1.0
-            span_y = float(np.ptp(y)) or 1.0
-            pitch  = min(span_x, span_y) / (len(x) ** 0.5)
-        else:
-            pitch  = 1.0
-        # scatter markersize 는 포인트 단위(직경). 72pt = 1inch.
-        # figure dpi 와 axes 크기로 데이터→pt 스케일을 추정
-        fig_w_in  = fig.get_figwidth()
-        ax_frac   = ax.get_position().width
-        ax_w_in   = fig_w_in * ax_frac
-        data_span = max(float(np.ptp(x)), 1.0)
-        pt_per_data = ax_w_in * 72.0 / data_span  # pt per data-unit
-        marker_pt   = max(1.0, pitch * pt_per_data * 0.92)
-        marker_area = marker_pt ** 2
-
-        sc = ax.scatter(
-            x, y, c=heights, cmap='coolwarm',
-            vmin=-max_abs, vmax=max_abs,
-            s=marker_area, marker='s',
-            linewidths=0,
+        from scipy.interpolate import griddata
+        n_grid = max(16, int(len(x) ** 0.5))
+        xi = np.linspace(x.min(), x.max(), n_grid)
+        yi = np.linspace(y.min(), y.max(), n_grid)
+        Xi, Yi = np.meshgrid(xi, yi)
+        Zi = griddata((x, y), heights, (Xi, Yi), method='linear')
+        sc = ax.imshow(
+            Zi, origin='lower', aspect='equal',
+            extent=[x.min(), x.max(), y.min(), y.max()],
+            cmap='coolwarm', vmin=-max_abs, vmax=max_abs,
+            interpolation='bilinear',
         )
 
         if self._height_colorbar is None:

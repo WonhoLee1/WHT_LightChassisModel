@@ -148,6 +148,7 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
 """
 
 import argparse
+import math
 import re
 import sys
 import io
@@ -218,6 +219,7 @@ CORNER_NAMES           = ['C5', 'C6', 'C7', 'C8']
 CORNER_MAP             = dict(enumerate(CORNER_NAMES))   # {0:'C5', 1:'C6', ...}
 ZETA                   = 0.02   # Rayleigh 감쇠비
 G_MM_S2                = 9_810.0  # mm/s² per g
+GRAVITY_MM             = 9_806.0  # mm/s²  표준 중력가속도 (9.80665 m/s² → 9806.65, 반올림 9806)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1349,11 +1351,25 @@ class TopographyPipeline:
             static_cases = []
             print(f"\n [3] 정적 하중 케이스: 비활성 (--no-static).")
         else:
+            w_bw = getattr(self.cfg, 'w_basic_weight', 1.0)
+            raw_loads = self._loads()
+            if w_bw != 0.0:
+                # 자중 자동계산: 총 무게 * 스케일 * 입력 부호
+                total_mass, W_N, x_cm, y_cm, z_cm, _, _ = self._calc_chassis_weight()
+                scaled_loads = {
+                    k: math.copysign(W_N * w_bw, v)
+                    for k, v in raw_loads.items()
+                }
+                self._print_weight_report(total_mass, W_N, x_cm, y_cm, z_cm,
+                                          scaled_loads)
+            else:
+                scaled_loads = raw_loads
+                print(f"\n [3] --w-basic-weight 0: 입력 하중값 그대로 사용.")
             load_manager = StochasticLoadManager(self.model)
             static_cases = load_manager.get_load_cases(
                 mesh_size_z=self.cfg.mesh_size,
                 weights=self._weights(),
-                loads=self._loads(),
+                loads=scaled_loads,
             )
             print(f"\n [3] 정적 하중 케이스 {len(static_cases)}개 구성 완료.")
 
@@ -1520,6 +1536,99 @@ class TopographyPipeline:
             "lifting":       self.cfg.w_lifting[1],
         }
 
+    def _calc_chassis_weight(self) -> tuple:
+        """
+        루프형 질량 행렬로 샤시 총 무게·무게중심·지지점 반력 모멘트를 계산합니다.
+
+        Returns
+        -------
+        total_mass : float   총 질량 [tonne]
+        W_N        : float   총 자중 [N]   (total_mass * GRAVITY_MM)
+        x_cm, y_cm, z_cm : float  무게중심 좌표 [mm]
+        m_diag     : array   노드 질량 대각 벡터
+        n2i        : dict    nid -> jaxsso index
+        """
+        temp = WHTDynamicSolver(self.model)
+        jm, s_nids, n2i = temp._build_jaxsso_model()
+        m_diag = temp._assemble_lumped_mass(jm, jm.ndof, s_nids, n2i)
+
+        total_mass = 0.0
+        mx = my = mz = 0.0
+        for nid in self.node_db:
+            ix = n2i.get(nid)
+            if ix is None or nid >= 900_000:
+                continue
+            m_z = float(m_diag[ix * 6 + 2])
+            if m_z <= 1e-12:
+                continue
+            total_mass += m_z
+            x, y, z = self.node_db[nid]
+            mx += m_z * x
+            my += m_z * y
+            mz += m_z * z
+
+        if total_mass > 1e-12:
+            x_cm = mx / total_mass
+            y_cm = my / total_mass
+            z_cm = mz / total_mass
+        else:
+            x_cm = y_cm = z_cm = 0.0
+
+        W_N = total_mass * GRAVITY_MM
+        return total_mass, W_N, x_cm, y_cm, z_cm, m_diag, n2i
+
+    def _print_weight_report(self, total_mass: float, W_N: float,
+                             x_cm: float, y_cm: float, z_cm: float,
+                             scaled_loads: dict) -> None:
+        """자중 계산 결과를 터미널에 상세 출력합니다."""
+        all_xyz = np.array(list(self.node_db.values()))
+        x_geo = (all_xyz[:, 0].min() + all_xyz[:, 0].max()) * 0.5
+        y_geo = (all_xyz[:, 1].min() + all_xyz[:, 1].max()) * 0.5
+        ecc_x = x_cm - x_geo
+        ecc_y = y_cm - y_geo
+        # 무게중심 편심에 의한 지지점 반력 모멘트 추정
+        # (단순지지 4코너 가정: Mx = W * ecc_y, My = W * ecc_x)
+        Mx_N_mm = W_N * ecc_y   # Y 편심 → X 축 모멘트
+        My_N_mm = W_N * ecc_x   # X 편심 → Y 축 모멘트
+
+        sep = "─" * 68
+        print(f"\n  {sep}")
+        print(f"  [자중 하중 자동계산]  (--w-basic-weight = {getattr(self.cfg, 'w_basic_weight', 1.0):.3g})")
+        print(f"  {sep}")
+        print(f"  {'항목':<28} {'값':>36}")
+        print(f"  {'─'*28} {'─'*36}")
+        print(f"  {'중력가속도':<28} {GRAVITY_MM:>30.1f} mm/s²")
+        print(f"  {'총 질량':<28} {total_mass*1e6:>28.4f} kg  "
+              f"({total_mass:.4e} tonne)")
+        print(f"  {'총 자중 (Z방향 합력)':<28} {W_N:>28.2f} N  "
+              f"({W_N/1000:.4f} kN)")
+        print(f"  {'무게중심 X':<28} {x_cm:>33.2f} mm")
+        print(f"  {'무게중심 Y':<28} {y_cm:>33.2f} mm")
+        print(f"  {'무게중심 Z':<28} {z_cm:>33.2f} mm")
+        print(f"  {'기하 중심 X':<28} {x_geo:>33.2f} mm")
+        print(f"  {'기하 중심 Y':<28} {y_geo:>33.2f} mm")
+        print(f"  {'X 편심 (x_cm - x_geo)':<28} {ecc_x:>33.2f} mm")
+        print(f"  {'Y 편심 (y_cm - y_geo)':<28} {ecc_y:>33.2f} mm")
+        print(f"  {'편심 X축 모멘트 Mx=W*ecc_y':<28} {Mx_N_mm:>26.2f} N·mm  "
+              f"({Mx_N_mm/1000:.2f} N·m)")
+        print(f"  {'편심 Y축 모멘트 My=W*ecc_x':<28} {My_N_mm:>26.2f} N·mm  "
+              f"({My_N_mm/1000:.2f} N·m)")
+        print(f"  {sep}")
+        print(f"  [적용 하중 (자중 스케일 적용 후)]")
+        print(f"  {'─'*28} {'─'*36}")
+        case_labels = {
+            "bending":       "중앙 굽힘",
+            "bending_xspan": "X스팬 굽힘",
+            "bending_yspan": "Y스팬 굽힘",
+            "twisting":      "대각 비틀림",
+            "twisting_alt":  "반전 비틀림",
+            "lifting":       "4코너 리프팅",
+        }
+        for k, label in case_labels.items():
+            F = scaled_loads.get(k, 0.0)
+            print(f"  {label:<28} {F:>32.2f} N  ({F/1000:.4f} kN)")
+        print(f"  {sep}\n")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI 진입점
@@ -1624,7 +1733,7 @@ def main():
       --sym-x --bead-connect --height-steps 2
 
   동적 ESL 전용 (정적 비활성)
-    python wht_topo/run_topo.py --n-workers 4 --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" "wht_topo/structural_dynamics_c125.csv,1.5,1.8" "wht_topo/structural_dynamics_c235.csv,1.5,1.8"  --w-dynamic 1.0 --w-peak 1.0 --add-inertia  --sym-x --bead-connect --height-steps 2 --min-width 40 --normalize-obj  --exclude-rect 500,300,300,300 --exclude-rect 200,400,300,500
+    python wht_topo/run_topo.py --n-workers 4 --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" "wht_topo/structural_dynamics_c125.csv,1.5,1.8" "wht_topo/structural_dynamics_c235.csv,1.5,1.8"  --w-dynamic 1.0 --w-peak 1.0 --add-inertia  --sym-x --bead-connect --height-steps 2 --min-width 150 
     
   헤드리스 서버 실행
     python wht_topo/run_topo.py \\
@@ -1865,17 +1974,22 @@ def main():
         "정적 하중 케이스 설정 (가중치 하중N, 예: --w-bending 1.0 -10)"
     )
     g.add_argument("--w-bending",       type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="중앙 굽힘        가중치·하중 (기본: 1.0 -10)")
+                   metavar=("W", "F_N"), help="중앙 굽힘        가중치·하중 (기본: 1.0 -5)")
     g.add_argument("--w-bending-xspan", type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="X스팬 굽힘       가중치·하중 (기본: 1.0 -10)")
+                   metavar=("W", "F_N"), help="X스팬 굽힘       가중치·하중 (기본: 1.0 -5)")
     g.add_argument("--w-bending-yspan", type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="Y스팬 굽힘       가중치·하중 (기본: 1.0 -10)")
+                   metavar=("W", "F_N"), help="Y스팬 굽힘       가중치·하중 (기본: 1.0 -5)")
     g.add_argument("--w-twisting",      type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="대각 비틀림      가중치·하중 (기본: 1.0 -10)")
+                   metavar=("W", "F_N"), help="대각 비틀림      가중치·하중 (기본: 1.0 -5)")
     g.add_argument("--w-twisting-alt",  type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="반전 대각 비틀림 가중치·하중 (기본: 1.0 -10)")
+                   metavar=("W", "F_N"), help="반전 대각 비틀림 가중치·하중 (기본: 1.0 -5)")
     g.add_argument("--w-lifting",       type=float, nargs=2, default=[1.0,  10.0],
-                   metavar=("W", "F_N"), help="4코너 리프팅     가중치·하중 (기본: 1.0 10)")
+                   metavar=("W", "F_N"), help="4코너 리프팅     가중치·하중 (기본: 1.0 5)")
+    g.add_argument("--w-basic-weight",  type=float, default=1.0,
+                   metavar="SCALE",
+                   help="자중 기반 하중 스케일 (기본: 1.0). "
+                        "0 이외의 값: 자중(total_mass*9806 N)*SCALE 을 각 하중값으로 대체. "
+                        "0: 입력된 --w-xxx F_N 값을 그대로 사용.")
 
     # 출력 및 시각화
     g = parser.add_argument_group("출력 및 시각화")
