@@ -228,6 +228,7 @@ class WHTDynamicSolver(WHTSolver):
         newmark_gamma: float = 0.5,
         verbose: bool = True,
         method: str = 'scipy',
+        label: str = '',
     ) -> DynamicResult:
         """
         직접 Newmark-β 암시적 동해석 (전체 DOF).
@@ -260,8 +261,9 @@ class WHTDynamicSolver(WHTSolver):
                 T, dt, load_groups, damping, newmark_beta, newmark_gamma, n_save, verbose
             )
 
+        label_str = f"  [{label}]" if label else ""
         print(f"\n{'='*60}", flush=True)
-        print(f" [Direct Dynamic] dt={dt:.2e}s  T={T:.2e}s", flush=True)
+        print(f" [Direct Dynamic]{label_str}  dt={dt:.2e}s  T={T:.2e}s", flush=True)
         print(f"{'='*60}", flush=True)
         t_wall = time.time()
 

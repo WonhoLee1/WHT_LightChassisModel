@@ -503,21 +503,36 @@ class WHTopographySolver:
     def _build_symmetry_map(self) -> np.ndarray:
         """
         X-mid plane을 기준으로 대칭 요소 인덱스 맵을 생성합니다.
+        허용 오차는 메시 중위 간격의 60%로 자동 산정합니다.
         """
+        from scipy.spatial import KDTree
+
         print(" -> [Solver] 좌우 대칭(Sym-X) 요소 매핑 중...")
         centroids = self._elem_centroids()
         x_mid = (centroids[:, 0].min() + centroids[:, 0].max()) / 2.0
 
-        from scipy.spatial import KDTree
         tree = KDTree(centroids)
 
+        # 메시 간격 추정: 각 요소의 두 번째 최근접 거리(자기 자신 제외) 중위값
+        dists_nn, _ = tree.query(centroids, k=2)
+        median_spacing = float(np.median(dists_nn[:, 1]))
+        tol = median_spacing * 0.6
+        print(f"    x_mid={x_mid:.1f} mm   median_spacing={median_spacing:.1f} mm   tol={tol:.1f} mm")
+
         sym_map = np.arange(self._n_design)
+        n_matched = 0
         for i in range(self._n_design):
             target = centroids[i].copy()
             target[0] = 2.0 * x_mid - target[0]
             dist, idx = tree.query(target)
-            if dist < 5.0:  # 5mm 이내이면 대칭 요소로 인정
+            if dist < tol:
                 sym_map[i] = idx
+                n_matched += 1
+
+        n_self = int(np.sum(sym_map == np.arange(self._n_design)))
+        print(f"    매핑 결과: {n_matched}/{self._n_design} 쌍 매칭  |  자기매핑(대칭쌍 없음): {n_self}개")
+        if n_self > self._n_design * 0.1:
+            print(f"    [경고] 자기매핑 비율 {n_self/self._n_design*100:.0f}% — 메시가 X-mid 기준으로 비대칭이거나 tol이 부족합니다.")
 
         return sym_map
 
@@ -832,12 +847,33 @@ class WHTopographySolver:
                 for row in self._tria_nids
             ], dtype=jnp.float64)  # (n_tria, 3, 3)
 
-        # ── 3. 하중 케이스별 FEA 워커 (스레드 내부, scipy만 사용) ─────────────
-        def _solve_one(load_case: "WHTLoadCase"):
-            jm_lc, _, _ = solver._build_jaxsso_model(load_case=load_case)
-            K_aug, f_aug = solver._augment_K_scipy(K_base, jm_lc)
-            u_aug_np = np.array(spsolve(K_aug.tocsc(), f_aug))
+        # ── 3. BC 패턴별 그룹화 + 다중 RHS splu 공유 ────────────────────────
+        # BC 패턴이 같은 케이스끼리 K_aug를 공유하고 LU 분해를 1회만 수행한다.
+        # f_aug를 열 행렬로 묶어 lu.solve(F) 로 한 번에 풀면 LU 분해 횟수가
+        # 케이스 수 → BC 패턴 수로 줄어든다.
+        from scipy.sparse.linalg import splu
 
+        # (jm_lc, K_aug, f_aug) 사전 준비
+        lc_data = []   # [(orig_idx, weight, lc, jm_lc, K_aug_csc, f_aug), ...]
+        for i, (lc, w) in enumerate(self._load_cases):
+            jm_lc, _, _ = solver._build_jaxsso_model(load_case=lc)
+            K_aug, f_aug = solver._augment_K_scipy(K_base, jm_lc)
+            lc_data.append((i, w, lc, jm_lc, K_aug.tocsc(), f_aug))
+
+        # BC 패턴 키: known_id 튜플로 그룹화
+        from collections import defaultdict
+        bc_groups: dict = defaultdict(list)
+        for entry in lc_data:
+            i, w, lc, jm_lc, K_aug_csc, f_aug = entry
+            bc_key = tuple(sorted(jm_lc.known_id))
+            bc_groups[bc_key].append(entry)
+
+        n_groups = len(bc_groups)
+        n_cases  = len(lc_data)
+        print(f" -> [Solver] {n_cases}개 케이스 → {n_groups}개 BC 그룹으로 LU 공유 분해")
+
+        def _extract_result(u_aug_np, lc, jm_lc):
+            """u_aug 벡터 → displacement, cell_data, u_full, f_full, C_i."""
             n_nodes = len(self.sorted_nids)
             displacement = np.zeros((n_nodes, 6))
             for ii, nid in enumerate(self.sorted_nids):
@@ -854,18 +890,16 @@ class WHTopographySolver:
                        self.nid_to_idx[nid] * 6 + 6] = displacement[ii, :]
 
             f_full = np.zeros(ndof)
-            for force in load_case.forces:
+            for force in lc.forces:
                 idx = self.nid_to_idx.get(force.node_id)
                 if idx is None: continue
                 for d, fval in enumerate(force.load_vector):
                     if abs(fval) > 1e-12:
                         f_full[idx * 6 + d] += fval
 
-            if load_case.forces and not load_case.bcs:
-                # 순수 힘 주도 케이스: C = F · u  (equilibrium에서 u^T·K·u와 동일)
+            if lc.forces and not lc.bcs:
                 C_i = float(np.dot(f_full, u_full))
             else:
-                # 변위 BC 포함 케이스(SPCD/ESL): C = u^T · K · u (항상 양수인 변형 에너지)
                 C_i = float(u_full @ (K_base @ u_full))
 
             result = WHTSolverResult("static", self.sorted_nids)
@@ -873,23 +907,35 @@ class WHTopographySolver:
             result.cell_data    = cell_data
             result._u_aug       = u_aug_np
             result._ndof        = ndof
-            return load_case.name, C_i, u_full, displacement, cell_data, result
+            return lc.name, C_i, u_full, displacement, cell_data, result
 
-        # ── 4. ThreadPoolExecutor 병렬 실행 ────────────────────────────────────
-        # UMFPACK(spsolve)은 단일스레드 → 멀티코어에서 진정한 병렬화
-        n_workers = min(len(self._load_cases), self.n_workers)
-        solve_results = [None] * len(self._load_cases)
-        lc_list = [(i, lc, w) for i, (lc, w) in enumerate(self._load_cases)]
+        def _solve_group(entries):
+            """BC 패턴이 같은 케이스 묶음을 다중 RHS로 한 번에 풀기."""
+            _, _, _, _, K_aug_csc, _ = entries[0]
+            lu = splu(K_aug_csc)
+            # f_aug 열 행렬 조립 (augmented 시스템 크기 × 케이스 수)
+            F = np.column_stack([e[5] for e in entries])
+            U = lu.solve(F)   # LU 분해 1회, forward/back substitution N회
+            results = []
+            for col_idx, entry in enumerate(entries):
+                i, w, lc, jm_lc, _, _ = entry
+                u_aug_np = U[:, col_idx]
+                results.append((i, w, _extract_result(u_aug_np, lc, jm_lc)))
+            return results
 
-        n_cases = len(lc_list)
+        # ── 4. BC 그룹별 병렬 실행 ─────────────────────────────────────────────
+        group_list = list(bc_groups.values())
+        n_workers  = min(len(group_list), self.n_workers)
+        solve_results = [None] * n_cases
+
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(_solve_one, lc): (i, w)
-                       for i, lc, w in lc_list}
-            with tqdm(total=n_cases, desc=f"  Iter {iter_num:>3d} 하중 케이스 해석", unit="case", ncols=80) as pbar:
+            futures = {executor.submit(_solve_group, grp): grp for grp in group_list}
+            with tqdm(total=n_cases, desc=f"  Iter {iter_num:>3d} 하중 케이스 해석",
+                      unit="case", ncols=80) as pbar:
                 for future in as_completed(futures):
-                    i, w = futures[future]
-                    solve_results[i] = (w, future.result())
-                    pbar.update(1)
+                    for i, w, res in future.result():
+                        solve_results[i] = (w, res)
+                        pbar.update(1)
 
         # ── 5. 결과 수집 + JAX 민감도 (순차 — JAX GIL 이슈) ──────────────────
         # 좌표 배열을 인스턴스에 저장 → solve()의 주파수 민감도 계산에서 재사용

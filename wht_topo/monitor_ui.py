@@ -961,16 +961,21 @@ class WHTMonitorWindow(QMainWindow):
         max_abs = max(1e-5, float(np.max(np.abs(heights))))
 
         from scipy.interpolate import griddata
-        n_grid = max(16, int(len(x) ** 0.5))
+        # 격자 해상도: 요소 수에 비례, 최소 64 — 흐릿함 방지
+        n_grid = max(64, int(len(x) ** 0.5) * 3)
         xi = np.linspace(x.min(), x.max(), n_grid)
         yi = np.linspace(y.min(), y.max(), n_grid)
         Xi, Yi = np.meshgrid(xi, yi)
+        # linear: convex hull 내부만 보간 → NaN 발생
         Zi = griddata((x, y), heights, (Xi, Yi), method='linear')
+        # nearest로 NaN(볼록 껍질 밖, 배제 영역 구멍 등)을 가장 가까운 값으로 채움
+        Zi_near = griddata((x, y), heights, (Xi, Yi), method='nearest')
+        Zi = np.where(np.isnan(Zi), Zi_near, Zi)
         sc = ax.imshow(
             Zi, origin='lower', aspect='equal',
             extent=[x.min(), x.max(), y.min(), y.max()],
             cmap='coolwarm', vmin=-max_abs, vmax=max_abs,
-            interpolation='bilinear',
+            interpolation='nearest',  # 격자 해상도가 충분하므로 추가 블러 불필요
         )
 
         if self._height_colorbar is None:

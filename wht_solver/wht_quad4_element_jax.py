@@ -1,5 +1,16 @@
+"""
+wht_quad4_element_jax.py
+========================
+MITC4+ 요소 강성 행렬 JAX 구현.
+
+_element_K_mitc4_plus_jax  : 단일 요소 순수 함수 (jit 적용 가능)
+K_quad4_jax                : vmap 배치 조립 — 전체 요소를 단일 XLA 커널로 처리
+"""
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+from scipy.sparse import coo_matrix, csr_matrix
 
 @jax.jit
 def _get_shape_functions(xi, eta):
@@ -74,7 +85,6 @@ def _get_Bs_raw_23(xi, eta, coords):
         Bs_row = Bs_row.at[6*i+3].set(-N[i])
     return Bs_row
 
-@jax.jit
 def _element_K_mitc4_plus_jax(c1, c2, c3, c4, t, E, nu):
     v12 = c2 - c1
     v14 = c4 - c1
@@ -143,6 +153,80 @@ def _element_K_mitc4_plus_jax(c1, c2, c3, c4, t, E, nu):
             K_loc += valid_mask * ((Bm.T @ Dm @ Bm + Bb.T @ Db @ Bb + Bs.T @ Ds @ Bs) * detJ)
 
     K_loc += K_drill
-        
+
     T_24 = jnp.kron(jnp.eye(8), T_mat)
     return T_24.T @ K_loc @ T_24
+
+
+# ── vmap으로 jit 적용한 배치 버전 ─────────────────────────────────────────────
+# in_axes=(0,0,0,0,0,0,0): 첫 번째 축(요소 축)으로 배치
+_element_K_batch = jax.jit(
+    jax.vmap(_element_K_mitc4_plus_jax, in_axes=(0, 0, 0, 0, 0, 0, 0))
+)
+
+
+def K_quad4_jax(wht_model, sorted_nids, nid_to_idx) -> csr_matrix:
+    """
+    JAX vmap 배치 조립 — 전체 QUAD4 요소를 단일 XLA 커널로 처리.
+
+    모든 요소의 좌표·재료 배열을 미리 준비한 뒤 _element_K_batch로 (n_elem, 24, 24)
+    강성 텐서를 한 번에 계산하고 COO 포맷으로 전역 행렬을 조립한다.
+    """
+    ndof = len(sorted_nids) * 6
+    nid_to_crds = {nid: (wht_model.nodes[nid].x,
+                         wht_model.nodes[nid].y,
+                         wht_model.nodes[nid].z) for nid in sorted_nids}
+
+    # ── 요소 데이터 추출 ──────────────────────────────────────────────────────
+    c1_list, c2_list, c3_list, c4_list = [], [], [], []
+    t_list, E_list, nu_list = [], [], []
+    dof_list = []   # 요소별 24-DOF 인덱스 (n_elem, 24)
+
+    for eid, elem in wht_model.elements.items():
+        if elem.type.upper() not in ('QUAD4', 'QUAD'):
+            continue
+        nids = elem.node_ids
+        pid  = elem.pid
+        prop = wht_model.properties.get(pid)
+        mat  = wht_model.materials.get(prop.mid) if prop else None
+        t    = prop.t  if prop else 1.0
+        E    = mat.E   if mat  else 210000.0
+        nu   = mat.nu  if mat  else 0.3
+
+        c1_list.append(nid_to_crds[nids[0]])
+        c2_list.append(nid_to_crds[nids[1]])
+        c3_list.append(nid_to_crds[nids[2]])
+        c4_list.append(nid_to_crds[nids[3]])
+        t_list.append(t);  E_list.append(E);  nu_list.append(nu)
+
+        dofs = [nid_to_idx[nid] * 6 + d for nid in nids for d in range(6)]
+        dof_list.append(dofs)
+
+    if not c1_list:
+        return csr_matrix((ndof, ndof))
+
+    # ── JAX 배치 계산 ─────────────────────────────────────────────────────────
+    c1 = jnp.array(c1_list, dtype=jnp.float64)
+    c2 = jnp.array(c2_list, dtype=jnp.float64)
+    c3 = jnp.array(c3_list, dtype=jnp.float64)
+    c4 = jnp.array(c4_list, dtype=jnp.float64)
+    t_arr  = jnp.array(t_list,  dtype=jnp.float64)
+    E_arr  = jnp.array(E_list,  dtype=jnp.float64)
+    nu_arr = jnp.array(nu_list, dtype=jnp.float64)
+
+    K_all = np.array(_element_K_batch(c1, c2, c3, c4, t_arr, E_arr, nu_arr))
+    # K_all shape: (n_elem, 24, 24)
+
+    # ── COO 어셈블리 ─────────────────────────────────────────────────────────
+    dof_arr = np.array(dof_list, dtype=np.int32)   # (n_elem, 24)
+    n_elem  = len(dof_list)
+
+    # 각 요소의 24×24 인덱스 쌍을 벡터화로 생성
+    ii = np.repeat(dof_arr, 24, axis=1).reshape(n_elem, 24, 24)   # row
+    jj = np.tile(dof_arr[:, None, :], (1, 24, 1))                  # col
+
+    rows = ii.ravel()
+    cols = jj.ravel()
+    data = K_all.ravel()
+
+    return coo_matrix((data, (rows, cols)), shape=(ndof, ndof)).tocsr()

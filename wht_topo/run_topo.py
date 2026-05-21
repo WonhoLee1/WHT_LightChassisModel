@@ -140,7 +140,8 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
   3. 4코너 마스터 노드(#900000~900003) + RBE3 → Z-SPCD 하중 그룹 구성.
      CSV # 헤더의 C5~C8 좌표로 가장 가까운 FEM 노드 3개씩 자동 탐색.
   4. (옵션 --add-inertia) 이선형 보간 + 집중 질량 → 관성 하중(F=-ma) 전 노드 인가.
-  5. Newmark-β 직접 적분 과도 응답 해석 (ζ=2%, --zeta 조정 가능).
+  5. 과도 응답 해석 (ζ=2%, --zeta 조정 가능).
+     기본: Newmark-β 직접 적분. --n-modes N 지정 시 모달 중첩법(N개 모드) 사용.
      저장 스냅샷 수: --n-save-esl (기본 50, 최소 n_windows×2 자동 적용).
   6. 전체 SE 이력(SE = ½uᵀKu) 계산 → n_windows 구간 분할 → 전역 피크 후보 추출.
   7. Greedy Max-Min Cosine Similarity 다양성 선별 → Top-n_top 스냅샷 선정.
@@ -158,10 +159,17 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
                         직전 ESL 결과를 재사용. 수렴 후반부 동해석 횟수 절감.
                         예) --esl-skip-tol 0.05  (h_max=10mm 기준 0.5% 변화 이하)
 
-  --parallel-scenarios  복수 CSV 시나리오를 스레드 풀로 동시 동해석 (기본: 순차).
-                        시나리오당 모델 deep-copy가 발생하므로 메모리 사용량 증가.
-                        n_workers(케이스 내부 병렬)와 레벨이 다름—중첩 사용 가능.
-                        예) --dynamic-opts A.csv B.csv C.csv --parallel-scenarios
+  --parallel-scenarios N  동시 실행 프로세스 수 (기본: 1=순차).
+                        2 이상 지정 시 ProcessPoolExecutor로 N개 시나리오를 동시 동해석.
+                        시나리오당 모델 deep-copy+pickle 직렬화 발생 — 메모리 주의.
+                        예) --dynamic-opts A.csv B.csv C.csv --parallel-scenarios 4
+
+  --n-modes N           모달 중첩법 사용 모드 수 (기본: 0 = 직접 Newmark-β 적분).
+                        0 초과 값을 지정하면 고유 모드를 N개 추출한 뒤 모달 좌표계
+                        에서 ODE를 풀어 응답을 재합성—직접 적분 대비 수십~수백 배
+                        빠르며 특히 자유도가 많은 메시에서 효과적.
+                        권장값: 관심 주파수 대역을 커버하는 모드 수 (예: 20~50).
+                        예) --n-modes 20
 
 [동적 ESL 알고리즘 — 요소별 최대 SE 피크 (--w-peak)]
   동적 해석 완료 후 모든 쉘 요소(QUAD4/TRIA3)에 대해:
@@ -522,6 +530,20 @@ def _apply_inertia_loads(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 병렬 ESL 추출 헬퍼 (ProcessPoolExecutor용 모듈 최상위 함수 — pickle 가능해야 함)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _esl_worker(args: tuple) -> list:
+    """
+    [병렬 단계] 동해석 + ESL 추출만 수행.
+    prepare()는 메인 프로세스에서 순차적으로 완료된 후 호출된다.
+    args에 ESLExtractor 인스턴스(prepare 완료 상태)를 전달한다.
+    """
+    extractor = args[0]
+    return extractor.solve_and_extract()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ESL 추출기  (TopographyPipeline 내부에서 사용)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -561,6 +583,8 @@ class ESLExtractor:
         iteration: int = -1,
         out_dir: Optional[Path] = None,
         n_save_esl: int = 50,
+        n_modes: int = 0,
+        dt: Optional[float] = None,
     ):
         self.model        = model
         self.node_db      = node_db
@@ -576,6 +600,8 @@ class ESLExtractor:
         self.iteration    = iteration  # -1: 단독 실행, ≥0: 최적화 루프 내
         self.out_dir      = out_dir    # None이면 CSV 옆 디렉토리에 저장
         self.n_save_esl   = max(n_windows * 2, n_save_esl)  # 윈도우당 최소 2개 보장
+        self.n_modes      = n_modes    # 0: 직접 Newmark-β, >0: 모달 중첩법
+        self.dt           = dt         # None → CSV 샘플링 간격 그대로 사용
 
         # 단계별 출력
         self._df          : Optional[pd.DataFrame]     = None
@@ -590,7 +616,15 @@ class ESLExtractor:
     # ── 공개 진입점 ──────────────────────────────────────────────────────────
 
     def extract(self) -> List[Tuple[WHTLoadCase, float]]:
-        """ESL 추출 전체 파이프라인을 실행하고 (WHTLoadCase, weight) 리스트를 반환합니다."""
+        """ESL 추출 전체 파이프라인 (순차 실행용 — prepare + solve_and_extract 통합)."""
+        self.prepare()
+        return self.solve_and_extract()
+
+    def prepare(self) -> None:
+        """
+        [순차 단계] CSV 로드·코너 탐색·하중 그룹 구성까지 수행하고 출력.
+        병렬 실행 시 이 단계를 먼저 순차적으로 완료한 뒤 solve_and_extract()를 병렬 실행한다.
+        """
         iter_tag = f"  Iter {self.iteration}" if self.iteration >= 0 else ""
         print(f"\n  {'─'*(_W-4)}")
         print(_hdr(f"ESL Extraction{iter_tag}  [{self.n_windows}win / top-{self.n_top}]", "─"))
@@ -604,6 +638,12 @@ class ESLExtractor:
         self._build_spcd_groups()
         if self.add_inertia:
             self._add_inertia_loads()
+
+    def solve_and_extract(self) -> List[Tuple[WHTLoadCase, float]]:
+        """
+        [병렬 가능 단계] 동해석·ESL 추출·스냅샷 선정 수행.
+        prepare() 완료 후 호출해야 한다.
+        """
         self._run_dynamic()
         self._extract_esl_cases()
         self._print_se_tables()
@@ -743,8 +783,31 @@ class ESLExtractor:
             _row("  (이 값으로 다른 CSV 조건의 충격 심각도를 비교하세요)", "")
 
     def _run_dynamic(self) -> None:
-        dt      = self._time_arr[1] - self._time_arr[0] if len(self._time_arr) > 1 else 1e-4
+        csv_dt  = self._time_arr[1] - self._time_arr[0] if len(self._time_arr) > 1 else 1e-4
         T_total = float(self._time_arr[-1])
+
+        # --dt 적용: CSV 간격과 다르면 시계열 리샘플링
+        if self.dt is not None and not np.isclose(self.dt, csv_dt, rtol=1e-6):
+            n_new = max(2, int(round(T_total / self.dt)) + 1)
+            t_new = np.linspace(0.0, T_total, n_new)
+            for lg in self._load_groups:
+                lg._u = np.interp(t_new, self._time_arr, lg._u)
+                lg._t = t_new
+            self._time_arr = t_new
+            dt = float(t_new[1] - t_new[0])
+            dt_note = f"dt={dt:.2e} s  (리샘플: CSV {csv_dt:.2e} s → 지정 {self.dt:.2e} s)"
+        else:
+            dt = csv_dt
+            dt_note = f"dt={dt:.2e} s"
+
+        try:
+            _p = Path(self.csv_path)
+            _folder = _p.parent.name
+            csv_name = _folder if _folder else _p.stem
+            if not csv_name:
+                csv_name = _p.stem
+        except Exception:
+            csv_name = str(self.csv_path)
         self._dyn_solver = WHTDynamicSolver(self.model)
 
         if self.n_modes > 0:
@@ -752,8 +815,9 @@ class ESLExtractor:
                 f"과도 응답 해석  (모달 중첩법  modes={self.n_modes}  ζ={ZETA*100:.0f}%)",
                 "ESL-1",
             )
+            _row("하중 케이스", csv_name)
             _row("적분 파라미터",
-                 f"dt={dt:.2e} s   T={T_total:.4f} s   "
+                 f"{dt_note}   T={T_total:.4f} s   "
                  f"모드 수={self.n_modes}   ESL 저장 스냅샷={self.n_save_esl}")
             print()
             self._dyn_res = self._dyn_solver.solve_modal_dynamic(
@@ -764,13 +828,15 @@ class ESLExtractor:
             )
         else:
             _section(f"과도 응답 해석  (직접 Newmark-β  ζ={ZETA*100:.0f}%)", "ESL-1")
+            _row("하중 케이스", csv_name)
             _row("적분 파라미터",
-                 f"dt={dt:.2e} s   T={T_total:.4f} s   "
+                 f"{dt_note}   T={T_total:.4f} s   "
                  f"ESL 저장 스냅샷={self.n_save_esl}")
             print()
             self._dyn_res = self._dyn_solver.solve_direct_dynamic(
                 self._load_groups, dt=dt, T=T_total, n_save=self.n_save_esl,
                 damping=DampingSpec(mode="zeta", zeta=ZETA),
+                label=csv_name,
             )
         _endsec()
 
@@ -1436,14 +1502,12 @@ class TopographyPipeline:
             )
             print(f"\n [3] 정적 하중 케이스 {len(static_cases)}개 구성 완료.")
 
-        use_parallel = getattr(self.cfg, 'parallel_scenarios', False) and len(entries) > 1
+        _n_par = getattr(self.cfg, 'parallel_scenarios', 1) or 1
+        use_parallel = _n_par > 1 and len(entries) > 1
 
-        def _extract_one(args):
-            """단일 시나리오 ESL 추출 (병렬 실행 시 모델 복사본 사용)."""
-            csv_path, t_start, t_end, w_dyn, iteration, model_copy = args
-            import copy
+        def _make_extractor(csv_path, t_start, t_end, w_dyn, iteration, model):
             return ESLExtractor(
-                model        = model_copy,
+                model        = model,
                 node_db      = self.node_db,
                 csv_path     = csv_path,
                 t_start      = t_start,
@@ -1457,30 +1521,35 @@ class TopographyPipeline:
                 iteration    = iteration,
                 out_dir      = self.out_dir,
                 n_save_esl   = self.cfg.n_save_esl,
-            ).extract()
+                n_modes      = getattr(self.cfg, 'n_modes', 0),
+                dt           = None,
+            )
 
         def _run_esl(iteration: int):
             import copy
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ProcessPoolExecutor, as_completed
 
-            task_args = [
-                (csv_path, t_start, t_end, w_dyn, iteration,
-                 copy.deepcopy(self.model) if use_parallel else self.model)
-                for (csv_path, t_start, t_end), w_dyn in zip(entries, w_list)
-            ]
+            # ── 1단계: prepare() 순차 실행 (출력이 섞이지 않도록) ────────────
+            extractors = []
+            for (csv_path, t_start, t_end), w_dyn in zip(entries, w_list):
+                model_copy = copy.deepcopy(self.model) if use_parallel else self.model
+                ext = _make_extractor(csv_path, t_start, t_end, w_dyn, iteration, model_copy)
+                ext.prepare()
+                extractors.append(ext)
 
             if not use_parallel:
                 all_snaps = []
-                for args in task_args:
-                    all_snaps.extend(_extract_one(args))
+                for ext in extractors:
+                    all_snaps.extend(ext.solve_and_extract())
                 return all_snaps
 
-            # ── 병렬 실행: 시나리오별 독립 모델 복사본으로 동시 동해석 ──────
-            print(f"\n     [병렬 ESL] {len(task_args)}개 시나리오 동시 실행 중...")
-            results = [None] * len(task_args)
-            with ThreadPoolExecutor(max_workers=len(task_args)) as exe:
-                fut_map = {exe.submit(_extract_one, a): idx
-                           for idx, a in enumerate(task_args)}
+            # ── 2단계: solve_and_extract() 병렬 실행 ─────────────────────────
+            n_proc = min(len(extractors), _n_par)
+            print(f"\n     [병렬 ESL] {len(extractors)}개 시나리오 동해석 병렬 시작... (workers={n_proc})")
+            results = [None] * len(extractors)
+            with ProcessPoolExecutor(max_workers=n_proc) as exe:
+                fut_map = {exe.submit(_esl_worker, (ext,)): idx
+                           for idx, ext in enumerate(extractors)}
                 for fut in as_completed(fut_map):
                     idx = fut_map[fut]
                     results[idx] = fut.result()
@@ -2070,9 +2139,14 @@ def main():
                 이전 이터 대비 Δh_rms < TOL 이면 직전 ESL 재사용.
                 0.05 권장 (h_max 10mm 기준 약 0.5mm 이하 변화 시 스킵).
 
---parallel-scenarios
-                복수 CSV 시나리오를 동시 동해석 (기본: 순차).
-                시나리오 수만큼 모델 deep-copy → 메모리 N배 증가 주의.
+--parallel-scenarios N
+                동시 실행 프로세스 수 (기본: 1=순차).
+                2 이상 지정 시 ProcessPoolExecutor로 N개 동시 동해석.
+                모델 pickle 직렬화 발생 → 메모리 N배 증가 주의.
+
+--n-modes N     모달 중첩법 사용 모드 수 (기본: 0=직접 Newmark-β).
+                0 초과 시 고유치 해석 후 모달 좌표계 ODE로 응답 합성.
+                직접 적분 대비 수십~수백 배 빠름. 권장: 20~50.
 
 [최적화 제약]
 --sym-x / --no-sym-x        X축 좌우 대칭 (기본: 활성)
@@ -2235,14 +2309,20 @@ def main():
                    help="매 이터레이션 ESL 재추출 (기본: 활성)")
     g.add_argument("--no-iterative-esl", action="store_false", dest="iterative_esl",
                    help="ESL 1회 추출 후 고정 (최적화 전 1회만 동해석)")
-    g.add_argument("--parallel-scenarios", action="store_true", default=False,
-                   help="복수 CSV 시나리오를 ThreadPoolExecutor로 동시 동해석 "
-                        "(기본: 순차). 시나리오당 모델 deep-copy 발생 — 메모리 주의.")
+    g.add_argument("--parallel-scenarios", type=int, default=1, metavar="N",
+                   help="복수 CSV 시나리오 동시 실행 프로세스 수 (기본: 1=순차). "
+                        "2 이상 지정 시 ProcessPoolExecutor로 N개 시나리오를 동시 동해석. "
+                        "CPU 코어 수 절반 권장. 예: --parallel-scenarios 4")
     g.add_argument("--esl-skip-tol",  type=float, default=0.0,
                    metavar="TOL",
                    help="반복 ESL 재추출 스킵 임계값 (기본: 0.0=항상 재실행). "
                         "이전 이터레이션 대비 Δh_rms < TOL 이면 동해석 생략하고 "
                         "직전 ESL을 재사용. 예: --esl-skip-tol 0.05")
+    g.add_argument("--n-modes",       type=int, default=0,
+                   metavar="N",
+                   help="모달 중첩법 사용 모드 수 (기본: 0=직접 Newmark-β 적분). "
+                        "0 초과 시 모달 중첩법으로 동해석 수행—직접 적분 대비 "
+                        "수십~수백 배 빠름. 예: --n-modes 20")
     g.add_argument("--no-static",        action="store_true", default=False,
                    help="정적 하중 케이스 전체 비활성 — 동적 ESL만 사용 (--dynamic-opts 병용 시)")
 

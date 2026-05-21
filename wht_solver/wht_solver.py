@@ -26,6 +26,11 @@ from .wht_result import WHTSolverResult
 from .wht_stress_recovery import ElementStressRecovery
 from .wht_tria3_element import K_tria3_scipy, M_tria3_lumped
 from .wht_quad4_element import K_quad4_scipy, M_quad4_lumped
+try:
+    from .wht_quad4_element_jax import K_quad4_jax as _K_quad4_jax
+    _JAX_VMAP_OK = True
+except Exception:
+    _JAX_VMAP_OK = False
 
 
 def _arpack_subprocess_worker(K, M_diag, k, sigma, maxiter, result_queue):
@@ -441,7 +446,10 @@ class WHTSolver:
         else:
             K_out = csr_matrix((ndof, ndof))
 
-        K_q = K_quad4_scipy(self.model, sorted_nids, nid_to_idx)
+        if _JAX_VMAP_OK:
+            K_q = _K_quad4_jax(self.model, sorted_nids, nid_to_idx)
+        else:
+            K_q = K_quad4_scipy(self.model, sorted_nids, nid_to_idx)
         K_t = K_tria3_scipy(self.model, sorted_nids, nid_to_idx)
         K_out = K_out + K_q + K_t
         print(f"    - [Assembly] Stiffness Audit: {K_q.nnz} non-zeros from shells.")
