@@ -46,6 +46,20 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
       --add-inertia --sym-x --bead-connect --height-steps 2 \
       --exclude-rect 450,250,120,120 --exclude-rect 1350,250,120,120
 
+  모드 E | 입력 디렉토리 일괄 실행 (--input-dir)
+    단일 폴더에 옵션 파일(topo_arg.txt)과 복수 시나리오 CSV를 구성하여
+    한 번의 명령으로 모드 C/D 설정을 완성합니다.
+    폴더 구조:
+      /input/
+        topo_arg.txt              ← 기본 옵션 설정 (argparse 형식, # 주석 지원)
+        scenario_A/
+          chassis_corners.csv     ← --dynamic-opts 항목으로 자동 등록
+        scenario_B/
+          chassis_corners.csv
+        ...
+    실행: python wht_topo/run_topo.py --input-dir /path/to/input
+    우선순위: 명령줄 인자 > topo_arg.txt > 자동 발견 CSV
+
 [하중 케이스 구성 원칙]
   정적 하중과 동적 ESL은 독립적으로 가중치를 설정하여 목적 함수에 합산됩니다.
   동적 ESL 적용 시 정적 하중이 자동으로 꺼지지 않습니다.
@@ -58,6 +72,18 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
                 --w-lifting  W  F
                 ...
                 --no-static 으로 전체 제외 가능
+
+[자중 기반 정하중 자동계산 — --w-basic-weight]
+  루프형 질량 행렬(mat-rho × 요소 면적 × 판 두께)로 총 자중을 산출하여
+  각 정적 하중 케이스의 하중 크기를 물리적으로 의미 있는 값으로 자동 설정합니다.
+
+  W_chassis = Σ(m_node) × 9806 mm/s²   [N]   (단위계: tonne·mm·s)
+
+  --w-basic-weight 0     : 입력된 --w-xxx F_N 값을 그대로 적용
+  --w-basic-weight 1.0   : F_i = sign(F_N_i) × W_chassis  (자중과 동일한 크기)
+  --w-basic-weight 0.5   : F_i = sign(F_N_i) × W_chassis × 0.5  (자중의 50%)
+
+  초기 실행 시 터미널에 자중·무게중심·편심·각 케이스 적용 하중을 상세 출력합니다.
 
 [비드 배제 영역 — --exclude-rect / --exclude-poly]
   마운팅 홀, 슬롯, 보스 등 비드를 생성하면 안 되는 영역을 지정합니다.
@@ -115,11 +141,27 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
      CSV # 헤더의 C5~C8 좌표로 가장 가까운 FEM 노드 3개씩 자동 탐색.
   4. (옵션 --add-inertia) 이선형 보간 + 집중 질량 → 관성 하중(F=-ma) 전 노드 인가.
   5. Newmark-β 직접 적분 과도 응답 해석 (ζ=2%, --zeta 조정 가능).
+     저장 스냅샷 수: --n-save-esl (기본 50, 최소 n_windows×2 자동 적용).
   6. 전체 SE 이력(SE = ½uᵀKu) 계산 → n_windows 구간 분할 → 전역 피크 후보 추출.
   7. Greedy Max-Min Cosine Similarity 다양성 선별 → Top-n_top 스냅샷 선정.
   8. WHTLoadCase(SPCD 형태)로 변환 → 목적 함수 하중 케이스 풀에 추가.
   출력: results/D날짜_시간/esl_se_report[_iterNNN].png
         (SE 이력 + 윈도우 분할 + 선택 시점 마킹)
+
+[동적 해석 속도 최적화 옵션]
+  --n-save-esl N        ESL 추출용 저장 스냅샷 수 (기본 50).
+                        줄일수록 메모리·I/O 감소. n_windows×2 미만이면 자동 상향.
+                        예) --n-windows 20 --n-save-esl 40
+
+  --esl-skip-tol TOL    반복 ESL 재추출 스킵 임계값 (기본 0.0=항상 재실행).
+                        이전 이터레이션 대비 Δh_rms < TOL 이면 동해석을 생략하고
+                        직전 ESL 결과를 재사용. 수렴 후반부 동해석 횟수 절감.
+                        예) --esl-skip-tol 0.05  (h_max=10mm 기준 0.5% 변화 이하)
+
+  --parallel-scenarios  복수 CSV 시나리오를 스레드 풀로 동시 동해석 (기본: 순차).
+                        시나리오당 모델 deep-copy가 발생하므로 메모리 사용량 증가.
+                        n_workers(케이스 내부 병렬)와 레벨이 다름—중첩 사용 가능.
+                        예) --dynamic-opts A.csv B.csv C.csv --parallel-scenarios
 
 [동적 ESL 알고리즘 — 요소별 최대 SE 피크 (--w-peak)]
   동적 해석 완료 후 모든 쉘 요소(QUAD4/TRIA3)에 대해:
@@ -518,6 +560,7 @@ class ESLExtractor:
         w_peak: float = 0.0,
         iteration: int = -1,
         out_dir: Optional[Path] = None,
+        n_save_esl: int = 50,
     ):
         self.model        = model
         self.node_db      = node_db
@@ -532,6 +575,7 @@ class ESLExtractor:
         self.w_peak       = w_peak
         self.iteration    = iteration  # -1: 단독 실행, ≥0: 최적화 루프 내
         self.out_dir      = out_dir    # None이면 CSV 옆 디렉토리에 저장
+        self.n_save_esl   = max(n_windows * 2, n_save_esl)  # 윈도우당 최소 2개 보장
 
         # 단계별 출력
         self._df          : Optional[pd.DataFrame]     = None
@@ -701,14 +745,33 @@ class ESLExtractor:
     def _run_dynamic(self) -> None:
         dt      = self._time_arr[1] - self._time_arr[0] if len(self._time_arr) > 1 else 1e-4
         T_total = float(self._time_arr[-1])
-        _section(f"과도 응답 해석  (Newmark-β  ζ={ZETA*100:.0f}%)", "ESL-1")
-        _row("적분 파라미터", f"dt={dt:.2e} s   T={T_total:.4f} s   저장 스냅샷=100")
-        print()
         self._dyn_solver = WHTDynamicSolver(self.model)
-        self._dyn_res    = self._dyn_solver.solve_direct_dynamic(
-            self._load_groups, dt=dt, T=T_total, n_save=100,
-            damping=DampingSpec(mode="zeta", zeta=ZETA),
-        )
+
+        if self.n_modes > 0:
+            _section(
+                f"과도 응답 해석  (모달 중첩법  modes={self.n_modes}  ζ={ZETA*100:.0f}%)",
+                "ESL-1",
+            )
+            _row("적분 파라미터",
+                 f"dt={dt:.2e} s   T={T_total:.4f} s   "
+                 f"모드 수={self.n_modes}   ESL 저장 스냅샷={self.n_save_esl}")
+            print()
+            self._dyn_res = self._dyn_solver.solve_modal_dynamic(
+                self._load_groups, dt=dt, T=T_total,
+                n_modes  = self.n_modes,
+                n_save   = self.n_save_esl,
+                damping  = DampingSpec(mode="zeta", zeta=ZETA),
+            )
+        else:
+            _section(f"과도 응답 해석  (직접 Newmark-β  ζ={ZETA*100:.0f}%)", "ESL-1")
+            _row("적분 파라미터",
+                 f"dt={dt:.2e} s   T={T_total:.4f} s   "
+                 f"ESL 저장 스냅샷={self.n_save_esl}")
+            print()
+            self._dyn_res = self._dyn_solver.solve_direct_dynamic(
+                self._load_groups, dt=dt, T=T_total, n_save=self.n_save_esl,
+                damping=DampingSpec(mode="zeta", zeta=ZETA),
+            )
         _endsec()
 
     def _extract_esl_cases(self) -> None:
@@ -1373,33 +1436,85 @@ class TopographyPipeline:
             )
             print(f"\n [3] 정적 하중 케이스 {len(static_cases)}개 구성 완료.")
 
+        use_parallel = getattr(self.cfg, 'parallel_scenarios', False) and len(entries) > 1
+
+        def _extract_one(args):
+            """단일 시나리오 ESL 추출 (병렬 실행 시 모델 복사본 사용)."""
+            csv_path, t_start, t_end, w_dyn, iteration, model_copy = args
+            import copy
+            return ESLExtractor(
+                model        = model_copy,
+                node_db      = self.node_db,
+                csv_path     = csv_path,
+                t_start      = t_start,
+                t_end        = t_end,
+                n_windows    = self.cfg.n_windows,
+                n_top        = self.cfg.n_top,
+                add_inertia  = self.cfg.add_inertia,
+                use_global_z = self.cfg.use_global_z,
+                esl_weight   = w_dyn,
+                w_peak       = self.cfg.w_peak,
+                iteration    = iteration,
+                out_dir      = self.out_dir,
+                n_save_esl   = self.cfg.n_save_esl,
+            ).extract()
+
         def _run_esl(iteration: int):
+            import copy
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            task_args = [
+                (csv_path, t_start, t_end, w_dyn, iteration,
+                 copy.deepcopy(self.model) if use_parallel else self.model)
+                for (csv_path, t_start, t_end), w_dyn in zip(entries, w_list)
+            ]
+
+            if not use_parallel:
+                all_snaps = []
+                for args in task_args:
+                    all_snaps.extend(_extract_one(args))
+                return all_snaps
+
+            # ── 병렬 실행: 시나리오별 독립 모델 복사본으로 동시 동해석 ──────
+            print(f"\n     [병렬 ESL] {len(task_args)}개 시나리오 동시 실행 중...")
+            results = [None] * len(task_args)
+            with ThreadPoolExecutor(max_workers=len(task_args)) as exe:
+                fut_map = {exe.submit(_extract_one, a): idx
+                           for idx, a in enumerate(task_args)}
+                for fut in as_completed(fut_map):
+                    idx = fut_map[fut]
+                    results[idx] = fut.result()
             all_snaps = []
-            for (csv_path, t_start, t_end), w_dyn in zip(entries, w_list):
-                snaps = ESLExtractor(
-                    model        = self.model,
-                    node_db      = self.node_db,
-                    csv_path     = csv_path,
-                    t_start      = t_start,
-                    t_end        = t_end,
-                    n_windows    = self.cfg.n_windows,
-                    n_top        = self.cfg.n_top,
-                    add_inertia  = self.cfg.add_inertia,
-                    use_global_z = self.cfg.use_global_z,
-                    esl_weight   = w_dyn,
-                    w_peak       = self.cfg.w_peak,
-                    iteration    = iteration,
-                    out_dir      = self.out_dir,
-                ).extract()
+            for snaps in results:
                 all_snaps.extend(snaps)
             return all_snaps
 
         if getattr(self.cfg, 'iterative_esl', False):
             # ── 반복 추출 모드: provider를 solver에 전달 ──────────────────────
-            def provider(iteration: int):
+            esl_skip_tol   = getattr(self.cfg, 'esl_skip_tol', 0.0)
+            _prev_h        = [None]   # [np.ndarray | None]  직전 h_elem 저장
+            _cached_snaps  = [None]   # [list | None]        직전 ESL 결과 캐시
+
+            def provider(iteration: int, h_elem=None):
+                nonlocal _prev_h, _cached_snaps
+                # Δh_rms 스킵 판단
+                if (esl_skip_tol > 0.0
+                        and h_elem is not None
+                        and _prev_h[0] is not None
+                        and _cached_snaps[0] is not None):
+                    delta = float(np.sqrt(np.mean((h_elem - _prev_h[0]) ** 2)))
+                    if delta < esl_skip_tol:
+                        print(f"\n [ESL-스킵] Iter {iteration} "
+                              f"Δh_rms={delta:.4f} < tol={esl_skip_tol} "
+                              f"→ 직전 ESL {len(_cached_snaps[0])}개 재사용.")
+                        return _cached_snaps[0]
+
                 print(f"\n [ESL-재추출] Iter {iteration} — 현재 비드 형상 기준 동적 해석")
                 snaps = _run_esl(iteration)
                 print(f"     -> Iter {iteration} ESL {len(snaps)}개 반환.")
+                if h_elem is not None:
+                    _prev_h[0]       = h_elem.copy()
+                _cached_snaps[0] = snaps
                 return snaps
             return static_cases, provider
         else:
@@ -1634,6 +1749,102 @@ class TopographyPipeline:
 # CLI 진입점
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve_input_dir(parser) -> list:
+    """
+    sys.argv 에서 --input-dir 를 먼저 추출합니다.
+
+    1. topo_arg.txt 가 있으면 파일 내용을 기본 인자로 로드합니다.
+    2. 하위 폴더 중 chassis_corners.csv 를 포함하는 폴더를 탐색하여
+       --dynamic-opts 항목으로 자동 추가합니다.
+    3. 명령줄 인자(--input-dir 제외)가 topo_arg.txt 설정을 덮어씁니다.
+
+    Returns
+    -------
+    list  parser.parse_args() 에 전달할 최종 argv 리스트
+    """
+    import shlex
+
+    argv = sys.argv[1:]
+
+    # --input-dir 값 추출 (따옴표 포함 경로 대응)
+    input_dir: Optional[Path] = None
+    clean_argv = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--input-dir",):
+            if i + 1 < len(argv):
+                input_dir = Path(argv[i + 1].strip('"').strip("'"))
+                i += 2
+            else:
+                i += 1
+        elif argv[i].startswith("--input-dir="):
+            input_dir = Path(argv[i].split("=", 1)[1].strip('"').strip("'"))
+            i += 1
+        else:
+            clean_argv.append(argv[i])
+            i += 1
+
+    if input_dir is None:
+        return clean_argv
+
+    if not input_dir.is_dir():
+        parser.error(f"--input-dir: 경로가 존재하지 않거나 디렉토리가 아닙니다: {input_dir}")
+
+    print(f"\n  [input-dir] 입력 디렉토리: {input_dir}")
+
+    # ── 1. topo_arg.txt 로드 ──────────────────────────────────────────────────
+    base_argv: list = []
+    arg_file = input_dir / "topo_arg.txt"
+    if arg_file.exists():
+        raw = arg_file.read_text(encoding="utf-8")
+        lines = [l.strip() for l in raw.splitlines()]
+        for line in lines:
+            line = line.split("#")[0].strip()   # 주석 제거
+            if not line:
+                continue
+            base_argv.extend(shlex.split(line))
+        print(f"  [input-dir] topo_arg.txt 로드: {len(base_argv)}개 토큰")
+    else:
+        print(f"  [input-dir] topo_arg.txt 없음 — 기본값 사용")
+
+    # ── 2. 하위 폴더 chassis_corners.csv 탐색 ────────────────────────────────
+    csv_entries: list = []
+    for sub in sorted(input_dir.iterdir()):
+        if not sub.is_dir():
+            continue
+        csv_path = sub / "chassis_corners.csv"
+        if csv_path.exists():
+            csv_entries.append(str(csv_path))
+
+    if csv_entries:
+        print(f"  [input-dir] chassis_corners.csv 발견: {len(csv_entries)}개 하위 폴더")
+        for p in csv_entries:
+            print(f"             {p}")
+    else:
+        print(f"  [input-dir] chassis_corners.csv 를 포함하는 하위 폴더 없음")
+
+    # ── 3. 최종 argv 조합 ─────────────────────────────────────────────────────
+    # 우선순위: 명령줄(clean_argv) > topo_arg.txt(base_argv) > 자동 추가 CSV
+    # --dynamic-opts 는 append 방식이 아니므로 기존 항목에 CSV 를 병합합니다.
+    # clean_argv 에 이미 --dynamic-opts 가 있으면 그 뒤에 추가합니다.
+    final_argv = base_argv + clean_argv
+
+    if csv_entries:
+        # 기존 --dynamic-opts 가 없으면 새로 삽입, 있으면 항목을 뒤에 추가
+        if "--dynamic-opts" not in final_argv:
+            final_argv += ["--dynamic-opts"] + csv_entries
+        else:
+            idx = final_argv.index("--dynamic-opts")
+            # 기존 값들 뒤 (다음 --옵션 전까지) 에 csv_entries 삽입
+            insert_at = idx + 1
+            while insert_at < len(final_argv) and not final_argv[insert_at].startswith("--"):
+                insert_at += 1
+            for entry in reversed(csv_entries):
+                final_argv.insert(insert_at, entry)
+
+    return final_argv
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="WHT 산업용 섀시 비드 최적화 도구 (Dynamic-ESL 통합형)",
@@ -1733,8 +1944,13 @@ def main():
       --sym-x --bead-connect --height-steps 2
 
   동적 ESL 전용 (정적 비활성)
-    python wht_topo/run_topo.py --n-workers 4 --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" "wht_topo/structural_dynamics_c125.csv,1.5,1.8" "wht_topo/structural_dynamics_c235.csv,1.5,1.8"  --w-dynamic 1.0 --w-peak 1.0 --add-inertia  --sym-x --bead-connect --height-steps 2 --min-width 150 
-    
+    python wht_topo/run_topo.py --n-workers 4 \\
+      --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
+                     "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \\
+                     "wht_topo/structural_dynamics_c235.csv,1.5,1.8" \\
+      --w-dynamic 1.0 --w-peak 1.0 --add-inertia \\
+      --sym-x --bead-connect --height-steps 2 --min-width 150
+
   헤드리스 서버 실행
     python wht_topo/run_topo.py \\
       --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \\
@@ -1745,19 +1961,48 @@ def main():
       --sym-x --bead-connect --height-steps 2 \\
       --no-gui --no-viz
 
+[모드 E] 입력 디렉토리 일괄 실행
+
+  폴더 내 topo_arg.txt + 하위 폴더 chassis_corners.csv 자동 수집
+    python wht_topo/run_topo.py --input-dir "D:/data/session_01"
+
+  폴더 구조 예시:
+    session_01/
+      topo_arg.txt          <- 기본 옵션 (# 주석 지원, 아래 옵션으로 덮어쓰기 가능)
+      rear_impact/
+        chassis_corners.csv <- --dynamic-opts 항목으로 자동 등록
+      curb_bump_125/
+        chassis_corners.csv
+      curb_bump_235/
+        chassis_corners.csv
+
+  명령줄 인자로 topo_arg.txt 설정 일부 덮어쓰기
+    python wht_topo/run_topo.py --input-dir "D:/data/session_01" --iters 30 --no-gui
+
+  우선순위: 명령줄 인자 > topo_arg.txt > 자동 발견 CSV
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 옵션 상세 설명
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [섀시 형상]
---tray-width/length/height  섀시 외형 치수 mm (기본: 1800×1200×35)
---mesh-xy / --mesh-z        XY면·Z방향 메시 크기 mm (기본: 40 / 10)
+--tray-width/length/height  섀시 외형 치수 mm (기본: 1800×1200×40)
+--mesh-xy / --mesh-z        XY면·Z방향 메시 크기 mm (기본: 30 / 10)
 --draft-angle               측면 드래프트 각도 deg (기본: 25)
 
 [재료 물성]
 --mat-E    탄성계수 MPa (기본: 210000, 강재)
 --mat-nu   포아송비    (기본: 0.3)
 --mat-rho  밀도 tonne/mm³ (기본: 7.85e-9, 강재)
---mat-t    기본 판 두께 mm (기본: 1.2)
+--mat-t    기본 판 두께 mm (기본: 0.6)
+
+[입력 디렉토리 (모드 E)]
+--input-dir DIR
+                디렉토리 경로를 지정하면 아래 두 동작을 자동 수행합니다.
+                  1. DIR/topo_arg.txt 를 기본 옵션 파일로 로드 (# 주석 지원)
+                  2. DIR 하위 폴더 중 chassis_corners.csv 를 포함하는 폴더를
+                     모두 탐색하여 --dynamic-opts 항목으로 자동 추가
+                우선순위: 명령줄 인자 > topo_arg.txt > 자동 발견 CSV
+                경로에 공백이 있으면 따옴표로 감싸세요: --input-dir "D:/my path"
 
 [CSV 입력]
 --pos-data      CSV 경로 → 모드 B(동적 단독 해석) 실행.
@@ -1775,6 +2020,7 @@ def main():
                   "CSV경로,시작(s),종료(s)"→ t_start/t_end 모두 지정
                 복수 충격 시나리오 (공백 구분):
                   --dynamic-opts "drop.csv,1.6,3.0" "bump.csv,0.5,2.5" "sine.csv"
+                --input-dir 사용 시 하위 폴더 chassis_corners.csv 가 자동 추가됨.
 
 [ESL 추출 방식]
 --iterative-esl    (기본: 활성) 매 이터레이션 현재 비드 형상에서 동해석 재실행.
@@ -1791,6 +2037,14 @@ def main():
 --w-bending/xspan/yspan  W F_N  중앙·X스팬·Y스팬 굽힘 가중치·하중 (w=0 → 제외)
 --w-twisting/alt         W F_N  대각·반전 비틀림 가중치·하중
 --w-lifting              W F_N  4코너 리프팅 가중치·하중
+
+--w-basic-weight SCALE
+                자중 기반 하중 자동계산 스케일 (기본: 1.0).
+                  0     : --w-xxx F_N 입력값을 그대로 사용
+                  1.0   : 총 자중(M×9806 N)을 각 케이스 하중 크기로 자동 대체
+                  0.5   : 자중의 50% 적용 (하중 민감도 분석 등에 활용)
+                실행 초기 터미널에 총 질량·자중·무게중심·편심 모멘트·
+                케이스별 적용 하중을 상세 출력합니다.
 
 --add-inertia   관성 하중 F=-ma 전 노드 분포 인가.
                 낙하·충격 하중 케이스에 반드시 사용.
@@ -1809,14 +2063,24 @@ def main():
 
 --n-windows     SE 이력 분할 창 수 (기본: 30 / 충격→20, 장시간 진동→50)
 --n-top         시간분할 ESL 최종 선정 개수 (기본: 10 / 고정밀→15~20)
+--n-save-esl    ESL 추출용 저장 스냅샷 수 (기본: 50).
+                n_windows*2 미만이면 자동 상향. 줄일수록 동해석 메모리·I/O 감소.
+
+--esl-skip-tol  반복 ESL 재추출 스킵 임계값 (기본: 0.0=항상 재실행).
+                이전 이터 대비 Δh_rms < TOL 이면 직전 ESL 재사용.
+                0.05 권장 (h_max 10mm 기준 약 0.5mm 이하 변화 시 스킵).
+
+--parallel-scenarios
+                복수 CSV 시나리오를 동시 동해석 (기본: 순차).
+                시나리오 수만큼 모델 deep-copy → 메모리 N배 증가 주의.
 
 [최적화 제약]
 --sym-x / --no-sym-x        X축 좌우 대칭 (기본: 활성)
 --bead-connect / --no-bead-connect  비드 형태학적 연결 (기본: 활성)
 --connect-gap               비드 연결 최대 갭 mm (기본: 120)
---height-steps              비드 이산화 단계 (기본: 2 → {0, h_max})
+--height-steps              비드 이산화 단계 (기본: 1=연속 / 2={0,h_max})
 --bead-height               최대 비드 높이 mm (기본: 10)
---bead-area                 비드 점유 면적 비율 0~1 (기본: 0.35)
+--bead-area                 비드 점유 면적 비율 0~1 (기본: 0.30)
 --min-width                 최소 비드 폭 mm (기본: 30)
 
 [비드 배제 영역]
@@ -1839,9 +2103,10 @@ def main():
 
 [출력]
 결과 디렉토리: results/D날짜_시간/ (실행 시작 시 자동 생성)
-  paraview/iter_NNN.hdf  — 이터레이션별 변위·응력·고유모드 (ParaView)
+  paraview/iter_NNN.hdf       — 이터레이션별 변위·응력·고유모드 (ParaView)
   esl_se_report_iterNNN.png   — 시간분할 ESL SE 이력 리포트
   esl_peak_report_iterNNN.png — 요소별 피크 ESL 리포트
+  run.log                     — 전체 실행 로그 (터미널 출력 동일 내용)
   final.k (또는 --export 경로) — LS-DYNA 최적 비드 패턴
 
 --no-gui   모니터링 GUI 비활성 (헤드리스 서버)
@@ -1944,7 +2209,7 @@ def main():
                    help="분석 시작 시점 s (기본: CSV 헤더 start_time 자동 적용)")
     g.add_argument("--t-end",     type=float, default=None,
                    help="분석 종료 시점 s (기본: CSV 마지막 프레임)")
-    g.add_argument("--dt",        type=float, default=1e-4,  help="적분 시간 스텝 s (기본: 1e-4)")
+    g.add_argument("--dt",        type=float, default=1e-3,  help="적분 시간 스텝 s (기본: 1e-4)")
     g.add_argument("--zeta",      type=float, default=0.02,  help="Rayleigh 감쇠비 (기본: 0.02)")
     g.add_argument("--corner-r",  type=float, default=150.0, help="코너 탐색 반경 mm (fallback 전용)")
 
@@ -1957,6 +2222,10 @@ def main():
     g.add_argument("--add-inertia",  action="store_true",     help="관성 하중(-ma) 인가")
     g.add_argument("--n-top",        type=int, default=10,    help="추출 ESL 개수 (기본: 10)")
     g.add_argument("--n-windows",    type=int, default=30,    help="시간 이력 분할 수 (기본: 30)")
+    g.add_argument("--n-save-esl",   type=int, default=50,
+                   help="ESL 추출용 저장 스냅샷 수 (기본: 50). "
+                        "n_windows*2 보다 작으면 자동으로 n_windows*2 로 상향. "
+                        "줄일수록 동해석 메모리·I/O 감소.")
     g.add_argument("--use-global-z",    action="store_true",      help="글로벌 Z 궤적 직접 사용")
     g.add_argument("--w-dynamic",       type=float, nargs='+', default=[1.0],
                    metavar="W",
@@ -1966,6 +2235,14 @@ def main():
                    help="매 이터레이션 ESL 재추출 (기본: 활성)")
     g.add_argument("--no-iterative-esl", action="store_false", dest="iterative_esl",
                    help="ESL 1회 추출 후 고정 (최적화 전 1회만 동해석)")
+    g.add_argument("--parallel-scenarios", action="store_true", default=False,
+                   help="복수 CSV 시나리오를 ThreadPoolExecutor로 동시 동해석 "
+                        "(기본: 순차). 시나리오당 모델 deep-copy 발생 — 메모리 주의.")
+    g.add_argument("--esl-skip-tol",  type=float, default=0.0,
+                   metavar="TOL",
+                   help="반복 ESL 재추출 스킵 임계값 (기본: 0.0=항상 재실행). "
+                        "이전 이터레이션 대비 Δh_rms < TOL 이면 동해석 생략하고 "
+                        "직전 ESL을 재사용. 예: --esl-skip-tol 0.05")
     g.add_argument("--no-static",        action="store_true", default=False,
                    help="정적 하중 케이스 전체 비활성 — 동적 ESL만 사용 (--dynamic-opts 병용 시)")
 
@@ -1998,7 +2275,14 @@ def main():
     g.add_argument("--no-viz",    action="store_true", help="최종 3D 시각화 생략")
     g.add_argument("--mesh-size", type=float, default=10.0, help="BC 탐색 기준 메시 크기 mm")
 
-    args = parser.parse_args()
+    # 입력 디렉토리 (topo_arg.txt + 하위 폴더 chassis_corners.csv 자동 수집)
+    g = parser.add_argument_group("입력 디렉토리 (일괄 설정)")
+    g.add_argument("--input-dir", type=str, default=None,
+                   metavar="DIR",
+                   help="입력 디렉토리 경로. 해당 폴더의 topo_arg.txt를 기본 옵션으로 로드하고, "
+                        "하위 폴더 각각에 있는 chassis_corners.csv를 --dynamic-opts 항목으로 자동 추가.")
+
+    args = parser.parse_args(_resolve_input_dir(parser))
 
     if args.pos_data:
         PosDynamicPipeline(args).run()

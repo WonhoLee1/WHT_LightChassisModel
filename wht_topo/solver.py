@@ -1070,7 +1070,7 @@ class WHTopographySolver:
 
             # 동적 ESL 재추출 (provider 등록 시 매 이터레이션 실행)
             if self._load_case_provider is not None:
-                dyn_cases = self._load_case_provider(i)
+                dyn_cases = self._load_case_provider(i, h_elem=h_filtered)
                 self._load_cases = list(self._static_load_cases) + list(dyn_cases)
                 print(f"  │  하중 케이스: 정적 {len(self._static_load_cases)}개 "
                       f"+ 동적 ESL {len(dyn_cases)}개 = 총 {len(self._load_cases)}개")
