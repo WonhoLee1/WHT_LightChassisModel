@@ -118,6 +118,25 @@ def _von_mises_max(stress_arr: np.ndarray) -> float:
     return float(np.max(vm))
 
 
+def _bresenham_line(r0: int, c0: int, r1: int, c1: int):
+    """Bresenham's line -- (row, col) 경로 반환."""
+    points = []
+    dr, dc = abs(r1 - r0), abs(c1 - c0)
+    sr, sc = (1 if r0 < r1 else -1), (1 if c0 < c1 else -1)
+    err = dr - dc
+    r, c = r0, c0
+    while True:
+        points.append((r, c))
+        if r == r1 and c == c1:
+            break
+        e2 = 2 * err
+        if e2 > -dc:
+            err -= dc; r += sr
+        if e2 < dr:
+            err += dr; c += sc
+    return points
+
+
 class WHTopographySolver:
     """
     물리적으로 올바른 Topography Optimization 엔진.
@@ -186,13 +205,18 @@ class WHTopographySolver:
         mesh_size_z: float = 10.0,
         fd_dz: float = 0.5,
         sym_x: bool = False,
-        bead_connect: bool = False,
-        connect_gap: float = 80.0,
+        bead_connect: float = 0.0,
+        bead_connect_alg: str = "closing",
         bead_steps: int = 0,
+        filter_type: str = "linear",
+        use_projection: bool = False,
+        proj_beta_max: float = 32.0,
+        proj_eta: float = 0.5,
         load_cases: Optional[List[Tuple["WHTLoadCase", float]]] = None,
         load_case_provider=None,
         out_dir=None,
         normalize_obj: bool = False,
+        weight_variation: float = 0.0,
         obj_type: str = "sum",
         obj_alpha: float = 10.0,
         freq_weight: float = 0.0,
@@ -208,14 +232,24 @@ class WHTopographySolver:
         self.mesh_size_z    = mesh_size_z
         self.fd_dz          = fd_dz
         self.sym_x          = sym_x
-        self.bead_connect   = bead_connect
-        self.connect_gap    = connect_gap
+        self.bead_connect     = bead_connect        # 0=비활성, >0=연결 최대 갭(mm)
+        self.connect_gap      = bead_connect        # 하위 호환용 alias
+        self.bead_connect_alg = bead_connect_alg   # 'closing'|'mst'|'geodesic'|'hybrid'
         self.bead_steps     = bead_steps
+        self.filter_type    = filter_type         # "linear" | "gaussian"
+        self.use_projection = use_projection      # Heaviside projection 활성화
+        self.proj_beta_max  = proj_beta_max       # beta 최대값 (continuation)
+        self.proj_eta       = proj_eta            # Heaviside 임계값 (0.5=중간)
+        # 다중 설계 탐색용 반발 패널티
+        self.diversity_weight  = 0.0              # λ: 반발 강도 (0=비활성)
+        self.diversity_sigma   = 0.3              # σ: 반발 범위 (설계 변수 공간)
+        self._reference_designs: List[np.ndarray] = []  # 수렴된 이전 설계들
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
         self.load_cases_input    = load_cases
         self._load_case_provider = load_case_provider
         self._out_dir            = out_dir  # results/D날짜_시간/ — None이면 자동 생성
         self.normalize_obj       = normalize_obj
+        self.weight_variation    = weight_variation  # >0이면 매 이터마다 케이스 가중치 랜덤 변동
         self.obj_type            = obj_type   # "sum" | "max" | "sum+max"
         self.obj_alpha           = obj_alpha  # softmax 온도 (클수록 hard-max에 가까움)
         self.freq_weight         = freq_weight
@@ -311,9 +345,9 @@ class WHTopographySolver:
 
         # 비드 연결 그리드 (Morphological Closing용)
         self._connect_grid = None
-        if self.bead_connect:
+        if self.bead_connect > 0:
             self._connect_grid = self._build_connect_grid()
-            print(f" -> [Solver] 비드 연결(Bead Connect) 활성화: 간격 {self.connect_gap:.0f}mm 이연 갈라진 비드 연결함")
+            print(f" -> [Solver] 비드 연결 활성화: alg={self.bead_connect_alg}  gap={self.bead_connect:.0f}mm")
 
         # 초기 비드 높이 (0 = 평탄)
         self.heights = np.zeros(self._n_design)
@@ -577,6 +611,20 @@ class WHTopographySolver:
     _NEIGHBORS_8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
 
     def _apply_bead_connect(self, x: np.ndarray, threshold: float = 0.1):
+        """알고리즘 선택 디스패처."""
+        alg = getattr(self, 'bead_connect_alg', 'closing')
+        if alg == 'mst':
+            return self._apply_bead_connect_mst(x, threshold)
+        elif alg == 'geodesic':
+            return self._apply_bead_connect_geodesic(x, threshold)
+        elif alg == 'hybrid':
+            x1, bi1 = self._apply_bead_connect_closing(x, threshold)
+            x2, bi2 = self._apply_bead_connect_mst(x1, threshold)
+            return x2, bi1 + bi2
+        else:  # 'closing' default
+            return self._apply_bead_connect_closing(x, threshold)
+
+    def _apply_bead_connect_closing(self, x: np.ndarray, threshold: float = 0.1):
         """
         Morphological Closing으로 단절된 비드 노드를 연결합니다.
 
@@ -634,67 +682,261 @@ class WHTopographySolver:
                 x_new[k] = max(x_new[k], max(neighbor_vals) if neighbor_vals else threshold + 0.1)
         return x_new, bridge_idx
 
+    def _apply_bead_connect_mst(self, x: np.ndarray, threshold: float = 0.1):
+        """
+        MST(Minimum Spanning Tree) 기반 비드 섬 연결.
+
+        [알고리즘]
+        1. scipy.ndimage.label로 8-연결 컴포넌트 식별
+        2. 컴포넌트 간 최근접 픽셀 쌍 거리 행렬 구성
+        3. Kruskal MST로 최소 연결 트리 계산
+        4. 각 MST 엣지: Bresenham 직선으로 bridge 경로 생성
+        5. 경로 상 비활성 노드 승격
+
+        [특징] 모든 섬을 반드시 연결. closing보다 공격적.
+        """
+        from scipy.ndimage import label as ndlabel
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import minimum_spanning_tree
+
+        cg = self._connect_grid
+        gi, gj = cg["gi"], cg["gj"]
+        nx, ny = cg["nx"], cg["ny"]
+        g2n    = cg["grid_to_node"]
+
+        grid = np.zeros((ny, nx), dtype=bool)
+        for k in range(self._n_design):
+            if x[k] > threshold:
+                grid[gj[k], gi[k]] = True
+
+        struct = np.ones((3, 3), dtype=int)
+        labeled, n_comp = ndlabel(grid, structure=struct)
+        if n_comp <= 1:
+            return x.copy(), []
+
+        # 각 컴포넌트 픽셀 목록
+        comp_pix = {}
+        for r in range(ny):
+            for c in range(nx):
+                lbl = labeled[r, c]
+                if lbl > 0:
+                    comp_pix.setdefault(lbl, []).append((r, c))
+
+        comp_ids = sorted(comp_pix.keys(), key=lambda cid: -len(comp_pix[cid]))
+        n = len(comp_ids)
+
+        # 컴포넌트 간 최근접 픽셀 쌍 거리 (샘플링으로 속도 확보)
+        MAX_SAMPLE = 200
+
+        def _sample(pix):
+            if len(pix) <= MAX_SAMPLE:
+                return np.array(pix)
+            idx = np.random.choice(len(pix), MAX_SAMPLE, replace=False)
+            return np.array(pix)[idx]
+
+        dist_mat  = np.full((n, n), np.inf)
+        near_pair = {}  # (i,j) -> (pa, pb)
+
+        for i in range(n):
+            arr_a = _sample(comp_pix[comp_ids[i]])
+            for j in range(i + 1, n):
+                arr_b = _sample(comp_pix[comp_ids[j]])
+                dists = np.sum(
+                    (arr_a[:, None, :] - arr_b[None, :, :]) ** 2, axis=2
+                )
+                mi = np.unravel_index(np.argmin(dists), dists.shape)
+                d  = float(np.sqrt(dists[mi]))
+                dist_mat[i, j] = dist_mat[j, i] = d
+                near_pair[(i, j)] = (tuple(arr_a[mi[0]]), tuple(arr_b[mi[1]]))
+                near_pair[(j, i)] = (tuple(arr_b[mi[1]]), tuple(arr_a[mi[0]]))
+
+        mst = minimum_spanning_tree(csr_matrix(dist_mat))
+        rows, cols = mst.nonzero()
+
+        x_new = x.copy()
+        bridge_idx = []
+        for ei, ej in zip(rows, cols):
+            pa, pb = near_pair[(ei, ej)]
+            for r, c in _bresenham_line(pa[0], pa[1], pb[0], pb[1]):
+                if 0 <= r < ny and 0 <= c < nx:
+                    k = g2n.get((r, c))
+                    if k is not None and x[k] <= threshold:
+                        bridge_idx.append(k)
+                        nbrs = [
+                            x[g2n[(r+dr, c+dc)]]
+                            for dr, dc in self._NEIGHBORS_8
+                            if g2n.get((r+dr, c+dc)) is not None
+                            and x[g2n[(r+dr, c+dc)]] > threshold
+                        ]
+                        x_new[k] = max(x_new[k], max(nbrs) if nbrs else threshold + 0.1)
+        return x_new, bridge_idx
+
+    def _apply_bead_connect_geodesic(self, x: np.ndarray, threshold: float = 0.1):
+        """
+        Dijkstra 최소비용 경로 기반 비드 섬 연결.
+
+        [알고리즘]
+        1. 컴포넌트 식별 (label)
+        2. 가장 큰 컴포넌트를 '본체'로 지정
+        3. 각 소형 섬 -> 본체까지 Dijkstra 최단 경로 탐색
+           - 비활성 노드 비용 = 1.0 (통과 비용)
+           - 활성 노드 비용  = 0.0 (이미 비드)
+        4. 경로 상 비활성 노드 승격
+
+        [특징] 기존 비드를 최대한 활용하는 자연스러운 경로.
+               구불구불한 실제 구조에 적합.
+        """
+        from scipy.ndimage import label as ndlabel
+        import heapq
+
+        cg = self._connect_grid
+        gi, gj = cg["gi"], cg["gj"]
+        nx, ny = cg["nx"], cg["ny"]
+        g2n    = cg["grid_to_node"]
+
+        grid = np.zeros((ny, nx), dtype=bool)
+        for k in range(self._n_design):
+            if x[k] > threshold:
+                grid[gj[k], gi[k]] = True
+
+        struct = np.ones((3, 3), dtype=int)
+        labeled, n_comp = ndlabel(grid, structure=struct)
+        if n_comp <= 1:
+            return x.copy(), []
+
+        # 컴포넌트 크기 -> 가장 큰 것이 본체
+        comp_sizes = {}
+        for r in range(ny):
+            for c in range(nx):
+                lbl = labeled[r, c]
+                if lbl > 0:
+                    comp_sizes[lbl] = comp_sizes.get(lbl, 0) + 1
+        main_comp = max(comp_sizes, key=lambda k: comp_sizes[k])
+
+        # Multi-source Dijkstra: 본체 모든 픽셀을 source(cost=0)로 시작
+        cost_grid = np.full((ny, nx), np.inf)
+        prev_grid = {}
+        heap = []
+
+        for r in range(ny):
+            for c in range(nx):
+                if labeled[r, c] == main_comp:
+                    cost_grid[r, c] = 0.0
+                    heapq.heappush(heap, (0.0, r, c))
+
+        while heap:
+            d, r, c = heapq.heappop(heap)
+            if d > cost_grid[r, c]:
+                continue
+            for dr, dc in self._NEIGHBORS_8:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < ny and 0 <= nc < nx):
+                    continue
+                step = 0.0 if grid[nr, nc] else 1.0
+                nd = d + step
+                if nd < cost_grid[nr, nc]:
+                    cost_grid[nr, nc] = nd
+                    prev_grid[(nr, nc)] = (r, c)
+                    heapq.heappush(heap, (nd, nr, nc))
+
+        # 컴포넌트별 최솟값 픽셀 탐색
+        comp_min = {}  # comp_id -> (cost, r, c)
+        for r in range(ny):
+            for c in range(nx):
+                lbl = labeled[r, c]
+                if lbl == 0 or lbl == main_comp:
+                    continue
+                cost = cost_grid[r, c]
+                if lbl not in comp_min or cost < comp_min[lbl][0]:
+                    comp_min[lbl] = (cost, r, c)
+
+        x_new = x.copy()
+        bridge_idx = []
+        for lbl, (_, r_start, c_start) in comp_min.items():
+            cur = (r_start, c_start)
+            while cur in prev_grid:
+                r, c = cur
+                if not grid[r, c]:
+                    k = g2n.get((r, c))
+                    if k is not None and x[k] <= threshold:
+                        bridge_idx.append(k)
+                        nbrs = [
+                            x[g2n[(r+dr, c+dc)]]
+                            for dr, dc in self._NEIGHBORS_8
+                            if g2n.get((r+dr, c+dc)) is not None
+                            and x[g2n[(r+dr, c+dc)]] > threshold
+                        ]
+                        x_new[k] = max(x_new[k], max(nbrs) if nbrs else threshold + 0.1)
+                cur = prev_grid[cur]
+
+        return x_new, bridge_idx
+
     # ─────────────── Discrete Projection (Staircase) ───────────────
 
     def _project_x(self, x: np.ndarray, beta: float) -> np.ndarray:
         """
-        설계 변수를 지정된 N단계 이산 레벨로 부드럽게 투사합니다.
-        
-        N=2 이면 {0, 1}, N=3 이면 {0, 0.5, 1} 등으로 수렴하도록 tanh 기반 계단 함수 적용.
+        설계 변수를 이산 레벨로 부드럽게 투사합니다.
+
+        bead_steps=1 → 2레벨 {0, 1}  (이진: 비드 없음 / 최대)
+        bead_steps=2 → 3레벨 {0, 0.5, 1}
+        bead_steps=N → N+1 레벨
+        bead_steps=0 → 연속 (투사 없음)
         """
-        if self.bead_steps < 2:
+        if self.bead_steps < 1:
             return x
-        
-        n = self.bead_steps
-        # 각 스텝 사이의 임계점(Thresholds)
+
+        n = self.bead_steps + 1          # 단계 수 → 레벨 수
         thresholds = np.linspace(0, 1, n * 2 + 1)[1:-1:2]
         levels = np.linspace(0, 1, n)
-        
-        # Staircase function: f(x) = l_0 + sum( (l_{k+1} - l_k) * 0.5 * (tanh(beta*(x - t_k)) + 1) )
+
         x_proj = np.full_like(x, levels[0])
         for i in range(n - 1):
             diff = levels[i+1] - levels[i]
             x_proj += diff * 0.5 * (np.tanh(beta * (x - thresholds[i])) + 1.0)
-            
+
         return x_proj
 
     def _project_x_grad(self, x: np.ndarray, beta: float) -> np.ndarray:
-        """
-        투사 함수의 미분값 (Chain-rule 용).
-        """
-        if self.bead_steps < 2:
+        """투사 함수의 미분값 (Chain-rule 용)."""
+        if self.bead_steps < 1:
             return np.ones_like(x)
-        
-        n = self.bead_steps
+
+        n = self.bead_steps + 1
         thresholds = np.linspace(0, 1, n * 2 + 1)[1:-1:2]
         levels = np.linspace(0, 1, n)
-        
-        # df/dx = sum( (l_{k+1} - l_k) * 0.5 * beta * (1 - tanh^2(beta*(x - t_k))) )
+
         grad = np.zeros_like(x)
         for i in range(n - 1):
             diff = levels[i+1] - levels[i]
             grad += diff * 0.5 * beta * (1.0 - np.tanh(beta * (x - thresholds[i]))**2)
-            
+
         return grad
 
     def _build_filter(self) -> np.ndarray:
         """
-        설계 노드 간 공간 필터 행렬 H를 조립합니다 (최소 비드 폭 제어).
+        공간 필터 행렬 H 조립 (최소 비드 폭 제어).
 
-        Returns
-        -------
-        np.ndarray
-            (n_design, n_design) 필터 가중치 행렬
+        filter_type="linear"  : w = rmin - dist  (hat kernel)
+        filter_type="gaussian": w = exp(-dist²/2σ²), σ = rmin/3
+          → 경계가 부드럽고 큼직한 덩어리 형태 유도에 유리
         """
-        print(f" -> [Solver] 공간 필터 행렬 ({self.rmin}mm) 조립 중 (요소 도심 기준)...")
+        print(f" -> [Solver] 공간 필터 행렬 ({self.rmin}mm, {self.filter_type}) 조립 중...")
         n = self._n_design
         coords = self._elem_centroids()
         W = np.zeros((n, n))
-        for i in range(n):
-            dists = np.linalg.norm(coords - coords[i], axis=1)
-            mask  = dists < self.rmin
-            w     = self.rmin - dists[mask]
-            W[i, mask] = w / (np.sum(w) + 1e-10)
+        if self.filter_type == "gaussian":
+            sigma = self.rmin / 3.0
+            for i in range(n):
+                dists = np.linalg.norm(coords - coords[i], axis=1)
+                mask  = dists < self.rmin
+                w     = np.exp(-dists[mask] ** 2 / (2.0 * sigma ** 2))
+                W[i, mask] = w / (np.sum(w) + 1e-10)
+        else:  # linear (기본)
+            for i in range(n):
+                dists = np.linalg.norm(coords - coords[i], axis=1)
+                mask  = dists < self.rmin
+                w     = self.rmin - dists[mask]
+                W[i, mask] = w / (np.sum(w) + 1e-10)
         return W
 
     # ─────────────── 노드 좌표 조작 ───────────────
@@ -880,6 +1122,20 @@ class WHTopographySolver:
                 displacement[ii, :] = u_aug_np[self.nid_to_idx[nid] * 6:
                                                 self.nid_to_idx[nid] * 6 + 6]
 
+            # Lagrange multiplier 방식에서 prescribed DOF는 u_aug에 반영되지 않을 수 있음.
+            # known_val(강제변위)이 있으면 해당 DOF의 변위를 명시적으로 복원한다.
+            if jm_lc.known_val is not None:
+                known_ids  = np.array(jm_lc.known_id,  dtype=np.int64)
+                known_vals = np.array(jm_lc.known_val, dtype=np.float64)
+                n_copy = min(len(known_ids), len(known_vals))
+                for k in range(n_copy):
+                    gid = known_ids[k]
+                    nidx_local = gid // 6
+                    dof_local  = gid %  6
+                    # nidx_local은 sorted_nids 기준 0-based 인덱스
+                    if 0 <= nidx_local < n_nodes:
+                        displacement[nidx_local, dof_local] = known_vals[k]
+
             rd_q = ElementStressRecovery.recover_quad4(solver.model, displacement, self.sorted_nids)
             rd_t = ElementStressRecovery.recover_tria3(solver.model, displacement, self.sorted_nids)
             cell_data = {k: (rd_q[k] + rd_t[k])[np.newaxis, :, :] for k in rd_q}
@@ -897,6 +1153,8 @@ class WHTopographySolver:
                     if abs(fval) > 1e-12:
                         f_full[idx * 6 + d] += fval
 
+            # C_i 계산: 순수 외력 케이스(BC 없음)는 f·u, 그 외(BC 포함/SPCD)는 u^T K u.
+            # prescribed DOF 변위를 복원한 u_full을 사용하므로 SPCD 케이스도 올바른 값이 나온다.
             if lc.forces and not lc.bcs:
                 C_i = float(np.dot(f_full, u_full))
             else:
@@ -931,7 +1189,7 @@ class WHTopographySolver:
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {executor.submit(_solve_group, grp): grp for grp in group_list}
             with tqdm(total=n_cases, desc=f"  Iter {iter_num:>3d} 하중 케이스 해석",
-                      unit="case", ncols=80) as pbar:
+                      unit="case", ncols=100) as pbar:
                 for future in as_completed(futures):
                     for i, w, res in future.result():
                         solve_results[i] = (w, res)
@@ -1103,11 +1361,25 @@ class WHTopographySolver:
             # ── 1. Discrete Projection & Filtering ──
             # beta continuation: 선형 증가, 전체 반복의 80%에서 max(50) 도달
             # (기존 100 → 60으로 완화: 패턴 안정화 전 조기 이산화 방지)
-            if self.bead_steps >= 2:
+            if self.bead_steps >= 1:
                 self._beta = min(50.0, 1.0 + (i / max_iter) * 60.0)
                 x_proj = self._project_x(x, self._beta)
             else:
                 x_proj = x
+
+            # Heaviside projection (use_projection=True 시)
+            # β-continuation: 초기 β_h≈1(부드러운 S-커브) → 선형 증가 → β_max(거의 계단함수)
+            # 표준 Heaviside: H_β(x;η) = [tanh(β·η) + tanh(β·(x−η))] / [tanh(β·η) + tanh(β·(1−η))]
+            #   η=0.5: x<0.5→0, x>0.5→1 에 수렴. β→∞이면 완전한 계단.
+            # 체인룰을 위해 입력값 x_proj_in을 반드시 별도 보존해야 함.
+            x_proj_in = x_proj  # Heaviside 입력값 (gradient 계산에 사용)
+            if self.use_projection:
+                _beta_h = min(self.proj_beta_max, 1.0 + (i / max_iter) * (self.proj_beta_max - 1.0))
+                _eta    = self.proj_eta
+                _t1 = np.tanh(_beta_h * _eta)
+                _t2 = np.tanh(_beta_h * (1.0 - _eta))
+                x_proj = (_t1 + np.tanh(_beta_h * (x_proj_in - _eta))) / (_t1 + _t2 + 1e-12)
+                x_proj = np.clip(x_proj, 0.0, 1.0)
 
             # 현재 비드 높이 (물리량) 계산 및 적용
             h_phys     = x_proj * self.h_max
@@ -1118,7 +1390,7 @@ class WHTopographySolver:
             if self._load_case_provider is not None:
                 dyn_cases = self._load_case_provider(i, h_elem=h_filtered)
                 self._load_cases = list(self._static_load_cases) + list(dyn_cases)
-                print(f"  │  하중 케이스: 정적 {len(self._static_load_cases)}개 "
+                print(f"     하중 케이스: 정적 {len(self._static_load_cases)}개 "
                       f"+ 동적 ESL {len(dyn_cases)}개 = 총 {len(self._load_cases)}개")
 
             # 컴플라이언스 및 민감도 계산 (솔버 인스턴스 공유)
@@ -1202,6 +1474,12 @@ class WHTopographySolver:
             # weights_map: {케이스명 → w_i}  (self._load_cases에서 추출)
             # C0_cases   : {케이스명 → C_i0} (첫 이터레이션에서 고정)
             weights_map = {lc.name: w for lc, w in self._load_cases}
+            if self.weight_variation > 0:
+                # 매 이터마다 각 케이스 가중치에 ±variation 랜덤 변동 적용
+                # uniform(-v, +v) → 케이스별 [w*(1-v), w*(1+v)] 범위
+                for _n in list(weights_map.keys()):
+                    _delta = self.weight_variation * (2.0 * np.random.rand() - 1.0)
+                    weights_map[_n] = max(0.01, weights_map[_n] * (1.0 + _delta))
             C0_cases    = self._C_0_cases
 
             if self.obj_type == 'sum' and not self.normalize_obj:
@@ -1336,21 +1614,54 @@ class WHTopographySolver:
 
                         f0val += float(P_norm)
                         dC_dh  = dC_dh + dP_dh
-                        print(f"  │  freq_penalty: f1={f1:.2f}Hz  target={self.freq_target:.2f}Hz"
+                        print(f"     freq_penalty: f1={f1:.2f}Hz  target={self.freq_target:.2f}Hz"
                               f"  deficit={deficit:.2f}Hz  P={P_norm:.4f}")
                     except Exception as _fe:
                         print(f"    [경고] 고유진동수 민감도 계산 실패: {_fe}")
 
-            # 필터 및 투사 역전파 (Chain-rule)
-            # dC/dx = (dx_proj/dx) * (dh/dx_proj) * (dH/dh) * (dC/dH)
-            # 1. 필터 역전파: dC/dh_phys = H^T @ dC/dh_filtered
-            dC_dh_phys = (self._H.T @ dC_dh)
-            # 2. 물리적 변환 및 투사 역전파: dC/dx = (dC/dh_phys * h_max) * dx_proj/dx
-            dC_dx = (dC_dh_phys * self.h_max)
-            if self.bead_steps >= 2:
+            # ── 민감도 역전파 (Chain-rule) ─────────────────────────────────────
+            # 순전파 경로: x → [이산화] → x_proj_in → [Heaviside] → x_proj
+            #              → h_phys(=x_proj*h_max) → h_filt(=H@h_phys) → C
+            #
+            # 역전파:
+            #   dC/dh_filt  : FEA 직접 계산 (dC_dh)
+            #   dC/dh_phys  = H^T · dC/dh_filt      (공간 필터 전치)
+            #   dC/dx_proj  = dC/dh_phys · h_max     (선형 스케일)
+            #   dC/dx_proj_in = dC/dx_proj · dH/dx_proj_in  (Heaviside 미분)
+            #   dC/dx       = dC/dx_proj_in · d_proj/dx    (이산화 미분)
+
+            # 1. 공간 필터 역전파
+            dC_dh_phys = self._H.T @ dC_dh
+
+            # 2. 높이 스케일 역전파
+            dC_dx = dC_dh_phys * self.h_max
+
+            # 3. Heaviside 역전파: dH/dx_in = β·sech²(β·(x_in−η)) / (tanh(β·η)+tanh(β·(1−η)))
+            #    x_proj_in 이 Heaviside 입력이므로 반드시 x_proj_in 기준으로 계산
+            if self.use_projection:
+                _beta_h = min(self.proj_beta_max, 1.0 + (i / max_iter) * (self.proj_beta_max - 1.0))
+                _eta    = self.proj_eta
+                _t1 = np.tanh(_beta_h * _eta)
+                _t2 = np.tanh(_beta_h * (1.0 - _eta))
+                # sech²(u) = 1 - tanh²(u), u = β·(x_in - η)
+                dH_dx = _beta_h * (1.0 - np.tanh(_beta_h * (x_proj_in - _eta)) ** 2) / (_t1 + _t2 + 1e-12)
+                dC_dx *= dH_dx
+
+            # 4. 이산 투사(bead_steps) 역전파
+            if self.bead_steps >= 1:
                 dC_dx *= self._project_x_grad(x, self._beta)
 
             df0dx = (dC_dx / C_0).flatten()
+
+            # ── 반발 패널티 (다중 설계 탐색) ─────────────────────────────────
+            if self.diversity_weight > 0 and self._reference_designs:
+                sig2 = self.diversity_sigma ** 2
+                for x_ref in self._reference_designs:
+                    diff   = x - x_ref
+                    dist2  = np.dot(diff, diff)
+                    w_rep  = self.diversity_weight * np.exp(-dist2 / (2.0 * sig2))
+                    f0val += float(w_rep)
+                    df0dx += w_rep * (-diff / sig2)
 
             # 좌우 대칭 강제 (민감도 동기화)
             if self.sym_x:
@@ -1361,7 +1672,7 @@ class WHTopographySolver:
             #   a) bridge 노드 df0dx를 활성 이웃 최댓값으로 승격 (MMA가 bridge 유지하도록)
             #   b) bridge 추가로 인한 체적 팽창을 사전에 vol_frac에서 차감
             #      (미보정 시: MMA가 다음 이터에서 약한 노드를 0으로 압축 → 비드 수축)
-            if self.bead_connect:
+            if self.bead_connect > 0:
                 x_bridged, bridge_idx = self._apply_bead_connect(x)
                 if bridge_idx:
                     cg = self._connect_grid
@@ -1377,7 +1688,7 @@ class WHTopographySolver:
                             df0dx[k] = max(df0dx[k], max(nb_sens))
 
                     # bridge 추가 후 체적 증가분 계산 → MMA 목표에서 선제 차감
-                    if self.bead_steps >= 2:
+                    if self.bead_steps >= 1:
                         vol_before = float(np.mean(self._project_x(x, self._beta)))
                         vol_after  = float(np.mean(self._project_x(x_bridged, self._beta)))
                     else:
@@ -1392,15 +1703,15 @@ class WHTopographySolver:
 
             # 제약 조건 민감도 (Chain-rule: df/dx = (1/N) * dx_proj/dx)
             dfdx = np.full(self._n_design, 1.0 / self._n_design)
-            if self.bead_steps >= 2:
+            if self.bead_steps >= 1:
                 dfdx *= self._project_x_grad(x, self._beta)
 
             fval = np.array([float(np.mean(x_proj)) - self.h_ratio])
 
             # MMA 업데이트
-            # bead_steps >= 2: project_fn 전달 → 이분법이 mean(x_proj) = h_ratio 기준으로 수렴
-            # bead_steps  < 2: project_fn=None → 기존 mean(x) 기준 (연속 변수이므로 동일)
-            if self.bead_steps >= 2:
+            # bead_steps >= 1: project_fn 전달 → 이분법이 mean(x_proj) = h_ratio 기준으로 수렴
+            # bead_steps  < 1: project_fn=None → 기존 mean(x) 기준 (연속 변수)
+            if self.bead_steps >= 1:
                 project_fn = lambda xv: self._project_x(np.array(xv), self._beta)
             else:
                 project_fn = None
@@ -1414,7 +1725,7 @@ class WHTopographySolver:
             x = np.clip(x, 0.0, 1.0)
 
             # ── 비드 연결 phase 2: 물리적 closing 적용 ───────────────────────────
-            if self.bead_connect:
+            if self.bead_connect > 0:
                 x, _ = self._apply_bead_connect(x)
 
             # 수렴 판정
@@ -1472,30 +1783,27 @@ class WHTopographySolver:
                     pass
 
             # ── 이터레이션 요약 출력 ──────────────────────────────────────────
-            # 박스 폭 _SW = 76: "  ┌"(3) + content + "┐"(1) = 76 → content = 72
-            _SW = 76
+            _SW = 100
             f1_str = f"F1={elastic_freqs[0]:.1f}Hz" if elastic_freqs else "F1=--"
             converged = change < tol
             stop_req  = stop_event and stop_event.is_set()
 
-            # 상단: "  ┌─ Iter NNN " = 14 cols, dashes = 76-14-1=61, "┐"
             obj_tag = (f"[{self.obj_type}{'·N' if self.normalize_obj else ''}]"
                        if self.obj_type != 'sum' or self.normalize_obj else "")
             print(f"\n  ┌─ Iter {i:03d} {'─' * (_SW - 15)}┐")
-            print(f"  │  C={C_total:.4e}  f0={f0val:.4f}{obj_tag}"
+            print(f"     C={C_total:.4e}  f0={f0val:.4f}{obj_tag}"
                   f"   {f1_str}   Avg_h={np.mean(x*self.h_max):.2f}mm   dx={change:.4f}")
             for name, res in C_responses.items():
-                print(f"  │  [{name:28s}]  U={0.5*res['C']:.3e}J"
+                print(f"     [{name:28s}]  U={0.5*res['C']:.3e}J"
                       f"  u={res['max_disp']:.1f}mm  sv={res['max_stress']:.0f}MPa")
             if len(elastic_freqs) >= 3:
                 freq_str = "  ".join(f"f{k+1}={elastic_freqs[k]:.1f}Hz"
                                      for k in range(min(5, len(elastic_freqs))))
-                print(f"  │  Freq: {freq_str}")
+                print(f"     Freq: {freq_str}")
             if converged:
-                print(f"  │  >> Converged  (dx={change:.2e} < tol={tol:.2e})")
+                print(f"     >> Converged  (dx={change:.2e} < tol={tol:.2e})")
             elif stop_req:
-                print(f"  │  >> Stop requested")
-            # 하단: "  └"(3) + dashes(_SW-4=72) + "┘"(1) = 76
+                print(f"     >> Stop requested")
             print(f"  └{'─' * (_SW - 4)}┘")
 
             if converged or stop_req:
@@ -1505,7 +1813,35 @@ class WHTopographySolver:
         self._restore_heights()
         # 최종 결과도 투사 적용
         self.heights = self._project_x(x, self._beta) * self.h_max
+
+        # 수렴 설계를 레퍼런스로 등록 (다음 solve() 호출 시 반발 대상)
+        if self.diversity_weight > 0:
+            self._reference_designs.append(x.copy())
+            print(f" -> [Diversity] 설계 #{len(self._reference_designs)} 등록 "
+                  f"(총 레퍼런스 {len(self._reference_designs)}개)")
+
         return self.heights
+
+    def reset_for_next_design(self, noise: float = 0.15):
+        """
+        다음 설계 탐색을 위해 설계 변수를 초기화합니다.
+        이전 수렴 결과에 noise를 주입해 다른 로컬 최적해로 유도합니다.
+
+        Parameters
+        ----------
+        noise : float
+            랜덤 노이즈 강도 [0, 1]. 기본 0.15.
+        """
+        self.mma = MMAOptimizer(n_vars=self._n_design, vol_frac=self.h_ratio)
+        self._beta = 1.0
+        # 이전 수렴 설계 + 노이즈에서 재시작
+        if self._reference_designs:
+            x_last = self._reference_designs[-1].copy()
+            x_new  = x_last + noise * np.random.randn(self._n_design)
+            self.heights = np.clip(x_new, 0.0, 1.0) * self.h_max
+        else:
+            self.heights = np.full(self._n_design, 0.01) * self.h_max
+        print(f" -> [Diversity] 설계 변수 초기화 완료 (noise={noise:.2f})")
 
     def apply_final_shape(self, skip_filter: bool = False):
         """

@@ -66,11 +66,13 @@ class _ReAnalysisWorker(QThread):
     error    = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, snap_dir: str, iter_num: int, case_name: str, parent=None):
+    def __init__(self, snap_dir: str, iter_num: int, case_name: str,
+                 num_modal_modes: int = 20, parent=None):
         super().__init__(parent)
-        self.snap_dir  = snap_dir
-        self.iter_num  = iter_num
-        self.case_name = case_name
+        self.snap_dir         = snap_dir
+        self.iter_num         = iter_num
+        self.case_name        = case_name
+        self.num_modal_modes  = num_modal_modes
 
     def run(self):
         try:
@@ -125,7 +127,7 @@ class _ReAnalysisWorker(QThread):
             # ── 모달 해석 ──────────────────────────────────────────────────
             if self.case_name == "Modal Analysis":
                 self.progress.emit("고유진동수 해석 실행 중...")
-                result = fea.solve_modal(num_modes=10)
+                result = fea.solve_modal(num_modes=self.num_modal_modes)
                 self.finished.emit({
                     "type":   "modal",
                     "result": result,
@@ -345,13 +347,14 @@ def _write_optistruct_fem(out_path: str, snap_dir: str, iter_num: int) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 
 class WHTMonitorWindow(QMainWindow):
-    def __init__(self, stop_event=None, results_dir: str = ""):
+    def __init__(self, stop_event=None, results_dir: str = "", num_modal_modes: int = 20):
         super().__init__()
         self.setWindowTitle("WHT Topography Optimization Monitor (V3.0)")
         self.resize(1300, 900)
-        self.stop_event  = stop_event
-        self.results_dir = results_dir   # out_dir 전달받음 (snap_dir 동적 갱신 가능)
-        self.snap_dir    = ""            # solver 콜백에서 수신
+        self.stop_event       = stop_event
+        self.results_dir      = results_dir
+        self.snap_dir         = ""
+        self.num_modal_modes  = num_modal_modes
 
         # ── 데이터 저장소 ──────────────────────────────────────────────────
         self.history = {
@@ -553,12 +556,11 @@ class WHTMonitorWindow(QMainWindow):
 
     def _build_tab_modal(self):
         tab = QWidget(); lay = QVBoxLayout(tab)
-        self.modal_table = QTableWidget(10, 3)
-        self.modal_table.setHorizontalHeaderLabels(
-            ["Mode", "Ref. (Hz)", "Current (Hz)"]
-        )
+        n = self.num_modal_modes
+        self.modal_table = QTableWidget(n, 2)
+        self.modal_table.setHorizontalHeaderLabels(["Mode", "Ref. (Hz)"])
         self.modal_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        for i in range(10):
+        for i in range(n):
             self.modal_table.setItem(i, 0, QTableWidgetItem(f"Mode {i+1}"))
         lay.addWidget(self.modal_table)
         self.tabs.addTab(tab, "Modal Analysis")
@@ -650,8 +652,9 @@ class WHTMonitorWindow(QMainWindow):
             if self.ref_freqs is None and freqs:
                 self.ref_freqs = freqs
                 if self.modal_table:
+                    n = self.modal_table.rowCount()
                     for i, f in enumerate(freqs):
-                        if i < 10:
+                        if i < n:
                             self.modal_table.setItem(
                                 i, 1, QTableWidgetItem(f"{f:.2f}")
                             )
@@ -745,11 +748,20 @@ class WHTMonitorWindow(QMainWindow):
                     c_off += 3
                 self.table.scrollToBottom()
 
-            # ── Modal 테이블 갱신 ─────────────────────────────────────────
+            # ── Modal 테이블 갱신: 이터레이션마다 열 추가 ────────────────────
             if self.modal_table and freqs:
+                n_rows = self.modal_table.rowCount()
+                col = self.modal_table.columnCount()
+                self.modal_table.insertColumn(col)
+                self.modal_table.setHorizontalHeaderItem(
+                    col, QTableWidgetItem(f"Iter {it}")
+                )
                 for i, f in enumerate(freqs):
-                    if i < 10:
-                        self.modal_table.setItem(i, 2, QTableWidgetItem(f"{f:.2f}"))
+                    if i < n_rows:
+                        self.modal_table.setItem(
+                            i, col, QTableWidgetItem(f"{f:.2f}")
+                        )
+                self.modal_table.scrollToBottom()
 
             self._update_curves()
             self._update_height_plot()
@@ -1107,7 +1119,8 @@ class WHTMonitorWindow(QMainWindow):
         if self.iter_run_btn:
             self.iter_run_btn.setEnabled(False)
 
-        self._re_worker = _ReAnalysisWorker(self.snap_dir, iter_num, case_name)
+        self._re_worker = _ReAnalysisWorker(self.snap_dir, iter_num, case_name,
+                                             num_modal_modes=self.num_modal_modes)
         self._re_worker.progress.connect(lambda msg: self._set_iter_status(msg, "blue"))
         self._re_worker.finished.connect(self._on_analysis_finished)
         self._re_worker.error.connect(self._on_analysis_error)
@@ -1205,18 +1218,21 @@ class MonitorDataHandler(QObject):
     data_received = Signal(dict)
 
 
-def start_monitor_ui(queue, stop_event=None, results_dir: str = ""):
+def start_monitor_ui(queue, stop_event=None, results_dir: str = "",
+                     num_modal_modes: int = 20):
     """
     별도 프로세스에서 PySide6 UI를 실행합니다.
 
     Parameters
     ----------
-    queue       : multiprocessing.Queue  — 솔버 → 모니터 데이터 큐
-    stop_event  : multiprocessing.Event  — GUI 종료 시 솔버에 중단 신호
-    results_dir : str                    — out_dir 경로 (OptiStruct 저장 기본 경로)
+    queue            : multiprocessing.Queue  — 솔버 → 모니터 데이터 큐
+    stop_event       : multiprocessing.Event  — GUI 종료 시 솔버에 중단 신호
+    results_dir      : str                    — out_dir 경로 (OptiStruct 저장 기본 경로)
+    num_modal_modes  : int                    — 모달 해석 모드 수 (기본: 10)
     """
     app    = QApplication.instance() or QApplication(sys.argv)
-    window = WHTMonitorWindow(stop_event=stop_event, results_dir=results_dir)
+    window = WHTMonitorWindow(stop_event=stop_event, results_dir=results_dir,
+                              num_modal_modes=num_modal_modes)
     window.show()
 
     class Receiver(QThread):

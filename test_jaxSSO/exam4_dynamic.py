@@ -5,15 +5,15 @@ exam4_dynamic.py — 대회전 대응 동적 해석 및 Diversity-aware ESL 추�
 
 [해석 파이프라인]
   [1] 메시 생성 (generate_shell_tray)
-  [2] 코너 노드 탐색 (find_corner_nodes, 반경 100mm, z ≤ 2mm)
+  [2] 코너 노드 탐색 (find_corner_nodes, 반경 100mm, z <= 2mm)
   [3] 하중 그룹 구성
-      CSV 모드: 로컬 Z 변위 SPCD (마스터 노드 + RBE3) + 관성 하중 F=-ma (선택)
+      CSV 모드: Kabsch body-frame 3-DOF SPCD (마스터 노드 + RBE3) + 관성 하중 F=-ma (선택)
       합성 모드: Half-sine 4코너 시차 SPCD
-  [4] Direct Newmark-β 과도 응답 해석 (ζ=2%)
+  [4] Direct Newmark-beta 과도 응답 해석 (zeta=2%)
   [5] 응력·변형률 이력 복원
   [6] ParaView HDF 저장
   [7] ESL 추출 및 정해석 검증 (--esl 지정 시)
-      [7-1] SE 이력 계산 (½uᵀKu)
+      [7-1] SE 이력 계산 (1/2 u^T K u)
       [7-2] 윈도우별 SE 테이블 출력
       [7-3] Top-N Diversity-aware ESL 요약 테이블
       [7-4] 전체 ESL 케이스 정해석 수행
@@ -50,7 +50,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -62,9 +62,11 @@ from wht_modeler.wht_dynamic_utils import (
     find_corner_nodes,
     find_nodes_for_corners,
     parse_csv_header,
-    calculate_local_z_history,
-    calculate_corner_accelerations,
     InterpLoadGroup,
+    KabschPreprocessor,
+    compute_vk_inertia_scale,
+    print_vk_scale_report,
+    compute_inertia_scale_via_fem,
 )
 from wht_converter.wht_models import WHTMetadata, WHTResultData
 from wht_converter.wht_exporters import VTKHDFExporter
@@ -115,6 +117,7 @@ class DynamicAnalysisPipeline:
     csv_df      : pd.DataFrame | None — t_start 필터 적용된 CSV
     time_arr    : np.ndarray  | None  — 0-based 상대 시간 배열 (s)
     load_groups : list                — DynamicLoadGroup / InterpLoadGroup 목록
+    kabsch      : KabschPreprocessor  — Kabsch 전처리 결과 (R_arr, T_arr 포함)
     solver      : WHTDynamicSolver    — 동적 해석기
     dyn         : DynamicResult       — 과도 응답 결과
     wht_data    : WHTResultData       — ParaView 내보내기용 결과
@@ -127,18 +130,20 @@ class DynamicAnalysisPipeline:
     def __init__(self, cfg):
         self.cfg = cfg
 
-        # 단계별 출력 (run() 실행 전 None)
+        stamp = datetime.now().strftime("D%Y%m%d_%H%M%S")
+        self.out_dir          : Path                         = Path(__file__).resolve().parent.parent / "results" / stamp
+
         self.model            : Optional[WHTMeshModel]       = None
         self.node_db          : Optional[dict]               = None
-        self.bot_groups       : Optional[list]               = None  # [(name, [nids]), ...]
+        self.bot_groups       : Optional[list]               = None
         self.csv_df           : Optional[pd.DataFrame]       = None
         self.csv_header       : dict                         = {}
         self.time_arr         : Optional[np.ndarray]         = None
         self.load_groups      : List                         = []
+        self.kabsch           : Optional[KabschPreprocessor] = None
         self.solver           : Optional[WHTDynamicSolver]   = None
         self.dyn              : Optional[DynamicResult]      = None
         self.wht_data         : Optional[WHTResultData]      = None
-        self.out_dir          : Optional[Path]               = None
         self.esl_cases        : Optional[List[WHTLoadCase]]  = None
         self.static_wht_data  : Optional[WHTResultData]      = None
         self.all_static_times : Optional[List[float]]        = None
@@ -171,10 +176,8 @@ class DynamicAnalysisPipeline:
             csv_path = Path.cwd() / csv_path
         print(f" [0] CSV 로드: {csv_path}")
 
-        # # 주석 헤더 파싱 (코너 좌표, start_time)
         self.csv_header = parse_csv_header(str(csv_path))
 
-        # t_start: CLI 인자 > CSV 헤더 > 0.0
         t_start_cli = getattr(self.cfg, 't_start', None)
         t_start = (t_start_cli if t_start_cli is not None
                    else self.csv_header.get('start_time') or 0.0)
@@ -232,7 +235,6 @@ class DynamicAnalysisPipeline:
                 cx, cy, cz = c5c8[name]
                 print(f"     {name} (ref {cx:+.0f},{cy:+.0f},{cz:+.0f}): {len(nids)}개 노드")
         else:
-            # CSV 없거나 헤더에 코너 좌표 없으면 메시 기하 기반 탐색으로 fallback
             raw = find_corner_nodes(self.node_db, WIDTH, LENGTH, CORNER_RADIUS, z_min=0.0, z_max=2.0)
             self.bot_groups = [(CORNER_MAP[i], g[1]) for i, g in enumerate(raw)]
             print(f"     [WARN] CSV 헤더 코너 좌표 없음 → 메시 기하 기반 탐색 사용")
@@ -247,69 +249,93 @@ class DynamicAnalysisPipeline:
             self._build_load_groups_halfsine()
 
     def _build_load_groups_csv(self) -> None:
-        """CSV 궤적 기반 SPCD + 관성 하중 그룹을 구성합니다."""
-        if self.cfg.use_global_z:
-            print(" [3] 글로벌 Z 변위 직접 인가")
-            corner_z, traj_mm = self._extract_global_z()
-        else:
-            print(" [3] 로컬 Z 변위 추출 (Large Rotation 대응)")
-            corner_z, traj_mm = calculate_local_z_history(self.csv_df, self.time_arr)
+        """Kabsch body-frame 3-DOF SPCD + 관성 하중 그룹을 구성합니다."""
+        header_corners = self.csv_header.get('corner_positions', {})
+        corner_positions = {k: v for k, v in header_corners.items()
+                            if k in ('C5', 'C6', 'C7', 'C8')} or None
 
-        # 마스터 노드 + RBE3 + SPCD
+        contact_thr = getattr(self.cfg, 'contact_threshold', 24516.6)
+        print(" [3] Kabsch 전처리 (body-frame 3-DOF 변형 추출)...")
+
+        diag_base = str(self.out_dir / "kabsch_diag")
+        self.kabsch = KabschPreprocessor(
+            contact_accel_threshold=contact_thr,
+        ).fit(
+            self.csv_df, self.time_arr,
+            corner_positions=corner_positions,
+            corner_labels=list(CORNER_MAP.values()),
+            diag_save_paths=[diag_base],
+        )
+
+        # 마스터 노드 + RBE3 + 3-DOF SPCD (X, Y, Z)
         for idx, (cname, corner_nids) in enumerate(self.bot_groups):
             pts    = np.array([self.model.nodes[nid].coords() for nid in corner_nids])
             center = np.mean(pts, axis=0)
             mnid   = 900000 + idx
             self.model.add_node(mnid, center[0], center[1], center[2])
             self.model.add_rbe3(mnid, mnid, corner_nids, dofs=(0, 1, 2))
-            self.load_groups.append(InterpLoadGroup(
-                node_ids=[mnid], dof=2,
-                time_arr=self.time_arr, val_arr=corner_z[cname],
-                load_type="SPCD",
-            ))
+            d = self.kabsch.deformation.get(cname)
+            if d is None:
+                continue
+            for dof_idx, dof in enumerate([0, 1, 2]):
+                self.load_groups.append(InterpLoadGroup(
+                    node_ids=[mnid], dof=dof,
+                    time_arr=self.time_arr, val_arr=d[:, dof_idx],
+                    load_type="SPCD",
+                ))
 
         if self.cfg.add_inertia:
-            self._add_inertia_loads(traj_mm)
+            self._add_inertia_loads()
 
-        # 강체 이동 방지: C5 첫 번째 슬레이브 노드의 X, Y 고정
-        self.model.apply_spc([self.bot_groups[0][1][0]], dofs=(0, 1))
-
-    def _extract_global_z(self) -> Tuple[dict, np.ndarray]:
-        """CSV에서 글로벌 Z 상대 변위와 (T,4,3) 궤적을 추출합니다."""
-        n = len(self.time_arr)
-        traj_mm = np.zeros((n, 4, 3))
-        for i, lbl in enumerate(CORNER_MAP.values()):
-            for j, ax in enumerate(['X', 'Y', 'Z']):
-                col = (f"{lbl}_{ax}" if f"{lbl}_{ax}" in self.csv_df.columns
-                       else f"{lbl}_pos_{ax}")
-                if col in self.csv_df.columns:
-                    traj_mm[:, i, j] = self.csv_df[col].to_numpy(dtype=float) * 1000.0
-        corner_z = {lbl: traj_mm[:, i, 2] - traj_mm[0, i, 2]
-                    for i, lbl in enumerate(CORNER_MAP.values())}
-        return corner_z, traj_mm
-
-    def _add_inertia_loads(self, traj_mm: np.ndarray) -> None:
+    def _add_inertia_loads(self) -> None:
         """
-        이선형 보간으로 모든 내부 노드에 관성 하중 F = -m·a 를 인가합니다.
+        모든 내부 노드에 관성 하중 F = -m·a 를 인가합니다.
 
-        가속도는 4코너 Z 궤적의 2차 미분이며, 노드 위치에 따라
-        (C5, C6, C7, C8) 코너값을 이선형 보간합니다.
+        가속도는 Kabsch T_arr(강체 평행이동, world-frame) 2차 미분을 body-frame으로
+        변환한 Z성분을 사용합니다. 강체 가속도는 공간적으로 균일하므로 bilinear 보간
+        없이 모든 노드에 동일하게 적용합니다.
         """
-        print(" [4] 관성 하중 생성 중 (F=-ma, 이선형 보간)...")
-        dt_csv = self.time_arr[1] - self.time_arr[0]
-        accels = calculate_corner_accelerations(traj_mm, dt_csv)  # (T, 4)
+        print(" [4] 관성 하중 생성 중 (F=-ma, 강체 가속도 body-frame Z)...")
+        # world-frame 강체 가속도: 코너 accel_arr 평균 (T, 3)
+        a_world = self.kabsch.accel_arr.mean(axis=1)   # (T, 3)
+        # body-frame 변환: a_body[t] = R[t].T @ a_world[t]
+        a_body = np.einsum('tji,tj->ti', self.kabsch.R_arr, a_world)
+        a_body_z = a_body[:, 2]  # (T,) body-frame Z 강체 가속도
 
-        all_pts = np.array([self.model.nodes[nid].coords()
-                            for nid in self.model.nodes if nid < 900000])
-        x_min, x_max = all_pts[:, 0].min(), all_pts[:, 0].max()
-        y_min, y_max = all_pts[:, 1].min(), all_pts[:, 1].max()
-        dx = max(x_max - x_min, 1.0)
-        dy = max(y_max - y_min, 1.0)
+        peak_g = float(np.max(np.abs(a_body_z))) / 9806.65
+        rms_g  = float(np.sqrt(np.mean(a_body_z**2))) / 9806.65
+        print(f"     강체 가속도 (body Z): peak={peak_g:.1f} g  RMS={rms_g:.1f} g")
 
-        # 집중 질량 조립
         temp = WHTDynamicSolver(self.model)
         jm, s_nids, n2i = temp._build_jaxsso_model()
         m_diag = temp._assemble_lumped_mass(jm, jm.ndof, s_nids, n2i)
+
+        total_mass = sum(
+            m_diag[n2i[nid] * 6 + 2]
+            for nid in self.model.nodes
+            if nid < 900000 and n2i.get(nid) is not None
+            and m_diag[n2i[nid] * 6 + 2] > 0
+        )
+        print(f"     총 질량 (lumped): {total_mass*1e3:.3f} kg")
+
+        # Von Kármán 비선형 목표 처짐 계산
+        _, _, w_NL, vk_info = compute_vk_inertia_scale(
+            E=MAT['E'], nu=MAT['nu'], t=MAT['t'],
+            plate_a=WIDTH, plate_b=LENGTH,
+            total_mass=total_mass, a_body_z=a_body_z,
+        )
+        print_vk_scale_report(vk_info)
+
+        # FEM 역산: 코너 고정 정해석으로 실제 구조 강성 기반 보정계수 계산
+        corner_nids = [nid for _, nids in self.bot_groups for nid in nids]
+        fem_scale, w_FEM = compute_inertia_scale_via_fem(
+            model=self.model,
+            corner_nids=corner_nids,
+            n2i=n2i, m_diag=m_diag,
+            a_body_z=a_body_z,
+            w_NL_target=w_NL,
+        )
+        a_body_z_scaled = a_body_z * fem_scale
 
         n_inertia = 0
         for nid in self.model.nodes:
@@ -318,27 +344,17 @@ class DynamicAnalysisPipeline:
             idx = n2i.get(nid)
             if idx is None:
                 continue
-            node = self.model.nodes[nid]
-            nx = (node.x - x_min) / dx
-            ny = (node.y - y_min) / dy
-            # 이선형 형상함수: C5(+X+Y), C6(+X-Y), C7(-X-Y), C8(-X+Y)
-            a_z = (
-                accels[:, 0] * (nx)     * (ny)      +  # C5
-                accels[:, 1] * (nx)     * (1 - ny)  +  # C6
-                accels[:, 2] * (1 - nx) * (1 - ny)  +  # C7
-                accels[:, 3] * (1 - nx) * (ny)         # C8
-            )
             node_mass = m_diag[idx * 6 + 2]
             if node_mass > 0:
                 self.load_groups.append(InterpLoadGroup(
-                    [nid], 2, self.time_arr, -node_mass * a_z, load_type="FORCE"
+                    [nid], 2, self.time_arr, -node_mass * a_body_z_scaled, load_type="FORCE"
                 ))
                 n_inertia += 1
         print(f"     -> {n_inertia}개 노드에 관성 하중 인가 완료.")
 
     def _build_load_groups_halfsine(self) -> None:
         """합성 Half-sine SPCD 하중을 구성합니다 (CSV 미지정 시)."""
-        for i, (_, slave_nids) in enumerate(self.bot_groups):  # noqa: _ unused corner name
+        for i, (_, slave_nids) in enumerate(self.bot_groups):
             self.load_groups.append(DynamicLoadGroup(
                 node_ids  = slave_nids,
                 dof       = 2,
@@ -354,12 +370,12 @@ class DynamicAnalysisPipeline:
     # ── 단계 5: 동해석 ───────────────────────────────────────────────────────
 
     def _run_dynamic(self) -> None:
-        """Newmark-β 직접 적분 과도 응답 해석을 수행합니다."""
+        """Newmark-beta 직접 적분 과도 응답 해석을 수행합니다."""
         dt_val      = (self.cfg.dt if self.cfg.dt else DT)
         t_total_val = (float(self.time_arr[-1]) if self.time_arr is not None else T_TOTAL)
         n_save_val  = (N_SAVE_CSV if self.csv_df is not None else N_SAVE)
 
-        print(f"\n [4] Direct Newmark-β 동해석 (dt={dt_val:.1e}s, T={t_total_val:.3f}s)...")
+        print(f"\n [4] Direct Newmark-beta 동해석 (dt={dt_val:.1e}s, T={t_total_val:.3f}s)...")
         self.solver = WHTDynamicSolver(self.model)
         self.dyn = self.solver.solve_direct_dynamic(
             load_groups = self.load_groups,
@@ -389,9 +405,7 @@ class DynamicAnalysisPipeline:
         )
         self.wht_data = self.dyn.to_wht_result_data(meta, self.model)
 
-        stamp        = datetime.now().strftime("D%Y%m%d_%H%M%S")
-        self.out_dir = Path(__file__).resolve().parent.parent / "results" / stamp
-        pv_dir       = self.out_dir / "paraview"
+        pv_dir = self.out_dir / "paraview"
         pv_dir.mkdir(parents=True, exist_ok=True)
 
         hdf_path = str(pv_dir / "dynamic_result.hdf")
@@ -401,10 +415,6 @@ class DynamicAnalysisPipeline:
     # ── 단계 8: ESL 추출 및 정해석 검증 ─────────────────────────────────────
 
     def _extract_esl(self) -> None:
-        """
-        SE 이력 계산 → 윈도우 테이블 → Top-N ESL 선정 → 정해석 수행을
-        순서대로 실행하고 결과를 인스턴스 속성에 저장합니다.
-        """
         n_win = self.cfg.n_windows
         n_top = self.cfg.n_top
 
@@ -420,7 +430,7 @@ class DynamicAnalysisPipeline:
         self._run_static_verification(n_top)
 
     def _compute_se_history(self) -> np.ndarray:
-        """전체 저장 프레임에 대해 변형 에너지 SE = ½uᵀKu 를 계산합니다."""
+        """전체 저장 프레임에 대해 변형 에너지 SE = 1/2 u^T K u 를 계산합니다."""
         print("\n [7-1] 변형 에너지 이력 계산 중...")
         jm, s_nids, n2i = self.solver._build_jaxsso_model()
         K   = self.solver._assemble_K_scipy(jm, s_nids, n2i, stabilize=True)
@@ -467,10 +477,6 @@ class DynamicAnalysisPipeline:
         print(pd.DataFrame(rows).to_string(index=False, float_format=lambda x: f"{x:.4e}"))
 
     def _run_static_verification(self, n_top: int) -> None:
-        """
-        모든 ESL 케이스에 대해 정해석 및 응력 복원을 수행하고
-        `self.static_wht_data` 와 `self.all_static_times` 에 결과를 저장합니다.
-        """
         from wht_solver.wht_solver import WHTSolver
         from wht_solver.wht_stress_recovery import ElementStressRecovery
 
@@ -501,7 +507,6 @@ class DynamicAnalysisPipeline:
             unit_length="mm", unit_force="N",
         )
         rd = self.model.to_wht_result_data(static_meta)
-        # time_values에 Rank 번호를 할당하여 시각화 슬라이더와 연동
         rd.time_values = np.arange(1, len(times) + 1, dtype=float)
         rd.point_data["Displacement"] = np.stack(disps,    axis=0)[:, :, :3]
         rd.cell_data["Stress"]        = np.stack(stresses, axis=0)
@@ -525,7 +530,8 @@ class DynamicAnalysisPipeline:
         print(" [7] WHTVisualizer 실행...")
         title = "Exam 4: CSV Pos Dynamic" if self.cfg.pos_data else "Exam 4: Half-Sine Dynamic"
         viz   = WHTVisualizer(title=title)
-        viz.show_result(self.wht_data, group_name="DynamicTray")
+        viz.show_result(self.wht_data, group_name="DynamicTray",
+                        kabsch=self.kabsch)
         viz.plotter.view_isometric()
         viz.plotter.reset_camera()
         if hasattr(viz.plotter, 'app'):
@@ -542,7 +548,8 @@ class DynamicAnalysisPipeline:
         viz_dyn = WHTVisualizer(
             title=f"Dynamic Analysis (Focus: Rank 1 Peak t={t_esl_top:.4f}s)"
         )
-        viz_dyn.show_result(self.wht_data, group_name="Dynamic_Tray")
+        viz_dyn.show_result(self.wht_data, group_name="Dynamic_Tray",
+                            kabsch=self.kabsch)
         viz_dyn.slider_time.setValue(idx_esl_top)
         viz_dyn.plotter.view_isometric()
 
@@ -582,106 +589,80 @@ if __name__ == "__main__":
 [권장] 실측 CSV + 관성 하중 + ESL 추출 (낙하 충격 표준 분석)
   python test_jaxSSO/exam4_dynamic.py --pos-data test_jaxSSO/structural_dynamics.csv
   -> t_start: CSV 헤더 start_time 자동 적용
-  -> 관성 하중 활성 (기본), ESL 10개 추출 및 정해석 검증 포함
+  -> Kabsch body-frame 3-DOF SPCD, 관성 하중 활성, ESL 10개 추출
 
 [권장] 충격 시작점 명시 + ESL 개수 확대 (고정밀 분석)
   python test_jaxSSO/exam4_dynamic.py --pos-data test_jaxSSO/structural_dynamics.csv --t-start 1.6 --n-windows 50 --n-top 15
-  -> t_start 1.6s 이전의 준정적 구간을 제외하고 충격 구간만 분석
-  -> 50개 창으로 더 촘촘히 피크 후보를 탐색, 상위 15개 ESL 선정
 
 [빠른 확인] ESL 검증 생략 (동적 거동 파형만 빠르게 확인)
   python test_jaxSSO/exam4_dynamic.py \\
     --pos-data test_jaxSSO/structural_dynamics.csv \\
     --no-verify
-  -> 정해석 및 듀얼 시각화 없이 동해석 + ParaView HDF 저장만 수행
 
-[비교 분석] 로컬 프레임 vs 글로벌 Z 변위 비교
-  python test_jaxSSO/exam4_dynamic.py \\
-    --pos-data test_jaxSSO/structural_dynamics.csv \\
-    --use-global-z --no-verify
-  -> 강체 회전 제거 없이 글로벌 Z 궤적 직접 인가 (차이 확인용)
-
-[순수 변위 응답] 관성 하중 제외 (SPCD 경계 조건 응답만)
+[순수 변위 응답] 관성 하중 제외
   python test_jaxSSO/exam4_dynamic.py \\
     --pos-data test_jaxSSO/structural_dynamics.csv \\
     --no-inertia
-  -> F=-ma 관성 분포 하중 없이 코너 변위 BC만으로 응답 계산
-  -> 관성 하중 기여도 파악 목적 (결과를 --add-inertia 케이스와 비교)
 
 [알고리즘 검증] CSV 없이 합성 Half-sine 모드
   python test_jaxSSO/exam4_dynamic.py --no-verify
-  -> 4코너에 시차(5ms) Half-sine 변위 SPCD 적용
-  -> 실측 데이터 없이 ESL 파이프라인 자체 동작 검증
 
 [서버/헤드리스] GUI 없이 결과 파일만 저장
   python test_jaxSSO/exam4_dynamic.py \\
     --pos-data test_jaxSSO/structural_dynamics.csv \\
     --no-verify --no-viz
-  -> 시각화 창 없이 ParaView HDF만 results/ 에 저장
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 옵션 상세 설명
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --pos-data      실측 4코너(C5~C8) 위치 CSV 경로.
                 미지정 시 합성 Half-sine SPCD 모드로 동작.
-                CSV 형식: # 주석 헤더(코너 좌표·start_time) + Frame,Time,C1_X...C8_Z
 
 --t-start       CSV 분석 시작 시점(s).
                 미지정 시 CSV 헤더의 "# start_time, X.X" 값을 자동 적용.
-                헤더에도 없으면 0.0 (전체 구간 사용).
 
 --add-inertia   CSV 궤적 2차 미분(가속도) 기반 F=-ma 관성 하중 계산.
   (기본: ON)    이선형 보간으로 모든 내부 노드에 분포 인가.
-                낙하·충격처럼 가속도 기여가 큰 하중 케이스에 반드시 사용.
 
 --no-inertia    관성 하중 제외 (순수 변위 SPCD 응답만 분석).
 
 --esl           동해석 완료 후 ESL 추출 및 정해석 비교 검증 수행.
-  (기본: ON)    SE 이력 → 윈도우 테이블 → Top-N 요약 → 정해석 → 듀얼 시각화
+  (기본: ON)
 
---no-verify     ESL 추출 및 검증 생략 (동적 거동·파형 확인만).
+--no-verify     ESL 추출 및 검증 생략.
 
---n-windows     SE 이력을 분할하는 시간 창 수. 클수록 피크 후보를 촘촘히 탐색.
-                기본: 30. 권장: 짧은 충격 구간 → 20, 긴 진동 구간 → 50
+--n-windows     SE 이력 분할 창 수. 기본: 30.
 
---n-top         최종 선정할 Diversity-aware ESL 개수.
-                기본: 10. 최적화 정밀도↑ 원할 때 15~20 사용 (계산 시간 증가).
-
---use-global-z  로컬 프레임 투영 대신 글로벌 Z 궤적 직접 사용.
-                강체 회전이 거의 없는 경우 또는 비교 분석 목적으로만 사용.
+--n-top         최종 선정 ESL 개수. 기본: 10.
 
 --solver-method scipy(기본) 또는 jax.
-                scipy: 소규모·범용. jax: 대규모 모델 고속 GPU 처리.
+
+--contact-threshold  Kabsch 충격 임계 가속도 [mm/s^2]. 기본: 24517 (약 2.5g).
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
     )
 
-    # CSV 및 해석 설정
     parser.add_argument("--pos-data",      type=str,   default="wht_topo/sample_pos.csv",
-                        help="실측 위치 데이터 CSV 경로 (기본: wht_topo/sample_pos.csv)")
+                        help="실측 위치 데이터 CSV 경로")
     parser.add_argument("--dt",            type=float, default=None,
                         help="시간 적분 간격 s (기본: 2e-4)")
     parser.add_argument("--t-start",       type=float, default=None,
-                        help="CSV 분석 시작 시점 s (기본: CSV 헤더 start_time 자동 적용)")
+                        help="CSV 분석 시작 시점 s")
     parser.add_argument("--solver-method", type=str,   default="scipy",
                         choices=["scipy", "jax"],
                         help="동적 해석 솔버 (기본: scipy)")
+    parser.add_argument("--contact-threshold", type=float, default=24516.6,
+                        dest="contact_threshold",
+                        help="Kabsch 충격 임계 가속도 mm/s^2 (기본: 24517 = ~2.5g)")
 
-    # 관성 하중
-    parser.add_argument("--add-inertia",   action="store_true", default=True,
-                        help="관성 하중(-ma) 인가 (기본: 활성)")
+    parser.add_argument("--add-inertia",   action="store_true", default=False,
+                        help="관성 하중(-ma) 인가 (기본: 비활성)")
     parser.add_argument("--no-inertia",    action="store_false", dest="add_inertia",
                         help="관성 하중 제외")
 
-    # 변위 모드
-    parser.add_argument("--use-global-z",  action="store_true",
-                        help="글로벌 Z 궤적 직접 사용 (기본: 로컬 프레임 투영)")
-
-    # 시각화
     parser.add_argument("--no-viz",        action="store_true",
                         help="시각화 GUI 생략")
 
-    # ESL 추출 및 검증
     parser.add_argument("--esl",           action="store_true", default=True,
                         help="ESL 추출 및 정해석 검증 (기본: 활성)")
     parser.add_argument("--no-verify",     action="store_false", dest="esl",

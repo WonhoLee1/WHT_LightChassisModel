@@ -1,4 +1,29 @@
 # -*- coding: utf-8 -*-
+'''
+# 여기는 삭제, 변경하지 않는다.
+
+#모드 B | CSV 단독 동적 응답 해석 (최적화 생략)
+
+python wht_topo/run_topo.py --pos-data wht_topo\structural_dynamics_c235.csv --add-inertia
+python wht_topo/run_topo.py --pos-data wht_topo\structural_dynamics_c235.csv --add-inertia --use-global-z
+
+
+#모드 D
+python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics_rear.csv"  "wht_topo/structural_dynamics_c125.csv" "wht_topo/structural_dynamics_c235.csv" --add-inertia --sym-x --bead-connect 140 --height-steps 1 
+
+
+# MST 방식 - 모든 섬을 Bresenham 직선으로 강제 연결
+python wht_topo/run_topo.py ... --bead-connect 140 --bead-connect-alg mst
+
+# Geodesic - 기존 비드를 최대 활용하는 자연스러운 경로
+python wht_topo/run_topo.py ... --bead-connect 140 --bead-connect-alg geodesic
+
+# Hybrid - closing으로 좁은 갭 먼저, 남은 섬은 MST로 처리
+python wht_topo/run_topo.py ... --bead-connect 140 --bead-connect-alg hybrid
+
+
+'''
+
 """
 run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
 ================================================================
@@ -52,10 +77,10 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
     폴더 구조:
       /input/
         topo_arg.txt              ← 기본 옵션 설정 (argparse 형식, # 주석 지원)
-        scenario_A/
-          chassis_corners.csv     ← --dynamic-opts 항목으로 자동 등록
+        scenario_A/               ← 폴더명이 loadcase 이름으로 사용됨
+          motion_data.csv         ← 폴더 안의 첫 번째 .csv 파일을 자동 탐색
         scenario_B/
-          chassis_corners.csv
+          bumpy_road.csv
         ...
     실행: python wht_topo/run_topo.py --input-dir /path/to/input
     우선순위: 명령줄 인자 > topo_arg.txt > 자동 발견 CSV
@@ -136,8 +161,10 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
 
 [동적 ESL 알고리즘 — 시간분할 스냅샷 (--w-dynamic)]
   1. CSV에서 [t_start, t_end] 구간 추출 (t_start: 인자 > CSV 헤더 > 0.0 우선순위).
-  2. 강체 회전 제거 → 로컬 Z 방향 순수 벤딩 변위 분리 (calculate_local_z_history).
-  3. 4코너 마스터 노드(#900000~900003) + RBE3 → Z-SPCD 하중 그룹 구성.
+  2. Kabsch 알고리즘(SVD)으로 강체 병진·회전 제거 → body-frame 3D 변형량 추출.
+     충격 임펄스 순간(상대 Z가속도 > --contact-threshold)의 코너는 fit에서 제외.
+     진단 그래프(X/Y/Z 방향 7행) → results 폴더 + CSV 폴더 동시 저장.
+  3. 4코너 마스터 노드(#900000~900003) + RBE3 → X/Y/Z 3-DOF SPCD 하중 그룹 구성.
      CSV # 헤더의 C5~C8 좌표로 가장 가까운 FEM 노드 3개씩 자동 탐색.
   4. (옵션 --add-inertia) 이선형 보간 + 집중 질량 → 관성 하중(F=-ma) 전 노드 인가.
   5. 과도 응답 해석 (ζ=2%, --zeta 조정 가능).
@@ -251,9 +278,11 @@ from wht_modeler.wht_dynamic_utils import (
     find_corner_nodes,
     find_nodes_for_corners,
     parse_csv_header,
-    calculate_local_z_history,
-    calculate_corner_accelerations,
+    run_kabsch_preprocessing,
     InterpLoadGroup,
+    compute_vk_inertia_scale,
+    print_vk_scale_report,
+    compute_inertia_scale_via_fem,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,12 +306,6 @@ GRAVITY_MM             = 9_806.0  # mm/s²  표준 중력가속도 (9.80665 m/s�
 # ─────────────────────────────────────────────────────────────────────────────
 
 _W = 100  # 박스 전체 표시 폭 (테두리 포함)
-#
-# 박스 폭 공식 검증 (단일 폭 문자 기준):
-#   상단  : "  ┌" (3) + dashes + "┐" (1) = _W  →  dashes = _W - 4
-#   행    : "  │" (3) + content + "│" (1) = _W  →  content = _W - 4
-#   구분  : "  ├" (3) + dashes + "┤" (1) = _W  →  dashes = _W - 4
-#   하단  : "  └" (3) + dashes + "┘" (1) = _W  →  dashes = _W - 4
 
 
 def _dw(s: str) -> int:
@@ -290,12 +313,12 @@ def _dw(s: str) -> int:
     n = 0
     for c in s:
         cp = ord(c)
-        if (0xAC00 <= cp <= 0xD7A3   # 한글 완성형
-                or 0x1100 <= cp <= 0x11FF   # 한글 자모
-                or 0x3130 <= cp <= 0x318F   # 한글 호환 자모
-                or 0x4E00 <= cp <= 0x9FFF   # CJK 통합 한자
-                or 0x3000 <= cp <= 0x303F   # CJK 기호
-                or 0xF900 <= cp <= 0xFAFF): # CJK 호환 한자
+        if (0xAC00 <= cp <= 0xD7A3
+                or 0x1100 <= cp <= 0x11FF
+                or 0x3130 <= cp <= 0x318F
+                or 0x4E00 <= cp <= 0x9FFF
+                or 0x3000 <= cp <= 0x303F
+                or 0xF900 <= cp <= 0xFAFF):
             n += 2
         else:
             n += 1
@@ -307,52 +330,126 @@ def _rpad(s: str, w: int) -> str:
     return s + ' ' * max(0, w - _dw(s))
 
 
-def _hdr(title: str, ch: str = "═") -> str:
-    """전체 폭 헤더 라인 (테두리 없음, 단순 장식선)."""
-    inner = f"  {ch*2} {title} "
-    n = max(0, _W - _dw(inner))  # 오른쪽 끝까지 채움
-    return inner + ch * n
+class _BoxPrinter:
+    """박스 형식 터미널 출력 전담 클래스.
+
+    모든 메서드는 표시 폭 _W 내에서 자동 줄바꿈을 보장합니다.
+    한글·CJK 2칸 문자, 경로처럼 공백 없는 긴 문자열 모두 처리합니다.
+    """
+
+    def __init__(self, width: int = _W):
+        self.W = width          # 박스 전체 표시 폭 (테두리 포함)
+        self._inner = width - 4 # "  │" (3) + content + "│" (1)
+
+    # ── 내부 유틸 ────────────────────────────────────────────────────────────
+
+    def _split(self, s: str, max_w: int) -> list:
+        """표시 폭 max_w를 초과하지 않도록 s를 줄 단위로 분리.
+
+        공백이 있으면 단어 경계 우선, 없으면(경로 등) 하드-컷."""
+        if _dw(s) <= max_w:
+            return [s]
+        lines, cur, cur_w = [], "", 0
+        # 공백 기준 단어 분리 먼저 시도
+        words = s.split(' ')
+        if len(words) > 1:
+            for word in words:
+                sep = ' ' if cur else ''
+                candidate = cur + sep + word
+                if _dw(candidate) <= max_w:
+                    cur = candidate
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = word
+            if cur:
+                lines.append(cur)
+            # 단어 자체가 max_w 초과인 경우 하드-컷 재처리
+            final = []
+            for ln in lines:
+                final.extend(self._hardcut(ln, max_w))
+            return final
+        return self._hardcut(s, max_w)
+
+    def _hardcut(self, s: str, max_w: int) -> list:
+        """표시 폭 기준 강제 절단."""
+        lines, cur, cur_w = [], "", 0
+        for ch in s:
+            cw = _dw(ch)
+            if cur_w + cw > max_w:
+                lines.append(cur)
+                cur, cur_w = ch, cw
+            else:
+                cur += ch
+                cur_w += cw
+        if cur:
+            lines.append(cur)
+        return lines or [s]
+
+    def _print_line(self, content: str) -> None:
+        """content를 박스 한 행으로 출력. 표시 폭을 맞춰 우측 테두리 정렬."""
+        prefix = "  │  "
+        inner = prefix + content
+        n = max(0, self.W - _dw(inner) - 1)
+        print(f"{inner}{' ' * n}│")
+
+    # ── 공개 메서드 ───────────────────────────────────────────────────────────
+
+    def hdr(self, title: str, ch: str = "═") -> str:
+        """전체 폭 헤더 라인 (테두리 없음)."""
+        inner = f"  {ch*2} {title} "
+        n = max(0, self.W - _dw(inner))
+        return inner + ch * n
+
+    def section(self, title: str, step: str = "") -> None:
+        """박스 상단: ┌─ [step] title ─...─┐"""
+        prefix = f"[{step}] " if step else ""
+        inner  = f"  ┌─ {prefix}{title} "
+        n = max(2, self.W - _dw(inner) - 1)
+        print(f"\n{inner}{'─' * n}┐")
+
+    def endsec(self) -> None:
+        """박스 하단: └─...─┘"""
+        print(f"  └{'─' * (self.W - 4)}┘")
+
+    def row(self, label: str, value: str = "", lw: int = 30) -> None:
+        """박스 행. value가 길면 자동 줄바꿈하여 박스 안에서 출력."""
+        label_part = _rpad(label, lw) + ' '
+        # 값이 들어갈 수 있는 최대 표시 폭
+        value_w = self._inner - 2 - _dw(label_part)  # "  "(2) + label + value
+        lines = self._split(str(value), max(20, value_w))
+        # 첫 줄: 레이블 + 값
+        self._print_line(label_part + lines[0])
+        # 이후 줄: 레이블 자리는 공백으로 채움
+        cont_prefix = ' ' * (_dw(label_part))
+        for ln in lines[1:]:
+            self._print_line(cont_prefix + ln)
+
+    def row_raw(self, content: str) -> None:
+        """박스 행: 미리 구성된 문자열. 넘치면 줄바꿈."""
+        lines = self._split(content, self._inner - 2)
+        for ln in lines:
+            self._print_line(ln)
+
+    def sep(self) -> None:
+        """박스 구분선: ├─...─┤"""
+        print(f"  ├{'─' * (self.W - 4)}┤")
+
+    def blank(self) -> None:
+        """빈 행: │ spaces │"""
+        print(f"  │{' ' * (self.W - 4)}│")
 
 
-def _section(title: str, step: str = "") -> None:
-    """박스 상단: ┌─ [step] title ─...─┐  (총 _W 표시 폭)."""
-    prefix = f"[{step}] " if step else ""
-    inner  = f"  ┌─ {prefix}{title} "
-    # inner(_dw) + dashes + ┐(1) = _W  →  dashes = _W - _dw(inner) - 1
-    n = max(2, _W - _dw(inner) - 1)
-    print(f"\n{inner}{'─' * n}┐")
+# 모듈 레벨 싱글턴 — 기존 호출부(_row, _section 등) 변경 없이 위임
+_box = _BoxPrinter(_W)
 
-
-def _endsec() -> None:
-    """박스 하단: └─...─┘  (총 _W 표시 폭)."""
-    #   "  └"(3) + dashes + "┘"(1) = _W  →  dashes = _W - 4
-    print(f"  └{'─' * (_W - 4)}┘")
-
-
-def _row(label: str, value: str = "", lw: int = 30) -> None:
-    """박스 행: │  <label padded lw> <value> <spaces> │  (총 _W 표시 폭).
-    lw: 레이블 표시 폭 기준 (한글 포함)."""
-    inner = f"  │  {_rpad(label, lw)} {value}"
-    # inner(_dw) + spaces + │(1) = _W  →  spaces = _W - _dw(inner) - 1
-    n = max(0, _W - _dw(inner) - 1)
-    print(f"{inner}{' ' * n}│")
-
-
-def _row_raw(content: str) -> None:
-    """박스 행: 미리 구성된 문자열을 출력하고 우측 테두리를 맞춤."""
-    inner = f"  │  {content}"
-    n = max(0, _W - _dw(inner) - 1)
-    print(f"{inner}{' ' * n}│")
-
-
-def _sep() -> None:
-    """박스 구분선: ├─...─┤  (총 _W 표시 폭)."""
-    print(f"  ├{'─' * (_W - 4)}┤")
-
-
-def _blank() -> None:
-    """빈 행: │ spaces │  (총 _W 표시 폭)."""
-    print(f"  │{' ' * (_W - 4)}│")
+def _hdr(title: str, ch: str = "═") -> str:        return _box.hdr(title, ch)
+def _section(title: str, step: str = "") -> None:   _box.section(title, step)
+def _endsec() -> None:                              _box.endsec()
+def _row(label: str, value: str = "", lw: int = 30) -> None: _box.row(label, value, lw)
+def _row_raw(content: str) -> None:                 _box.row_raw(content)
+def _sep() -> None:                                 _box.sep()
+def _blank() -> None:                               _box.blank()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -472,28 +569,28 @@ def _load_csv(
 
 
 def _apply_inertia_loads(
-    df, time_arr, node_db, model, load_groups: list
+    kabsch, time_arr, node_db, model, load_groups: list,
+    corner_nids: list = None,
 ) -> tuple:
     """
-    코너 가속도 쌍선형 보간으로 모든 내부 노드에 관성 하중 F = -m·a 를 인가합니다.
+    강체 가속도(T_arr 2차 미분, body-frame Z)로 모든 내부 노드에 관성 하중 F = -m·a 를 인가합니다.
 
     load_groups 리스트에 InterpLoadGroup(FORCE)을 직접 추가합니다.
 
     Returns
     -------
     total_mass   : float   총 섀시 질량 (tonne)
-    corner_accels: ndarray (T, 4) 코너 가속도 [mm/s²]
+    a_body_z     : ndarray (T,) body-frame Z 강체 가속도 [mm/s²]
     n_inertia    : int     관성 하중 인가 노드 수
     """
-    _, traj_mm = calculate_local_z_history(df, time_arr)
-    dt         = time_arr[1] - time_arr[0] if len(time_arr) > 1 else 1e-4
-    accels     = calculate_corner_accelerations(traj_mm, dt)  # (T, 4)
+    # world-frame 강체 가속도: 코너 accel_arr 평균 (T, 3)
+    a_world  = kabsch.accel_arr.mean(axis=1)  # (T, 3)
+    a_body   = np.einsum('tji,tj->ti', kabsch.R_arr, a_world)  # R.T @ a_world per step
+    a_body_z = a_body[:, 2]  # (T,) body-frame Z 강체 가속도
 
-    all_xyz = np.array(list(node_db.values()))
-    xmin, xmax = all_xyz[:, 0].min(), all_xyz[:, 0].max()
-    ymin, ymax = all_xyz[:, 1].min(), all_xyz[:, 1].max()
-    dx = max(xmax - xmin, 1.0)
-    dy = max(ymax - ymin, 1.0)
+    peak_g = float(np.max(np.abs(a_body_z))) / 9806.65
+    rms_g  = float(np.sqrt(np.mean(a_body_z**2))) / 9806.65
+    print(f"     강체 가속도 (body Z): peak={peak_g:.1f} g  RMS={rms_g:.1f} g")
 
     temp   = WHTDynamicSolver(model)
     jm, s_nids, n2i = temp._build_jaxsso_model()
@@ -505,28 +602,43 @@ def _apply_inertia_loads(
         if n2i.get(nid) is not None and nid < 900000
         and m_diag[n2i[nid] * 6 + 2] > 1e-12
     ))
+    print(f"     총 질량 (lumped): {total_mass*1e3:.3f} kg")
+
+    # Von Kármán 비선형 목표 처짐 계산
+    all_xyz = np.array(list(node_db.values()))
+    plate_a = float(all_xyz[:, 0].max() - all_xyz[:, 0].min())
+    plate_b = float(all_xyz[:, 1].max() - all_xyz[:, 1].min())
+    _, _, w_NL, vk_info = compute_vk_inertia_scale(
+        E=MAT['E'], nu=MAT['nu'], t=MAT['t'],
+        plate_a=plate_a, plate_b=plate_b,
+        total_mass=total_mass, a_body_z=a_body_z,
+    )
+    print_vk_scale_report(vk_info)
+
+    # FEM 역산: 코너 고정 정해석으로 실제 구조 강성 기반 보정계수 계산
+    _corner_nids = corner_nids if corner_nids else []
+    fem_scale, _ = compute_inertia_scale_via_fem(
+        model=model,
+        corner_nids=_corner_nids,
+        n2i=n2i, m_diag=m_diag,
+        a_body_z=a_body_z,
+        w_NL_target=w_NL,
+    )
+    a_body_z_scaled = a_body_z * fem_scale
 
     n_inertia = 0
     for nid in node_db:
         ix = n2i.get(nid)
         if ix is None or nid >= 900000:
             continue
-        x, y, _ = node_db[nid]
-        nx, ny  = (x - xmin) / dx, (y - ymin) / dy
-        a_z = (
-            accels[:, 0] * (nx)     * (ny)      +  # C5: +X+Y
-            accels[:, 1] * (nx)     * (1 - ny)  +  # C6: +X-Y
-            accels[:, 2] * (1 - nx) * (1 - ny)  +  # C7: -X-Y
-            accels[:, 3] * (1 - nx) * (ny)         # C8: -X+Y
-        )
         node_mass = m_diag[ix * 6 + 2]
         if node_mass > 1e-12:
             load_groups.append(
-                InterpLoadGroup([nid], 2, time_arr, -node_mass * a_z, "FORCE")
+                InterpLoadGroup([nid], 2, time_arr, -node_mass * a_body_z_scaled, "FORCE")
             )
             n_inertia += 1
 
-    return total_mass, accels, n_inertia
+    return total_mass, a_body_z_scaled, n_inertia
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -585,16 +697,19 @@ class ESLExtractor:
         n_save_esl: int = 50,
         n_modes: int = 0,
         dt: Optional[float] = None,
+        use_jax: bool = False,
+        contact_threshold: float = 24516.6,
     ):
-        self.model        = model
-        self.node_db      = node_db
-        self.csv_path     = csv_path
-        self.t_start      = t_start   # None → CSV 헤더 start_time 자동 적용
-        self.t_end        = t_end     # None → CSV 마지막 프레임까지
-        self.n_windows    = n_windows
-        self.n_top        = n_top
-        self.add_inertia  = add_inertia
-        self.use_global_z = use_global_z
+        self.model             = model
+        self.node_db           = node_db
+        self.csv_path          = csv_path
+        self.t_start           = t_start   # None → CSV 헤더 start_time 자동 적용
+        self.t_end             = t_end     # None → CSV 마지막 프레임까지
+        self.n_windows         = n_windows
+        self.n_top             = n_top
+        self.add_inertia       = add_inertia
+        self.use_global_z      = use_global_z
+        self.contact_threshold = contact_threshold
         self.esl_weight   = esl_weight
         self.w_peak       = w_peak
         self.iteration    = iteration  # -1: 단독 실행, ≥0: 최적화 루프 내
@@ -602,6 +717,7 @@ class ESLExtractor:
         self.n_save_esl   = max(n_windows * 2, n_save_esl)  # 윈도우당 최소 2개 보장
         self.n_modes      = n_modes    # 0: 직접 Newmark-β, >0: 모달 중첩법
         self.dt           = dt         # None → CSV 샘플링 간격 그대로 사용
+        self.use_jax      = use_jax    # True → JAX 직접 적분 (method='jax')
 
         # 단계별 출력
         self._df          : Optional[pd.DataFrame]     = None
@@ -711,20 +827,35 @@ class ESLExtractor:
         _endsec()
 
     def _build_spcd_groups(self) -> None:
-        """각 코너에 마스터 노드(#900000+) + RBE3 + Z-SPCD 하중을 구성합니다."""
-        if self.use_global_z:
-            corner_z = self._extract_global_z()
-        else:
-            corner_z, _ = calculate_local_z_history(self._df, self._time_arr)
+        """各 코너에 마스터 노드(#900000+) + RBE3 + 3-DOF SPCD 하중을 구성합니다.
+        Kabsch 알고리즘으로 강체 운동을 제거한 body-frame 변형량(X,Y,Z)을 SPCD로 입력합니다.
+        """
+        corner_positions = self._csv_header.get('corner_positions', {})
+        lc_name = Path(self.csv_path).parent.name  # loadcase 이름 = CSV 부모 폴더명
+
+        diag_base = f"kabsch_{lc_name}"
+        diag_paths = [str(self.out_dir / diag_base)] if self.out_dir else []
+
+        self._kabsch = run_kabsch_preprocessing(
+            self._df, self._time_arr,
+            corner_positions=corner_positions if corner_positions else None,
+            contact_accel_threshold=self.contact_threshold,
+            diag_save_paths=diag_paths,
+            loadcase_name=lc_name,
+        )
 
         for idx, (cname, cnids) in enumerate(self._bot_groups):
             center = np.mean([self.node_db[n] for n in cnids], axis=0)
             mnid   = 900000 + idx
             self.model.add_node(mnid, center[0], center[1], center[2])
             self.model.add_rbe3(mnid, mnid, cnids, dofs=(0, 1, 2))
-            self._load_groups.append(InterpLoadGroup(
-                [mnid], 2, self._time_arr, corner_z[cname], "SPCD"
-            ))
+            d = self._kabsch.deformation.get(cname)
+            if d is None:
+                continue
+            for dof_idx, dof in enumerate([0, 1, 2]):   # X, Y, Z
+                self._load_groups.append(InterpLoadGroup(
+                    [mnid], dof, self._time_arr, d[:, dof_idx], "SPCD"
+                ))
 
     def _extract_global_z(self) -> dict:
         """CSV에서 글로벌 Z 상대 변위를 추출합니다."""
@@ -737,47 +868,41 @@ class ESLExtractor:
 
     def _add_inertia_loads(self) -> None:
         """이선형 보간으로 모든 내부 노드에 관성 하중 F = -m·a 를 인가합니다."""
+        _c_nids = [nid for _, nids in self._bot_groups for nid in nids]
         total_mass, accels, n_inertia = _apply_inertia_loads(
-            self._df, self._time_arr, self.node_db, self.model, self._load_groups
+            self._kabsch, self._time_arr, self.node_db, self.model, self._load_groups,
+            corner_nids=_c_nids,
         )
         self._total_mass    = total_mass
         self._corner_accels = accels
         self._accel_dt      = self._time_arr[1] - self._time_arr[0] if len(self._time_arr) > 1 else 1e-4
 
         _section("관성 하중 (F = -m·a) 인가", "ESL-0c")
-        _row("총 섀시 질량", f"{self._total_mass*1e6:.2f} kg  ({self._total_mass:.4e} tonne)")
+        _row("총 섀시 질량", f"{self._total_mass*1e3:.2f} kg  ({self._total_mass:.4e} tonne)")
         _row("관성 하중 인가 노드", f"{n_inertia:,}개")
         self._print_impact_summary()
         _endsec()
 
     def _print_impact_summary(self) -> None:
-        """코너 가속도 기반 충격력 지표를 출력합니다 (CSV 간 비교용)."""
+        """강체 가속도 기반 충격력 지표를 출력합니다 (CSV 간 비교용)."""
         if not hasattr(self, '_corner_accels') or self._corner_accels is None:
             return
-        accels = self._corner_accels  # (T, 4)  mm/s²
-        M      = getattr(self, '_total_mass', None)
+        a    = self._corner_accels  # (T,) body-frame Z 강체 가속도 mm/s²
+        M    = getattr(self, '_total_mass', None)
+        pk   = float(np.max(np.abs(a)))
+        rms  = float(np.sqrt(np.mean(a**2)))
+        g_pk  = pk  / G_MM_S2
+        g_rms = rms / G_MM_S2
 
         _sep()
-        _row("코너 가속도 (로컬 Z)", "  peak [mm/s²]    peak [g]    RMS [g]")
-        a_peaks_g = []
-        for ci, lbl in enumerate(CORNER_NAMES):
-            a   = accels[:, ci]
-            pk  = float(np.max(np.abs(a)))
-            rms = float(np.sqrt(np.mean(a**2)))
-            g_pk  = pk  / G_MM_S2
-            g_rms = rms / G_MM_S2
-            a_peaks_g.append(g_pk)
-            _row(f"  {lbl}", f"{pk:>12,.1f}   {g_pk:>8.3f} g   {g_rms:.3f} g")
+        _row("강체 가속도 (body-frame Z)", f"peak {pk:,.1f} mm/s²  ({g_pk:.3f} g)  RMS {g_rms:.3f} g")
 
         if M and M > 0:
-            a_global_peak = float(np.max(np.abs(accels)))  # 전체 최대 (mm/s²)
-            a_rms_global  = float(np.sqrt(np.mean(accels**2)))
-            F_peak = M * a_global_peak          # N (tonne × mm/s² = N)
-            F_rms  = M * a_rms_global
-            g_peak = a_global_peak / G_MM_S2
+            F_peak = M * pk
+            F_rms  = M * rms
             _sep()
             _row("▶ 충격력 지표 (M × a_peak)",
-                 f"F_peak = {F_peak:,.1f} N   ({g_peak:.2f} g)")
+                 f"F_peak = {F_peak:,.1f} N   ({g_pk:.2f} g)")
             _row("  충격력 지표 (M × a_rms)",
                  f"F_rms  = {F_rms:,.1f} N")
             _row("  (이 값으로 다른 CSV 조건의 충격 심각도를 비교하세요)", "")
@@ -837,6 +962,7 @@ class ESLExtractor:
                 self._load_groups, dt=dt, T=T_total, n_save=self.n_save_esl,
                 damping=DampingSpec(mode="zeta", zeta=ZETA),
                 label=csv_name,
+                method='jax' if self.use_jax else 'scipy',
             )
         _endsec()
 
@@ -1197,12 +1323,15 @@ class PosDynamicPipeline:
     """
 
     def __init__(self, cfg):
-        self.cfg      = cfg
-        self.model    : Optional[WHTMeshModel]     = None
-        self.node_db  : Optional[dict]             = None
-        self.dyn_res  : Optional[DynamicResult]    = None
-        self.wht_data : Optional[WHTResultData]    = None
-        self.out_dir  : Optional[Path]             = None
+        self.cfg          = cfg
+        self.model        : Optional[WHTMeshModel]     = None
+        self.node_db      : Optional[dict]             = None
+        self._bot_groups  : Optional[list]             = None
+        self._kabsch      : Optional[object]           = None
+        self._load_groups : list                       = []
+        self.dyn_res      : Optional[DynamicResult]    = None
+        self.wht_data     : Optional[WHTResultData]    = None
+        self.out_dir      : Optional[Path]             = None
 
     def run(self) -> None:
         """파이프라인 전체 실행."""
@@ -1223,12 +1352,14 @@ class PosDynamicPipeline:
             self._build_mesh()
             self._find_corners_and_load()
             if getattr(self.cfg, 'add_inertia', False):
+                _c_nids = [nid for _, nids in self._bot_groups for nid in nids]
                 total_mass, accels, n_inertia = _apply_inertia_loads(
-                    self._df, self._time_arr,
-                    self.node_db, self.model, self._load_groups
+                    self._kabsch, self._time_arr,
+                    self.node_db, self.model, self._load_groups,
+                    corner_nids=_c_nids,
                 )
                 _section("관성 하중 (F = -m·a) 인가", "B-inertia")
-                _row("총 섀시 질량", f"{total_mass*1e6:.2f} kg  ({total_mass:.4e} tonne)")
+                _row("총 섀시 질량", f"{total_mass*1e3:.2f} kg  ({total_mass:.4e} tonne)")
                 _row("관성 하중 인가 노드", f"{n_inertia:,}개")
                 _endsec()
             self._run_dynamic()
@@ -1270,7 +1401,8 @@ class PosDynamicPipeline:
         print(f"\n [2] CSV 로드: {self.cfg.pos_data}")
         df, time_arr, header = _load_csv(self.cfg.pos_data, t_start_arg, t_end_arg)
         t_start_used = t_start_arg if t_start_arg is not None else (header.get('start_time') or 0.0)
-        dt_val  = float(time_arr[1] - time_arr[0]) if len(time_arr) > 1 else self.cfg.dt
+        csv_dt  = float(time_arr[1] - time_arr[0]) if len(time_arr) > 1 else 1e-3
+        dt_val  = float(self.cfg.dt) if self.cfg.dt is not None else csv_dt
         T_total = float(time_arr[-1])
         t_end_str = f"{t_end_arg}s" if t_end_arg is not None else "end"
         print(f"     t=[{t_start_used}s ~ {t_end_str}], 프레임={len(time_arr)}, "
@@ -1291,29 +1423,39 @@ class PosDynamicPipeline:
             bot_groups = [(CORNER_NAMES[i], g[1]) for i, g in enumerate(raw)]
             print("     [WARN] CSV 헤더에 코너 좌표 없음 → 메시 기하 기반 탐색 사용")
 
-        # 코너 변위 추출
-        print(f"\n [4] 하중 그룹 구성 ({'글로벌 Z' if self.cfg.use_global_z else '로컬 프레임'})...")
-        if self.cfg.use_global_z:
-            corner_z = {}
-            for lbl in CORNER_NAMES:
-                col = f"{lbl}_Z" if f"{lbl}_Z" in df.columns else f"{lbl}_pos_Z"
-                z = df[col].to_numpy(dtype=float) * 1000.0
-                corner_z[lbl] = z - z[0]
-        else:
-            corner_z, _ = calculate_local_z_history(df, time_arr)
+        self._bot_groups = bot_groups
 
-        # 마스터 노드 + RBE3 + SPCD
+        # Kabsch 전처리: 강체 제거 → body-frame 3D 변형량
+        print(f"\n [4] Kabsch 전처리 및 3-DOF SPCD 하중 그룹 구성...")
+        lc_name = Path(self.cfg.pos_data).parent.name or Path(self.cfg.pos_data).stem
+
+        diag_paths = [str(self.out_dir / f"kabsch_{lc_name}")] if self.out_dir else []
+
+        contact_thr = getattr(self.cfg, 'contact_threshold', 24516.6)
+        self._kabsch = run_kabsch_preprocessing(
+            df, time_arr,
+            corner_positions=header_corners if header_corners else None,
+            contact_accel_threshold=contact_thr,
+            diag_save_paths=diag_paths,
+            loadcase_name=lc_name,
+        )
+
+        # 마스터 노드 + RBE3 + X/Y/Z SPCD
         load_groups = []
         for idx, (cname, corner_nids) in enumerate(bot_groups):
             center = np.mean([self.node_db[n] for n in corner_nids], axis=0)
             mnid   = 900000 + idx
             self.model.add_node(mnid, center[0], center[1], center[2])
             self.model.add_rbe3(mnid, mnid, corner_nids, dofs=(0, 1, 2))
-            load_groups.append(InterpLoadGroup(
-                [mnid], 2, time_arr, corner_z[cname], "SPCD"
-            ))
-        # 강체 이동 방지
-        self.model.apply_spc([bot_groups[0][1][0]], dofs=(0, 1))
+            d = self._kabsch.deformation.get(cname)
+            if d is None:
+                continue
+            for dof_idx, dof in enumerate([0, 1, 2]):   # X, Y, Z
+                load_groups.append(InterpLoadGroup(
+                    [mnid], dof, time_arr, d[:, dof_idx], "SPCD"
+                ))
+        # 강체 이동 방지 (X, Y SPC는 SPCD가 직접 구속하므로 제거)
+        # SPCD가 X,Y,Z 모두 구속 → 추가 SPC 불필요
 
         # 인스턴스에 저장 (다음 단계에서 사용)
         self._load_groups = load_groups
@@ -1522,7 +1664,9 @@ class TopographyPipeline:
                 out_dir      = self.out_dir,
                 n_save_esl   = self.cfg.n_save_esl,
                 n_modes      = getattr(self.cfg, 'n_modes', 0),
-                dt           = None,
+                dt                 = getattr(self.cfg, 'dt', None),
+                use_jax            = getattr(self.cfg, 'jax_dynamic', False),
+                contact_threshold  = getattr(self.cfg, 'contact_threshold', 24516.6),
             )
 
         def _run_esl(iteration: int):
@@ -1619,12 +1763,16 @@ class TopographyPipeline:
             mesh_size_z       = self.cfg.mesh_size,
             sym_x             = self.cfg.sym_x,
             bead_connect      = self.cfg.bead_connect,
-            connect_gap       = self.cfg.connect_gap,
+            bead_connect_alg  = getattr(self.cfg, 'bead_connect_alg', 'closing'),
             bead_steps        = self.cfg.height_steps,
+            filter_type       = getattr(self.cfg, 'filter_type', 'linear'),
+            use_projection    = getattr(self.cfg, 'projection', 0.0) > 0,
+            proj_beta_max     = getattr(self.cfg, 'projection', 0.0) or 32.0,
             load_cases        = load_cases,
             load_case_provider= load_case_provider,
             out_dir           = self.out_dir,
-            normalize_obj     = self.cfg.normalize_obj,
+            normalize_obj     = self.cfg.normalize_obj > 0,
+            weight_variation  = max(0.0, self.cfg.normalize_obj - 1.0),
             obj_type          = self.cfg.obj_type,
             obj_alpha         = self.cfg.obj_alpha,
             freq_weight       = freq_w,
@@ -1632,6 +1780,10 @@ class TopographyPipeline:
             exclude_zones     = exclude_zones,
             n_workers         = self.cfg.n_workers,
         )
+        n_designs = getattr(self.cfg, 'n_designs', 1)
+        if n_designs > 1:
+            self.solver.diversity_weight = getattr(self.cfg, 'diversity_weight', 0.3)
+            self.solver.diversity_sigma  = getattr(self.cfg, 'diversity_sigma',  0.3)
 
     def _run_optimizer(self) -> None:
         """최적화를 실행합니다. GUI 지정 시 모니터링 프로세스를 병렬로 시작합니다."""
@@ -1645,14 +1797,36 @@ class TopographyPipeline:
             stop_event = multiprocessing.Event()
             ui_process = multiprocessing.Process(
                 target=start_monitor_ui,
-                args=(queue, stop_event, str(self.out_dir))
+                args=(queue, stop_event, str(self.out_dir)),
+                kwargs={"num_modal_modes": self.cfg.modal_modes},
             )
             ui_process.start()
             callback = queue.put
 
-        print(f" [4] 최적화 실행 (max_iter={self.cfg.iters})...")
+        n_designs    = getattr(self.cfg, 'n_designs', 1)
+        noise        = getattr(self.cfg, 'diversity_noise', 0.15)
+        print(f" [4] 최적화 실행 (max_iter={self.cfg.iters}, n_designs={n_designs})...")
         try:
-            self.solver.solve(max_iter=self.cfg.iters, callback=callback, stop_event=stop_event)
+            for design_idx in range(n_designs):
+                if n_designs > 1:
+                    print(f"\n{'='*60}")
+                    print(f"  [Design {design_idx+1}/{n_designs}]")
+                    print(f"{'='*60}")
+                    if design_idx > 0:
+                        self.solver.reset_for_next_design(noise=noise)
+                self.solver.solve(max_iter=self.cfg.iters, callback=callback,
+                                  stop_event=stop_event)
+                if n_designs > 1:
+                    # 각 설계를 별도 파일로 저장
+                    self._discretize()
+                    self._apply_shape()
+                    _stem = Path(self.cfg.export or "final.k").stem if self.cfg.export else "design"
+                    _out  = (self.out_dir / f"{_stem}_d{design_idx+1:02d}.k") if self.out_dir \
+                            else Path(f"{_stem}_d{design_idx+1:02d}.k")
+                    self.model.export_to_solver('lsdyna', str(_out), reorder=True)
+                    print(f" -> 설계 {design_idx+1} 저장: {_out}")
+                    # 모델 좌표 원점 복원 후 다음 설계 준비
+                    self.solver._restore_heights()
         finally:
             if ui_process and ui_process.is_alive():
                 queue.put("STOP")
@@ -1782,7 +1956,7 @@ class TopographyPipeline:
         print(f"  {'항목':<28} {'값':>36}")
         print(f"  {'─'*28} {'─'*36}")
         print(f"  {'중력가속도':<28} {GRAVITY_MM:>30.1f} mm/s²")
-        print(f"  {'총 질량':<28} {total_mass*1e6:>28.4f} kg  "
+        print(f"  {'총 질량':<28} {total_mass*1e3:>28.4f} kg  "
               f"({total_mass:.4e} tonne)")
         print(f"  {'총 자중 (Z방향 합력)':<28} {W_N:>28.2f} N  "
               f"({W_N/1000:.4f} kN)")
@@ -1823,8 +1997,10 @@ def _resolve_input_dir(parser) -> list:
     sys.argv 에서 --input-dir 를 먼저 추출합니다.
 
     1. topo_arg.txt 가 있으면 파일 내용을 기본 인자로 로드합니다.
-    2. 하위 폴더 중 chassis_corners.csv 를 포함하는 폴더를 탐색하여
-       --dynamic-opts 항목으로 자동 추가합니다.
+       topo_arg.txt 내 --dynamic-opts / --pos-data 의 상대경로는 input_dir 기준으로 변환합니다.
+    2. 하위 폴더를 탐색합니다. 폴더명이 loadcase 이름이 되고,
+       폴더 안의 첫 번째 .csv 파일을 --dynamic-opts 항목으로 자동 추가합니다.
+       (파일명은 chassis_corners.csv 고정 이름이 아니어도 됩니다.)
     3. 명령줄 인자(--input-dir 제외)가 topo_arg.txt 설정을 덮어씁니다.
 
     Returns
@@ -1872,44 +2048,89 @@ def _resolve_input_dir(parser) -> list:
             if not line:
                 continue
             base_argv.extend(shlex.split(line))
+
+        # topo_arg.txt 내 --dynamic-opts / --pos-data 의 상대경로를 input_dir 기준 절대경로로 변환.
+        # CWD가 다른 위치일 때 "chassis_corners.csv" 같은 상대경로가 깨지는 문제 방지.
+        _path_opts = {"--dynamic-opts", "--pos-data"}
+        _in_path_opt = False
+        for k, tok in enumerate(base_argv):
+            if tok in _path_opts:
+                _in_path_opt = True
+                continue
+            if _in_path_opt:
+                if tok.startswith("--"):
+                    _in_path_opt = False
+                else:
+                    # CSV 경로[,t_start[,t_end]] 형태에서 경로 부분만 절대경로 변환
+                    parts = tok.split(",", 1)
+                    p = Path(parts[0])
+                    if not p.is_absolute():
+                        parts[0] = str((input_dir / p).resolve())
+                        base_argv[k] = ",".join(parts)
+
         print(f"  [input-dir] topo_arg.txt 로드: {len(base_argv)}개 토큰")
     else:
         print(f"  [input-dir] topo_arg.txt 없음 — 기본값 사용")
 
-    # ── 2. 하위 폴더 chassis_corners.csv 탐색 ────────────────────────────────
+    # ── 2. 하위 폴더 탐색: 폴더명 = loadcase 이름, 폴더 내 첫 번째 .csv = 데이터 파일 ──
+    # chassis_corners.csv 고정 이름 대신, 하위 폴더 안의 임의 .csv 파일을 자동 탐색한다.
+    # 폴더명이 ESL extractor의 csv_name(_p.parent.name)으로 자동 반영되어 loadcase 이름이 된다.
     csv_entries: list = []
     for sub in sorted(input_dir.iterdir()):
         if not sub.is_dir():
             continue
-        csv_path = sub / "chassis_corners.csv"
-        if csv_path.exists():
-            csv_entries.append(str(csv_path))
+        csv_files = sorted(sub.glob("*.csv"))
+        if not csv_files:
+            continue
+        if len(csv_files) > 1:
+            print(f"  [input-dir]   {sub.name}/: CSV {len(csv_files)}개 — 첫 번째 파일 사용: {csv_files[0].name}")
+        csv_entries.append(str(csv_files[0]))
 
     if csv_entries:
-        print(f"  [input-dir] chassis_corners.csv 발견: {len(csv_entries)}개 하위 폴더")
+        print(f"  [input-dir] 하위 폴더(loadcase) 발견: {len(csv_entries)}개")
         for p in csv_entries:
-            print(f"             {p}")
+            _sub = Path(p)
+            print(f"             [{_sub.parent.name}]  {_sub.name}")
     else:
-        print(f"  [input-dir] chassis_corners.csv 를 포함하는 하위 폴더 없음")
+        print(f"  [input-dir] CSV 파일을 포함하는 하위 폴더 없음")
 
     # ── 3. 최종 argv 조합 ─────────────────────────────────────────────────────
-    # 우선순위: 명령줄(clean_argv) > topo_arg.txt(base_argv) > 자동 추가 CSV
-    # --dynamic-opts 는 append 방식이 아니므로 기존 항목에 CSV 를 병합합니다.
-    # clean_argv 에 이미 --dynamic-opts 가 있으면 그 뒤에 추가합니다.
-    final_argv = base_argv + clean_argv
+    # 우선순위: 명령줄(clean_argv) > 자동 발견 CSV(csv_entries) > topo_arg.txt(base_argv)
+    #
+    # 하위 폴더에서 CSV를 발견한 경우: topo_arg.txt 의 --dynamic-opts 를 제거하고
+    # 발견된 CSV 목록으로 완전히 대체한다.
+    # (topo_arg.txt 의 --dynamic-opts chassis_corners.csv 같은 잔류 항목과 충돌 방지)
+    #
+    # 명령줄(clean_argv) 에 --dynamic-opts 가 있으면 그것이 최우선 — 자동 발견 CSV도 무시.
 
-    if csv_entries:
-        # 기존 --dynamic-opts 가 없으면 새로 삽입, 있으면 항목을 뒤에 추가
-        if "--dynamic-opts" not in final_argv:
+    def _strip_dynamic_opts(argv: list) -> list:
+        """argv 에서 --dynamic-opts 와 그 뒤 값 토큰을 모두 제거한다."""
+        result = []
+        skip = False
+        for tok in argv:
+            if tok == "--dynamic-opts":
+                skip = True
+                continue
+            if skip and tok.startswith("--"):
+                skip = False
+            if not skip:
+                result.append(tok)
+        return result
+
+    if csv_entries and "--dynamic-opts" not in clean_argv:
+        # 하위 폴더 CSV 발견 + 명령줄에 --dynamic-opts 없음
+        # → topo_arg.txt 의 --dynamic-opts 를 제거하고 발견된 CSV 로 대체
+        base_argv_clean = _strip_dynamic_opts(base_argv)
+        final_argv = base_argv_clean + clean_argv + ["--dynamic-opts"] + csv_entries
+        if "--dynamic-opts" in base_argv:
+            print(f"  [input-dir] topo_arg.txt 의 --dynamic-opts 를 하위 폴더 CSV {len(csv_entries)}개로 대체")
+    else:
+        final_argv = base_argv + clean_argv
+        if csv_entries and "--dynamic-opts" in clean_argv:
+            print(f"  [input-dir] 명령줄 --dynamic-opts 우선 적용 — 하위 폴더 CSV {len(csv_entries)}개 무시")
+        elif csv_entries:
+            # csv_entries 있지만 final_argv 에 --dynamic-opts 없는 경우 (base_argv 에도 없었음)
             final_argv += ["--dynamic-opts"] + csv_entries
-        else:
-            idx = final_argv.index("--dynamic-opts")
-            # 기존 값들 뒤 (다음 --옵션 전까지) 에 csv_entries 삽입
-            insert_at = idx + 1
-            while insert_at < len(final_argv) and not final_argv[insert_at].startswith("--"):
-                insert_at += 1
-            for entry in reversed(csv_entries):
-                final_argv.insert(insert_at, entry)
 
     return final_argv
 
@@ -2032,18 +2253,18 @@ def main():
 
 [모드 E] 입력 디렉토리 일괄 실행
 
-  폴더 내 topo_arg.txt + 하위 폴더 chassis_corners.csv 자동 수집
+  폴더 내 topo_arg.txt + 하위 폴더 CSV 자동 수집 (폴더명 = loadcase 이름)
     python wht_topo/run_topo.py --input-dir "D:/data/session_01"
 
   폴더 구조 예시:
     session_01/
       topo_arg.txt          <- 기본 옵션 (# 주석 지원, 아래 옵션으로 덮어쓰기 가능)
-      rear_impact/
-        chassis_corners.csv <- --dynamic-opts 항목으로 자동 등록
-      curb_bump_125/
-        chassis_corners.csv
-      curb_bump_235/
-        chassis_corners.csv
+      rear_impact/          <- loadcase 이름: "rear_impact"
+        motion.csv          <- 폴더 안 첫 번째 .csv 파일 자동 사용 (파일명 무관)
+      curb_bump_125/        <- loadcase 이름: "curb_bump_125"
+        bumpy.csv
+      curb_bump_235/        <- loadcase 이름: "curb_bump_235"
+        bumpy.csv
 
   명령줄 인자로 topo_arg.txt 설정 일부 덮어쓰기
     python wht_topo/run_topo.py --input-dir "D:/data/session_01" --iters 30 --no-gui
@@ -2068,8 +2289,9 @@ def main():
 --input-dir DIR
                 디렉토리 경로를 지정하면 아래 두 동작을 자동 수행합니다.
                   1. DIR/topo_arg.txt 를 기본 옵션 파일로 로드 (# 주석 지원)
-                  2. DIR 하위 폴더 중 chassis_corners.csv 를 포함하는 폴더를
-                     모두 탐색하여 --dynamic-opts 항목으로 자동 추가
+                  2. DIR 하위 폴더를 탐색 — 폴더명이 loadcase 이름이 되고,
+                     폴더 안의 첫 번째 .csv 파일을 --dynamic-opts 항목으로 자동 추가
+                     (파일명은 무관, chassis_corners.csv 고정 이름 불필요)
                 우선순위: 명령줄 인자 > topo_arg.txt > 자동 발견 CSV
                 경로에 공백이 있으면 따옴표로 감싸세요: --input-dir "D:/my path"
 
@@ -2089,7 +2311,7 @@ def main():
                   "CSV경로,시작(s),종료(s)"→ t_start/t_end 모두 지정
                 복수 충격 시나리오 (공백 구분):
                   --dynamic-opts "drop.csv,1.6,3.0" "bump.csv,0.5,2.5" "sine.csv"
-                --input-dir 사용 시 하위 폴더 chassis_corners.csv 가 자동 추가됨.
+                --input-dir 사용 시 하위 폴더(폴더명=loadcase명) 내 첫 .csv 가 자동 추가됨.
 
 [ESL 추출 방식]
 --iterative-esl    (기본: 활성) 매 이터레이션 현재 비드 형상에서 동해석 재실행.
@@ -2148,63 +2370,170 @@ def main():
                 0 초과 시 고유치 해석 후 모달 좌표계 ODE로 응답 합성.
                 직접 적분 대비 수십~수백 배 빠름. 권장: 20~50.
 
-[최적화 제약]
---sym-x / --no-sym-x        X축 좌우 대칭 (기본: 활성)
---bead-connect / --no-bead-connect  비드 형태학적 연결 (기본: 활성)
---connect-gap               비드 연결 최대 갭 mm (기본: 120)
---height-steps              비드 이산화 단계 (기본: 1=연속 / 2={0,h_max})
---bead-height               최대 비드 높이 mm (기본: 10)
---bead-area                 비드 점유 면적 비율 0~1 (기본: 0.30)
---min-width                 최소 비드 폭 mm (기본: 30)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+비드 형상 제어 (Topography Filter / Projection)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+--min-width R mm  (기본: 80)
+    공간 밀도 필터 반경. R 이내의 요소 높이를 가중 평균하여 비드가
+    R 미만의 폭으로 형성되지 않도록 강제.
+    체커보드 방지 필수 조건: R > 2 × 메시 간격.
+    권장: 메시 간격의 3~5배 (메시 30mm → R=90~150).
+
+--filter-type {linear|gaussian}  (기본: linear)
+    linear  : w(d) = R - d  (거리에 비례하는 hat 커널)
+              → 날카로운 필터 경계, 처음 시도에 적합
+    gaussian: w(d) = exp(-d²/2σ²), σ=R/3
+              → 부드러운 가우시안 커널. 필터 경계가 완만해
+                 큼직한 덩어리 형태 패턴 유도에 유리.
+                 체커보드 억제 효과가 linear보다 강함.
+    권장: gaussian + --min-width 80~120
+
+--projection β  (기본: 0=비활성)
+    수렴형 Heaviside 투사(β-continuation).
+    순전파: H_β(x;η=0.5) = [tanh(βη)+tanh(β(x-0.5))] / [tanh(βη)+tanh(β(0.5))]
+    β=1 → 완만한 S-커브(부드러운 시작)
+    β→∞ → 계단함수(완전한 0/1)
+    최적화 진행에 따라 β를 1에서 지정값까지 선형 증가시켜
+    초기에는 탐색 유연성을, 후기에는 선명한 비드 경계를 보장.
+    수렴 후 비드 면적비 제약이 필터+Heaviside 조합으로 정확히 만족됨.
+    권장: 32 (8~16: 완만한 수렴, 32: 표준, 64+: 불안정 위험)
+
+--bead-connect N mm  (기본: 120, 0=비활성)
+    형태학적 폐합(Morphological Closing: Dilation→Erosion)으로
+    N mm 이하의 단절된 비드 구간을 자동 연결.
+    ① bridge 노드 민감도를 이웃 최대값으로 승격 → MMA가 연결 유지
+    ② bridge 추가로 인한 체적 증가를 사전에 vol_frac에서 차감
+    연속된 비드 라인은 제조성(프레스 성형)과 강성 기여 모두에 필수.
+    권장: 100~150 (메시 간격 30mm 기준 약 3~5 요소 간격)
+
+--height-steps N  (기본: 1=연속)
+    비드 높이 이산화 단계 수.
+    1  : 연속 변수 (0~h_max 사이 임의값)
+    2  : 이진({0, h_max}) → 완전한 ON/OFF 비드
+    3+ : N개 등간격 레벨. tanh 계단 함수로 근사, β-continuation으로 점진 이산화.
+    권장: 초기 탐색=1, 최종 제조 설계=2
+
+--sym-x / --no-sym-x  (기본: 활성)
+    X축 기준 좌우 대칭 강제. 설계 변수와 민감도를 좌우 평균하여 동기화.
+    섀시 구조 특성상 대칭 강제가 물리적으로 타당하고 수렴을 가속함.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+다중 설계 탐색 (Multi-Design Exploration)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+동일 하중·제약 조건에서 위상적으로 다른 여러 설계안을 순차 생성.
+각 설계 수렴 후 반발 패널티(Repulsion Penalty)를 추가해 다음 최적화가
+이전 설계에서 멀어지도록 유도한다.
+
+  수렴 설계 x*_k 등록 후 다음 목적함수:
+    f_total = f_compliance + λ·Σ_k exp(-||x - x*_k||² / 2σ²)
+    → x*_k 근방에서 목적함수가 높아져 MMA가 회피 방향으로 이동
+
+--n-designs N  (기본: 1)
+    생성할 설계 수. N>1이면 첫 설계 수렴 후 반발 패널티를 추가하며
+    N-1번 재시작. 각 설계는 별도 파일(design_dNN.k)로 저장.
+
+--diversity-weight λ  (기본: 0.3)
+    반발 패널티 강도. 클수록 이전 설계에서 멀리 떨어진 새 형태 탐색.
+    너무 크면 compliance가 나빠짐.
+    권장: 0.1~0.5. 하중 케이스 수가 많거나 목적함수가 크면 낮춤.
+
+--diversity-sigma σ  (기본: 0.3)
+    반발 가우시안의 표준편차 (설계 변수 [0,1] 공간 기준).
+    작으면(0.1~0.2) 국소 회피 → 거의 같은 형태에서 세부만 다름.
+    크면(0.4~0.6) 넓은 회피 → 위상적으로 다른 구조 유도.
+    권장: 0.25~0.4
+
+--diversity-noise ε  (기본: 0.15)
+    재시작 시 이전 수렴 설계에 추가하는 랜덤 노이즈 강도.
+    반발 패널티와 함께 새로운 국소 최적해 탐색을 보조.
+    너무 크면(>0.4) 체적 제약 위반으로 초기 이터 불안정.
+    권장: 0.1~0.2
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+목적함수 옵션
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+--normalize-obj V  (기본: 0=비활성)
+    0       : 비활성. f = C_total / C_0 (Iter 0 총 컴플라이언스로 스케일)
+    1.0     : 케이스별 정규화. f = Σ w_i·(C_i/C_i0)
+              하중 크기가 다른 정적·동적 케이스 혼재 시 권장.
+              C_i0 = 각 케이스 Iter 0 컴플라이언스 → 케이스 간 크기 차이 제거.
+    1.0~2.0 : 정규화 + 케이스별 가중치 랜덤 변동 (의외성 탐색).
+              V=1.4 → 매 이터마다 각 케이스 가중치에 ±40% 균등 변동 적용.
+              MMA가 이터마다 다른 케이스를 강조하여 단일 최소값에 고착되지 않음.
+    권장: 다중 케이스 최적화 시 1.0, 다양성 탐색 시 1.2~1.5
+
+--obj-type {sum|max|sum+max}  (기본: sum+max)
+    sum     : f = Σ w_i·C_i. 모든 케이스 균등 최적화. 빠른 수렴.
+    max     : f = (1/α)·log[Σ exp(α·w_i·C_i/C_i0)]
+              KS(Kreisselmeier-Steinhauser) 함수 근사.
+              log-sum-exp = 미분 가능한 softmax max 근사.
+              α→∞: hard-max(최악 케이스만 반영), α→0: 단순 합산.
+    sum+max : f = 0.5·f_sum + 0.5·f_max
+              전체 균형과 최악 케이스 방어를 동시 달성. 권장.
+
+--obj-alpha α  (기본: 10.0, obj-type=max/sum+max 시)
+    KS softmax 온도 파라미터.
+    1~3  : 모든 케이스 가중 평균에 가까움 (sum과 유사)
+    10   : 최악 케이스에 ~60~80% 집중 (권장 시작값)
+    50+  : hard-max에 근접, gradient가 나머지 케이스에서 거의 0 → 수렴 불안정
+    권장: 5~20
+
+--freq-penalty W F0_HZ
+    고유진동수 패널티: P = W·max(0,F0-f₁)²/F0²
+    f₁ < F0 인 경우에만 활성화 (단측 페널티).
+    민감도는 첫 탄성 모드 형상 φ₁로 계산 (JAX vmap 재사용, 추가 FEA 없음):
+      df₁/dh ≈ φ₁ᵀ(∂K/∂h)φ₁ / (4π²f₁)
 
 [비드 배제 영역]
 --exclude-rect CX,CY,W,H    중심(CX,CY) 기준 W×H mm 사각형 영역 내 비드 생성 금지.
-                            반복 지정으로 복수 영역 추가 가능:
-                              --exclude-rect 500,300,100,80 --exclude-rect 200,400,60,60
+                            반복 지정으로 복수 영역 추가 가능.
 
 --exclude-poly X1,Y1,X2,Y2,...
-                            꼭짓점 좌표 나열(mm)로 정의한 임의 다각형 영역 내 비드 생성 금지.
-                            꼭짓점은 순서대로 나열 (자동 닫힘), 최소 3개 꼭짓점(6개 좌표):
-                              --exclude-poly 100,200,300,200,300,350,100,350
-                            복수 영역: --exclude-poly "..." --exclude-poly "..."
-
-  사용 예)
-    구멍/마운팅 보스 주변 제외 (사각형 2개):
-      --exclude-rect 450,250,120,120 --exclude-rect 1350,250,120,120
-
-    장공/슬롯 주변 제외 (다각형):
-      --exclude-poly 600,400,900,400,900,500,600,500
+                            꼭짓점 좌표(mm) 나열로 정의한 임의 다각형 영역.
+                            꼭짓점은 순서대로 나열 (자동 닫힘), 최소 3개 꼭짓점.
 
 [출력]
 결과 디렉토리: results/D날짜_시간/ (실행 시작 시 자동 생성)
-  paraview/iter_NNN.hdf       — 이터레이션별 변위·응력·고유모드 (ParaView)
-  esl_se_report_iterNNN.png   — 시간분할 ESL SE 이력 리포트
-  esl_peak_report_iterNNN.png — 요소별 피크 ESL 리포트
-  run.log                     — 전체 실행 로그 (터미널 출력 동일 내용)
-  final.k (또는 --export 경로) — LS-DYNA 최적 비드 패턴
+  paraview/iter_NNN.hdf        — 이터레이션별 변위·응력·고유모드 (ParaView)
+  esl_se_report_iterNNN.png    — 시간분할 ESL SE 이력 리포트
+  esl_peak_report_iterNNN.png  — 요소별 피크 ESL 리포트
+  snapshots/iter_NNN.pkl       — 이터레이션 스냅샷 (재시작·후처리용)
+  run.log                      — 전체 실행 로그
+  final.k / design_dNN.k       — LS-DYNA 최적 비드 패턴 (다중 설계 시 번호별)
 
 --no-gui   모니터링 GUI 비활성 (헤드리스 서버)
 --no-viz   최종 3D 시각화 생략
 
-[목적함수 옵션]
---normalize-obj
-    각 케이스를 Iter 0 컴플라이언스로 정규화: f = Σ w_i·(C_i/C_i0).
-    하중 크기가 서로 다른 정적·동적 케이스 혼재 시 권장.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+추천 초기 설정
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[A] 빠른 탐색 (패턴 확인용)
+  --iters 20 --min-width 80 --filter-type gaussian
+  --bead-connect 120 --normalize-obj 1.0
 
---obj-type {sum|max|sum+max}  (기본: sum)
-    sum     : f = Σ w_i·C_i  (또는 normalize-obj 시 Σ w_i·C_i/C_i0)
-    max     : f = (1/α)·log(Σ exp(α·w_i·C_i/C_i0))   softmax 최악 케이스
-    sum+max : f = 0.5·f_sum + 0.5·f_max               평균+최악 균형
+[B] 표준 단일 설계 (권장 시작점)
+  --iters 40 --min-width 100 --filter-type gaussian
+  --projection 32 --bead-connect 120 --height-steps 2
+  --sym-x --normalize-obj 1.0 --obj-type sum+max
 
---obj-alpha α  (기본: 10.0, obj-type=max/sum+max 시)
-    클수록 hard-max (가장 나쁜 케이스만 반영).
-    작을수록 soft 평균. 통상 5~50 범위 사용.
+[C] 체커보드 억제 강화 (픽셀화 문제 시)
+  --iters 40 --min-width 120 --filter-type gaussian
+  --projection 32 --bead-connect 150
+  --sym-x --normalize-obj 1.0 --obj-type sum+max
 
---freq-penalty W F0_HZ
-    고유진동수 패널티: P = W·max(0,F0-f₁)²/F0²
-    위 목적함수 어디에도 추가 가능.
-    민감도는 첫 탄성 모드 형상 φ₁로 계산 (JAX vmap 재사용, 추가 FEA 없음):
-      df₁/dh ≈ φ₁ᵀ(∂K/∂h)φ₁ / (4π²f₁)
+[D] 다중 설계 탐색 (3개 다른 형태 생성)
+  --iters 35 --n-designs 3
+  --min-width 100 --filter-type gaussian --projection 32
+  --bead-connect 120 --sym-x
+  --normalize-obj 1.3 --obj-type sum+max
+  --diversity-weight 0.3 --diversity-sigma 0.3 --diversity-noise 0.15
+
+[E] 산업용 고신뢰성 (동적 ESL 포함)
+  --iters 40 --min-width 100 --filter-type gaussian
+  --projection 32 --bead-connect 120 --height-steps 2
+  --sym-x --normalize-obj 1.0 --obj-type sum+max
+  --w-dynamic 1.0 --w-peak 0.5 --add-inertia
+  --n-windows 30 --n-top 10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
     )
@@ -2227,28 +2556,39 @@ def main():
 
     # 최적화 기본 제어
     g = parser.add_argument_group("최적화 기본 설정")
-    g.add_argument("--iters",       type=int,   default=15,   help="최대 반복 횟수 (기본: 15)")
-    g.add_argument("--bead-height", type=float, default=10.0, help="최대 비드 높이 mm (기본: 10.0)")
-    g.add_argument("--min-width",   type=float, default=30.0, help="최소 비드 폭 mm (기본: 30.0)")
-    g.add_argument("--bead-area",   type=float, default=0.30, help="비드 점유 면적 비율 0~1 (기본: 0.35)")
+    g.add_argument("--iters",       type=int,   default=20,   help="최대 반복 횟수 (기본: 15)")
+    g.add_argument("--bead-height", type=float, default=15.0, help="최대 비드 높이 mm (기본: 10.0)")
+    g.add_argument("--min-width",   type=float, default=120.0, help="최소 비드 폭 mm (기본: 30.0)")
+    g.add_argument("--bead-area",   type=float, default=0.30, help="비드 점유 면적 비율 0~1 (기본: 0.30)")
 
     # 목적함수 옵션
     g = parser.add_argument_group("목적함수 옵션")
-    g.add_argument("--normalize-obj",    action="store_true", default=False,
-                   help="케이스별 초기 컴플라이언스로 정규화 (Σ w_i·C_i/C_i0). "
-                        "하중 크기가 달라도 케이스 간 균등 반영.")
-    g.add_argument("--no-normalize-obj", action="store_false", dest="normalize_obj",
-                   help="정규화 비활성 (기본)")
+    g.add_argument("--normalize-obj",    type=float, default=1.0,
+                   help="케이스별 정규화 활성화 및 가중치 변동 폭. "
+                        "0=비활성(기본), 1.0=정규화(변동 없음), "
+                        "1.4=정규화+케이스별 ±0.4 랜덤 가중치 부여 (의외성 유도)")
     g.add_argument("--obj-type",    choices=["sum", "max", "sum+max"], default="sum+max",
                    help="목적함수 유형: sum=가중합(기본), max=softmax 최악케이스, "
                         "sum+max=0.5·sum+0.5·softmax")
     g.add_argument("--obj-alpha",   type=float, default=10.0,
                    help="softmax 온도 (--obj-type max/sum+max 시). "
-                        "클수록 hard-max에 근접 (기본: 10.0)")
+                        "1~3=케이스 평균에 가까움, 10=최악케이스 집중(기본), "
+                        "50+=hard-max 근접(수렴 불안정 주의) (기본: 10.0)")
     g.add_argument("--freq-penalty", type=float, nargs=2, default=[0.0, 0.0],
                    metavar=("W", "F0_HZ"),
                    help="고유진동수 패널티: W·(max(0,F0-f1)/F0)². "
                         "예: --freq-penalty 5.0 50  → f1 < 50Hz 시 패널티 부과")
+
+    # 다중 설계 탐색 옵션
+    g = parser.add_argument_group("다중 설계 탐색 (Multi-Design Exploration)")
+    g.add_argument("--n-designs",        type=int,   default=1,
+                   help="생성할 설계 수 (기본: 1). >1이면 수렴 후 반발 패널티로 다른 설계 탐색")
+    g.add_argument("--diversity-weight", type=float, default=0.3,
+                   help="반발 패널티 강도 λ (기본: 0.3). 클수록 이전 설계에서 멀리 떨어짐")
+    g.add_argument("--diversity-sigma",  type=float, default=0.3,
+                   help="반발 범위 σ (기본: 0.3). 클수록 넓은 영역 회피")
+    g.add_argument("--diversity-noise",  type=float, default=0.15,
+                   help="설계 재시작 시 노이즈 강도 (기본: 0.15)")
 
     # 병렬 해석 옵션
     g = parser.add_argument_group("병렬 해석 옵션")
@@ -2261,10 +2601,17 @@ def main():
     g = parser.add_argument_group("비드 형상 및 제조 제약")
     g.add_argument("--sym-x",          action="store_true", default=True,  help="좌우 대칭 활성화 (기본: 활성)")
     g.add_argument("--no-sym-x",       action="store_false", dest="sym_x", help="좌우 대칭 해제")
-    g.add_argument("--bead-connect",   action="store_true", default=True,  help="비드 자동 연결 활성화 (기본: 활성)")
-    g.add_argument("--no-bead-connect",action="store_false", dest="bead_connect", help="비드 연결 비활성화")
-    g.add_argument("--connect-gap",    type=float, default=120.0, help="비드 연결 최대 갭 mm (기본: 120.0)")
+    g.add_argument("--bead-connect",   type=float, default=120.0,
+                   help="비드 자동 연결 최대 갭 mm. 0=비활성, >0=해당 갭 이하 단절 비드 연결 (기본: 120.0)")
+    g.add_argument("--bead-connect-alg", type=str, default="closing",
+                   choices=["closing", "mst", "geodesic", "hybrid"],
+                   help="비드 연결 알고리즘 (기본: closing)")
     g.add_argument("--height-steps",   type=int,   default=1,    help="비드 이산화 단계 (기본: 2 → {0, h_max})")
+    g.add_argument("--filter-type",    type=str,   default="linear", choices=["linear", "gaussian"],
+                   help="공간 필터 커널. linear=hat(기본), gaussian=부드러운 덩어리 형태 유도")
+    g.add_argument("--projection",     type=float, default=0.0,
+                   help="Heaviside projection beta 최대값. 0=비활성, >0=활성화 (기본: 0). "
+                        "8~16=부드러운 경계, 32=표준, 64+=hard 경계(수렴 불안정 주의)")
     g.add_argument("--draw-dir", type=str, default="0,0,-1",
                    help="비드 돌출 방향 (쉼표 구분, 기본: 0,0,-1 = 아래). 예: 0,0,1  또는  0,0,-1")
     g.add_argument("--exclude-rect", type=str, action='append', default=None,
@@ -2283,7 +2630,7 @@ def main():
                    help="분석 시작 시점 s (기본: CSV 헤더 start_time 자동 적용)")
     g.add_argument("--t-end",     type=float, default=None,
                    help="분석 종료 시점 s (기본: CSV 마지막 프레임)")
-    g.add_argument("--dt",        type=float, default=1e-3,  help="적분 시간 스텝 s (기본: 1e-4)")
+    g.add_argument("--dt",        type=float, default=0.005,  help="적분 시간 스텝 s (기본: None=CSV 샘플링 간격 그대로). ESL 모드에도 동일 적용.")
     g.add_argument("--zeta",      type=float, default=0.02,  help="Rayleigh 감쇠비 (기본: 0.02)")
     g.add_argument("--corner-r",  type=float, default=150.0, help="코너 탐색 반경 mm (fallback 전용)")
 
@@ -2296,11 +2643,15 @@ def main():
     g.add_argument("--add-inertia",  action="store_true",     help="관성 하중(-ma) 인가")
     g.add_argument("--n-top",        type=int, default=10,    help="추출 ESL 개수 (기본: 10)")
     g.add_argument("--n-windows",    type=int, default=30,    help="시간 이력 분할 수 (기본: 30)")
-    g.add_argument("--n-save-esl",   type=int, default=50,
-                   help="ESL 추출용 저장 스냅샷 수 (기본: 50). "
+    g.add_argument("--n-save-esl",   type=int, default=30,
+                   help="ESL 추출용 저장 스냅샷 수 (기본: 30). "
                         "n_windows*2 보다 작으면 자동으로 n_windows*2 로 상향. "
                         "줄일수록 동해석 메모리·I/O 감소.")
     g.add_argument("--use-global-z",    action="store_true",      help="글로벌 Z 궤적 직접 사용")
+    g.add_argument("--contact-threshold", type=float, default=24516.6,
+                   metavar="A",
+                   help="Kabsch fit 제외 임계 상대 Z가속도 [mm/s²] (기본: 24517≈2.5g). "
+                        "충격 임펄스 순간에 이 값을 초과하는 코너는 강체 fit에서 제외됩니다.")
     g.add_argument("--w-dynamic",       type=float, nargs='+', default=[1.0],
                    metavar="W",
                    help="시간분할 ESL 스냅샷 가중치 (기본: 1.0). CSV별 복수 지정 가능: --w-dynamic 1.0 0.8")
@@ -2323,6 +2674,8 @@ def main():
                    help="모달 중첩법 사용 모드 수 (기본: 0=직접 Newmark-β 적분). "
                         "0 초과 시 모달 중첩법으로 동해석 수행—직접 적분 대비 "
                         "수십~수백 배 빠름. 예: --n-modes 20")
+    g.add_argument("--jax-dynamic",   action="store_true", default=False,
+                   help="직접 Newmark-β를 JAX 가속 솔버로 실행 (기본: scipy)")
     g.add_argument("--no-static",        action="store_true", default=False,
                    help="정적 하중 케이스 전체 비활성 — 동적 ESL만 사용 (--dynamic-opts 병용 시)")
 
@@ -2351,16 +2704,19 @@ def main():
     # 출력 및 시각화
     g = parser.add_argument_group("출력 및 시각화")
     g.add_argument("--export",    type=str,  default="industrial_bead.k", help="LS-DYNA .k 저장 경로")
-    g.add_argument("--no-gui",    action="store_true", help="모니터링 GUI 비활성화")
-    g.add_argument("--no-viz",    action="store_true", help="최종 3D 시각화 생략")
+    g.add_argument("--no-gui",       action="store_true", help="모니터링 GUI 비활성화")
+    g.add_argument("--no-viz",       action="store_true", help="최종 3D 시각화 생략")
+    g.add_argument("--modal-modes",  type=int, default=20,
+                   help="모달 재해석 모드 수 (기본: 20). 모니터 GUI Modal Analysis 탭에 반영됨")
     g.add_argument("--mesh-size", type=float, default=10.0, help="BC 탐색 기준 메시 크기 mm")
 
-    # 입력 디렉토리 (topo_arg.txt + 하위 폴더 chassis_corners.csv 자동 수집)
+    # 입력 디렉토리 (topo_arg.txt + 하위 폴더 CSV 자동 수집)
     g = parser.add_argument_group("입력 디렉토리 (일괄 설정)")
     g.add_argument("--input-dir", type=str, default=None,
                    metavar="DIR",
                    help="입력 디렉토리 경로. 해당 폴더의 topo_arg.txt를 기본 옵션으로 로드하고, "
-                        "하위 폴더 각각에 있는 chassis_corners.csv를 --dynamic-opts 항목으로 자동 추가.")
+                        "하위 폴더(폴더명=loadcase 이름) 안의 첫 번째 .csv 파일을 "
+                        "--dynamic-opts 항목으로 자동 추가. 파일명은 무관.")
 
     args = parser.parse_args(_resolve_input_dir(parser))
 

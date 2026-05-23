@@ -28,9 +28,9 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 import time
-from typing import List, Optional, Dict, TYPE_CHECKING
+from typing import List, Optional
 import numpy as np
-from scipy.sparse import diags, csr_matrix
+from scipy.sparse import diags
 from scipy.sparse.linalg import splu
 from tqdm import tqdm
 
@@ -363,7 +363,7 @@ class WHTDynamicSolver(WHTSolver):
             return u_s, ud_s, udd_s
 
         print(f"    - [Time Loop] Integrating {n_steps} steps...")
-        pbar = tqdm(total=n_steps, desc="      Dynamic Solve", unit="step", leave=True)
+        pbar = tqdm(total=n_steps, desc="      Dynamic Solve", unit="step", leave=True, ncols=100)
         
         for step in range(n_steps + 1):
             t_cur = step * dt
@@ -460,7 +460,13 @@ class WHTDynamicSolver(WHTSolver):
         K_struct = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, 
                                           stabilize=True, include_beams=False, include_rbe3=False)
         M_diag  = self._assemble_lumped_mass(jm, ndof, sorted_nids, nid_to_idx)
-        
+        # [Bug2 Fix] 질량 0 DOF 패치 (scipy 솔버와 동일)
+        m_max = np.max(M_diag)
+        if m_max > 0:
+            M_diag = np.maximum(M_diag, max(m_max * 1e-8, 1e-10))
+        else:
+            M_diag = np.maximum(M_diag, 1e-10)
+
         # ── 1b. DOF 분류: SPCD → free_id에서 제거 (Scipy 솔버와 동일한 파티셔닝) ──
         #   [BUG FIX] 기존에는 free_id = jm.unknown_id 전체를 사용하여 SPCD DOF가
         #   free DOF에 포함되어 K_fs 커플링이 무효화되는 문제가 있었음.
@@ -534,7 +540,8 @@ class WHTDynamicSolver(WHTSolver):
         else:
             K_eff_ff = K_ff_jax_sparse + nc["a0"] * M_sparse + nc["a1"] * C_ff
         
-        K_fs_full = to_jax_sparse(K[free_id, :][:, spcd_id]) if n_spcd else None
+        K_fs_full_scipy  = K[free_id, :][:, spcd_id].tocsr() if n_spcd else None
+        K_fs_full   = to_jax_sparse(K_fs_full_scipy) if n_spcd else None
         K_fs_struct = to_jax_sparse(K_struct[free_id, :][:, spcd_id]) if n_spcd else None
 
         if verbose:
@@ -562,7 +569,17 @@ class WHTDynamicSolver(WHTSolver):
         
         ud_s_all  = jnp.gradient(u_s_all, dt, axis=0)
         udd_s_all = jnp.gradient(ud_s_all, dt, axis=0)
-        f_f_all   = jnp.zeros((total_steps_padded + 1, n_free), dtype=jnp.float64)
+
+        # [Bug1 Fix] FORCE 하중 사전 계산 (scipy 솔버와 동일하게 매 스텝 외력 반영)
+        times_np = np.array(times_padded)
+        f_f_all_np = np.zeros((total_steps_padded + 1, n_free), dtype=np.float64)
+        force_groups = [lg for lg in load_groups if lg.load_type.upper() == "FORCE"]
+        if force_groups:
+            for step_i in range(total_steps_padded + 1):
+                t_cur = times_np[step_i]
+                f_full = self._build_load_vector(t_cur, force_groups, ndof, nid_to_idx)
+                f_f_all_np[step_i] = f_full[free_id]
+        f_f_all = jnp.array(f_f_all_np, dtype=jnp.float64)
 
         # Reshape inputs into blocks: (n_blocks, save_every, ...)
         # We exclude the last padded element for integration steps
@@ -577,91 +594,142 @@ class WHTDynamicSolver(WHTSolver):
         
         block_inputs = (block_idxs, block_u_s, block_ud_s, block_udd_s, block_f_f)
 
-        # Jacobi preconditioner for CG (only for sparse)
-        if not is_dense:
-            diag_K_eff = K_eff_ff.todense().diagonal() 
-            inv_diag = jnp.array(1.0, dtype=jnp.float64) / jnp.where(jnp.abs(diag_K_eff) > 1e-12, diag_K_eff, jnp.array(1.0, dtype=jnp.float64))
-        else:
-            inv_diag = None
-
-        # Robust solve: Use dense direct solver with pre-factoring for medium sizes
-        from jax.scipy.linalg import lu_factor, lu_solve
-        if is_dense:
-            K_eff_lu = lu_factor(K_eff_ff)
-        else:
-            K_eff_lu = None
-
-        # Core Step Function (Same logic as before)
-        def single_step(state, carry_in):
-            u_f, ud_f, udd_f = state
-            idx, u_s, ud_s, udd_s, f_f = carry_in
-            f_eff = f_f + M_f * (nc["a0"]*u_f + nc["a2"]*ud_f + nc["a3"]*udd_f)
-            f_eff = f_eff + C_ff @ (nc["a1"]*u_f + nc["a4"]*ud_f + nc["a5"]*udd_f)
-            if n_spcd:
-                f_eff -= K_fs_full @ u_s
-                f_eff -= (beta_r * K_fs_struct) @ ud_s
-            
-            if is_dense:
-                u_f_new = lu_solve(K_eff_lu, f_eff)
-            else:
-                from jax.scipy.sparse.linalg import cg
-                u_f_new, _ = cg(lambda x: K_eff_ff @ x, f_eff, x0=u_f, tol=1e-8, maxiter=2000, M=lambda x: inv_diag * x)
-            
-            udd_f_new = nc["a0"]*(u_f_new - u_f) - nc["a2"]*ud_f - nc["a3"]*udd_f
-            ud_f_new  = ud_f + dt * ((1.0 - newmark_gamma)*udd_f + newmark_gamma*udd_f_new)
-            return (u_f_new, ud_f_new, udd_f_new), (u_f_new, ud_f_new, udd_f_new, u_s, udd_s)
-
-        # Memory-Efficient Block Step
-        def block_step(state, b_in):
-            # b_in: (save_every, ...)
-            # Inner scan: Only returns final state, doesn't store intermediate history!
-            final_state, _ = jax.lax.scan(lambda s, ci: (single_step(s, ci)[0], None), state, b_in)
-            
-            # Extract last SPCD values for the block result
-            u_s_last = b_in[1][-1]
-            a_s_last = b_in[3][-1]
-            return final_state, (final_state[0], final_state[1], final_state[2], u_s_last, a_s_last)
-
-        init_state = (jnp.zeros(n_free, dtype=jnp.float64), 
-                      jnp.zeros(n_free, dtype=jnp.float64), 
-                      jnp.zeros(n_free, dtype=jnp.float64))
+        # [Bug3 Fix] 초기 가속도: M·ü₀ = f₀ − K_fs·u_s₀ (scipy 솔버와 동일)
+        f0_np = f_f_all_np[0]
+        rhs0  = f0_np.copy()
+        if n_spcd and K_fs_full_scipy is not None:
+            u_s0 = np.array(u_s_all[0])
+            rhs0 -= K_fs_full_scipy @ u_s0
+        udd_f0 = rhs0 / M_diag[free_id]
 
         if verbose:
             print(f" Done ({time.time()-t_traj:.2f}s)")
-            print(f"    - [JAX] [4/5] JIT compiling & Block Integration ({n_blocks} blocks of {save_every} steps)...", flush=True)
             t0 = time.time()
-        
+
         # ── 4. 실행 ──────────────────────────────────────────────────────────
-        # outer scan: Only returns results for n_blocks frames!
-        _, (u_f_hist, v_f_hist, a_f_hist, u_s_hist, a_s_hist) = jax.lax.scan(block_step, init_state, block_inputs)
-        
-        # [WHT] JAX 비동기 디스패치 완료 대기: block_until_ready()를 호출하지 않으면
-        # "Time Integration Finished"가 JIT 컴파일 완료 시점(~1s)에 찍히고,
-        # 실제 연산은 Step 5(np.array 호출)에서 수행되어 수 분이 소요되는 문제가 있음.
-        u_f_hist = jax.block_until_ready(u_f_hist)
-        
-        if verbose:
-            print(f"    - [JAX] Time Integration Finished ({time.time()-t0:.2f}s) [실제 연산 완료]")
-            print(f"    - [JAX] [5/5] Converting {len(u_f_hist)} frames to Numpy...", end="", flush=True)
-            t_conv = time.time()
+        if is_dense:
+            # Dense path: JAX lax.scan + LU factorization
+            from jax.scipy.linalg import lu_factor, lu_solve
+            K_eff_lu = lu_factor(K_eff_ff)
 
-        # [WHT] Memory Management: Delete large device arrays before conversion to avoid stalls
-        del block_inputs, block_u_s, block_ud_s, block_udd_s, block_f_f
-        del K_ff_jax_sparse, K_struct_ff_sparse, C_ff
-        if is_dense: del K_eff_ff, K_eff_lu
-        import gc; gc.collect()
+            def single_step_dense(state, carry_in):
+                u_f, ud_f, udd_f = state
+                idx, u_s, ud_s, udd_s, f_f = carry_in
+                f_eff = f_f + M_f * (nc["a0"]*u_f + nc["a2"]*ud_f + nc["a3"]*udd_f)
+                f_eff = f_eff + C_ff @ (nc["a1"]*u_f + nc["a4"]*ud_f + nc["a5"]*udd_f)
+                if n_spcd:
+                    f_eff -= K_fs_full @ u_s
+                    f_eff -= (beta_r * K_fs_struct) @ ud_s
+                u_f_new = lu_solve(K_eff_lu, f_eff)
+                udd_f_new = nc["a0"]*(u_f_new - u_f) - nc["a2"]*ud_f - nc["a3"]*udd_f
+                ud_f_new  = ud_f + dt * ((1.0 - newmark_gamma)*udd_f + newmark_gamma*udd_f_new)
+                return (u_f_new, ud_f_new, udd_f_new), (u_f_new, ud_f_new, udd_f_new, u_s, udd_s)
 
-        u_f_hist_np = np.array(jax.device_get(u_f_hist))
-        v_f_hist_np = np.array(jax.device_get(v_f_hist))
-        a_f_hist_np = np.array(jax.device_get(a_f_hist))
-        if n_spcd:
-            u_s_hist_np = np.array(jax.device_get(u_s_hist))
-            a_s_hist_np = np.array(jax.device_get(a_s_hist))
+            def block_step_dense(state, b_in):
+                final_state, _ = jax.lax.scan(lambda s, ci: (single_step_dense(s, ci)[0], None), state, b_in)
+                u_s_last = b_in[1][-1]
+                a_s_last = b_in[3][-1]
+                return final_state, (final_state[0], final_state[1], final_state[2], u_s_last, a_s_last)
+
+            init_state = (jnp.zeros(n_free, dtype=jnp.float64),
+                          jnp.zeros(n_free, dtype=jnp.float64),
+                          jnp.array(udd_f0, dtype=jnp.float64))
+
+            if verbose:
+                print(f"    - [JAX] [4/5] JIT compiling & Block Integration ({n_blocks} blocks of {save_every} steps)...", flush=True)
+
+            _, (u_f_hist, v_f_hist, a_f_hist, u_s_hist, a_s_hist) = jax.lax.scan(block_step_dense, init_state, block_inputs)
+            u_f_hist = jax.block_until_ready(u_f_hist)
+
+            if verbose:
+                print(f"    - [JAX] Time Integration Finished ({time.time()-t0:.2f}s)")
+                print(f"    - [JAX] [5/5] Converting {len(u_f_hist)} frames to Numpy...", end="", flush=True)
+                t_conv = time.time()
+
+            del block_inputs, block_u_s, block_ud_s, block_udd_s, block_f_f
+            del K_ff_jax_sparse, K_struct_ff_sparse, C_ff, K_eff_ff, K_eff_lu
+            import gc; gc.collect()
+
+            u_f_hist_np = np.array(jax.device_get(u_f_hist))
+            v_f_hist_np = np.array(jax.device_get(v_f_hist))
+            a_f_hist_np = np.array(jax.device_get(a_f_hist))
+            if n_spcd:
+                u_s_hist_np = np.array(jax.device_get(u_s_hist))
+                a_s_hist_np = np.array(jax.device_get(a_s_hist))
+
+        else:
+            # Sparse path (large DOF): scipy splu + numpy loop
+            # JAX lax.scan + CG inside scan causes catastrophic JIT compile times for large DOFs
+            from scipy.sparse import csr_matrix as sp_csr
+            from scipy.sparse.linalg import splu as sp_splu
+
+            raw_nc_np = newmark_coeffs(newmark_beta, newmark_gamma, dt)
+            M_f_np  = np.array(M_diag[free_id], dtype=np.float64)
+            K_ff_sp = K[free_id, :][:, free_id].tocsr()
+            K_struct_ff_sp = K_struct[free_id, :][:, free_id].tocsr()
+            C_ff_sp = alpha * diags(M_f_np) + beta_r * K_struct_ff_sp
+            K_eff_sp = K_ff_sp + raw_nc_np["a0"] * diags(M_f_np) + raw_nc_np["a1"] * C_ff_sp
+            K_eff_lu_sp = sp_splu(K_eff_sp.tocsc())
+
+            K_fs_np = K_fs_full_scipy  # scipy CSR, already computed above
+            K_fs_struct_np = K_struct[free_id, :][:, spcd_id].tocsr() if n_spcd else None
+
+            u_s_np   = np.array(u_s_all,   dtype=np.float64)
+            ud_s_np  = np.array(ud_s_all,  dtype=np.float64)
+            udd_s_np = np.array(udd_s_all, dtype=np.float64)
+
+            u_f  = np.zeros(n_free, dtype=np.float64)
+            ud_f = np.zeros(n_free, dtype=np.float64)
+            udd_f = udd_f0.copy()
+
+            u_f_hist_np = np.zeros((n_blocks, n_free), dtype=np.float64)
+            v_f_hist_np = np.zeros((n_blocks, n_free), dtype=np.float64)
+            a_f_hist_np = np.zeros((n_blocks, n_free), dtype=np.float64)
+            u_s_hist_np = np.zeros((n_blocks, n_spcd), dtype=np.float64) if n_spcd else None
+            a_s_hist_np = np.zeros((n_blocks, n_spcd), dtype=np.float64) if n_spcd else None
+
+            if verbose:
+                print(f"    - [JAX] [4/5] scipy splu time integration ({total_steps_padded} steps)...", flush=True)
+                pbar = tqdm(total=n_blocks, desc="    JAX(sparse)", ncols=100)
+
+            for blk in range(n_blocks):
+                for s in range(save_every):
+                    step_i = blk * save_every + s
+                    u_s_i   = u_s_np[step_i]
+                    ud_s_i  = ud_s_np[step_i]
+                    f_f_i   = f_f_all_np[step_i]
+
+                    f_eff = f_f_i + M_f_np * (raw_nc_np["a0"]*u_f + raw_nc_np["a2"]*ud_f + raw_nc_np["a3"]*udd_f)
+                    f_eff = f_eff + C_ff_sp @ (raw_nc_np["a1"]*u_f + raw_nc_np["a4"]*ud_f + raw_nc_np["a5"]*udd_f)
+                    if n_spcd:
+                        f_eff -= K_fs_np @ u_s_i
+                        f_eff -= (beta_r * K_fs_struct_np) @ ud_s_i
+
+                    u_f_new  = K_eff_lu_sp.solve(f_eff)
+                    udd_f_new = raw_nc_np["a0"]*(u_f_new - u_f) - raw_nc_np["a2"]*ud_f - raw_nc_np["a3"]*udd_f
+                    ud_f_new  = ud_f + dt * ((1.0 - newmark_gamma)*udd_f + newmark_gamma*udd_f_new)
+                    u_f, ud_f, udd_f = u_f_new, ud_f_new, udd_f_new
+
+                u_f_hist_np[blk] = u_f
+                v_f_hist_np[blk] = ud_f
+                a_f_hist_np[blk] = udd_f
+                if n_spcd:
+                    u_s_hist_np[blk] = u_s_np[blk * save_every + save_every - 1]
+                    a_s_hist_np[blk] = udd_s_np[blk * save_every + save_every - 1]
+                if verbose:
+                    pbar.update(1)
+
+            if verbose:
+                pbar.close()
+                print(f"    - [JAX] Time Integration Finished ({time.time()-t0:.2f}s) [scipy splu]")
+                print(f"    - [JAX] [5/5] Results ready (no conversion needed)", flush=True)
+                t_conv = time.time()
         
-        u_saved = []
-        v_saved = []
-        a_saved = []
-        
+        # Include t=0 initial frame (matches scipy behavior: saves step 0 as first frame)
+        u_saved = [np.zeros((n_nodes, 6))]
+        v_saved = [np.zeros((n_nodes, 6))]
+        a_saved = [np.zeros((n_nodes, 6))]
+
         for i in range(n_blocks):
             u_vec = np.zeros(ndof)
             v_vec = np.zeros(ndof)
@@ -679,8 +747,8 @@ class WHTDynamicSolver(WHTSolver):
         if verbose:
             print(f" Done ({time.time()-t_conv:.2f}s)")
 
-        # Result times for each block (at the end of the block)
-        t_hist = np.arange(1, n_blocks + 1) * save_every * dt
+        # Result times: t=0 (initial) + end of each block
+        t_hist = np.concatenate([[0.0], np.arange(1, n_blocks + 1) * save_every * dt])
         res = DynamicResult(t_hist, sorted_nids)
         res.u = np.array(u_saved)
         res.v = np.array(v_saved)
@@ -747,7 +815,7 @@ class WHTDynamicSolver(WHTSolver):
         dynamic_result: DynamicResult,
         n_windows: int = 30,
         n_top: int = 10,
-        diversity_weight: float = 0.5,
+        diversity_weight: float = 0.5,  # noqa: ARG002 — 향후 다양성 기반 선별에 사용 예정
     ) -> List[WHTLoadCase]:
         """
         [Method A+] 동해석 결과로부터 다양성을 고려한 고급 ESL 로드케이스 추출.
@@ -911,7 +979,7 @@ class WHTDynamicSolver(WHTSolver):
         # 첫 스텝으로 필드 파악
         u0 = dynamic_result.u[0]
         quad_0 = ElementStressRecovery.recover_quad4_nodal(self.model, u0, sorted_nids)
-        tria_0 = ElementStressRecovery.recover_tria3_nodal(self.model, u0, sorted_nids)
+        ElementStressRecovery.recover_tria3_nodal(self.model, u0, sorted_nids)
 
         stress_data: dict = {}
         for fld in fields:

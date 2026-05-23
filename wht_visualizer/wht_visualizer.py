@@ -273,6 +273,7 @@ class WHTVisualizer:
         self.base_coords: Optional[np.ndarray] = None
         self._is_updating = False
         self._is_ready = False
+        self._kabsch = None  # KabschPreprocessor instance (강체 변환 시각화용)
         
         # State: Multi-Part Management
         self.parts: Dict[str, dict] = {} # {name: {"mesh": Grid, "actor": Actor, "style": dict}}
@@ -419,7 +420,14 @@ class WHTVisualizer:
         self.spin_scale.valueChanged.connect(self._on_warp_scale_changed)
         
         hbox_warp.addWidget(self.chk_warp)
-        
+
+        self.chk_rigid_body = QtWidgets.QCheckBox("Rigid Body")
+        self.chk_rigid_body.setChecked(False)
+        self.chk_rigid_body.setEnabled(False)
+        self.chk_rigid_body.setToolTip("Kabsch 강체 변환(R, T)을 시각화에 적용합니다.")
+        self.chk_rigid_body.stateChanged.connect(self._apply_warping)
+        hbox_warp.addWidget(self.chk_rigid_body)
+
         # Deform Vector Selection
         self.combo_warp_vec = QtWidgets.QComboBox()
         self.combo_warp_vec.setMinimumWidth(120)
@@ -995,10 +1003,11 @@ class WHTVisualizer:
             self.plotter.screenshot(file_path)
             print(f" -> Screenshot saved to {file_path}")
 
-    def show_result(self, result: "WHTResultData", group_name: Optional[str] = None, clear: bool = True):
+    def show_result(self, result: "WHTResultData", group_name: Optional[str] = None,
+                    clear: bool = True, kabsch=None):
         """
         Main entry point to display WHTResultData IR objects.
-        
+
         Parameters
         ----------
         result : WHTResultData
@@ -1007,13 +1016,20 @@ class WHTVisualizer:
             Prefix for part names to distinguish between multiple results.
         clear : bool, default True
             If True, clears the plotter before adding new data.
+        kabsch : KabschPreprocessor, optional
+            Kabsch 전처리 결과. 지정 시 "Rigid Body" 체크박스가 활성화되어
+            강체 변환(R, T)을 시각화에 적용할 수 있습니다.
         """
         if not result or result.nodes is None:
             print(" -> [Visualizer Warning] Attempted to load empty result data.")
             return
 
         self._is_ready = False
-        
+        self._kabsch = kabsch
+        self.chk_rigid_body.setEnabled(kabsch is not None)
+        if kabsch is None:
+            self.chk_rigid_body.setChecked(False)
+
         # Always update result_data to the latest loaded one
         self.result_data = result
         self.current_timestep = 0
@@ -1722,16 +1738,37 @@ class WHTVisualizer:
         except Exception as e:
             print(f" -> [Visualizer Error] Failed to bind data at step {t_idx}: {e}")
 
+    def _kabsch_frame(self, fem_t_idx: int) -> int:
+        """FEM 저장 프레임 인덱스를 Kabsch 시간 배열 인덱스로 변환합니다."""
+        if self._kabsch is None or self._kabsch.time_arr is None:
+            return 0
+        t_val = float(self.result_data.time_values[fem_t_idx]) if \
+            self.result_data and fem_t_idx < len(self.result_data.time_values) else 0.0
+        return int(np.searchsorted(self._kabsch.time_arr, t_val, side='left').clip(
+            0, len(self._kabsch.time_arr) - 1))
+
+    def _warp_pts(self, orig_pts: np.ndarray, disp: np.ndarray,
+                  ids: Optional[np.ndarray], scale: float) -> np.ndarray:
+        """orig_pts 에 변위를 적용하고 (선택적으로) 강체 변환을 덧씌웁니다."""
+        if ids is not None:
+            u = disp[ids, :3]
+        elif len(disp) == len(orig_pts):
+            u = disp[:, :3]
+        else:
+            u = np.zeros_like(orig_pts)
+        if self._kabsch is not None and self.chk_rigid_body.isChecked():
+            k_idx = self._kabsch_frame(self.current_timestep)
+            return self._kabsch.apply_rigid_body(orig_pts, u, k_idx, scale)
+        return orig_pts + u * scale
+
     def _apply_warping(self):
         """Applies displacement warping to all parts."""
         if not self.result_data: return
         chk = self.chk_warp.isChecked()
         scale = self.spin_scale.value()
-        
-        
+
         warp_field = self.combo_warp_vec.currentText()
         if not warp_field or warp_field not in self.result_data.point_data:
-            # Fallback to pure original points if no valid field
             for name, part in self.parts.items():
                 part["mesh"].points = part["orig_pts"]
                 active_mesh = part.get("active_mesh", part["mesh"])
@@ -1739,44 +1776,35 @@ class WHTVisualizer:
                     active_mesh.points = part["orig_pts"]
             return
 
+        use_rigid = self._kabsch is not None and self.chk_rigid_body.isChecked()
+
         for name, part in self.parts.items():
             mesh = part["mesh"]
             orig_pts = part["orig_pts"]
             orig_ids = mesh.point_data.get('vtkOriginalPointIds')
-            
+
             if chk:
                 disp_all = self.result_data.point_data[warp_field]
                 if self.current_timestep < len(disp_all):
                     disp = np.nan_to_num(disp_all[self.current_timestep])
-                    
-                    # Update Base Mesh
-                    if orig_ids is not None:
-                        mesh.points = orig_pts + disp[orig_ids, :3] * scale
-                    else:
-                        if len(disp) == len(orig_pts):
-                            mesh.points = orig_pts + disp[:, :3] * scale
-                    
-                    # Proactive Integrity: Also update active filtered mesh points if they share the same point count
-                    # Outline often has different points, but we can try to warp it if it has original IDs too
-                    active_mesh = part.get("active_mesh", mesh)
-                    if active_mesh is not mesh:
-                        # For filters like Feature Edges that preserve points, we can warp directly
-                        if active_mesh.n_points == mesh.n_points:
-                            active_mesh.points = mesh.points
-                        else:
-                            # If it's an outline or decimated mesh, we might need to re-generate 
-                            # but that's slow. For now, we only warp point-preserving filters.
-                            pass
+                    mesh.points = self._warp_pts(orig_pts, disp, orig_ids, scale)
+                elif use_rigid:
+                    mesh.points = self._warp_pts(orig_pts,
+                                                 np.zeros_like(orig_pts), orig_ids, scale)
+            elif use_rigid:
+                # Use Deform off이지만 Rigid Body on → 변형 없이 강체 변환만 적용
+                mesh.points = self._warp_pts(orig_pts,
+                                             np.zeros_like(orig_pts), orig_ids, scale)
             else:
                 mesh.points = orig_pts
-                active_mesh = part.get("active_mesh", mesh)
-                if active_mesh.n_points == mesh.n_points:
-                    active_mesh.points = orig_pts
-                
+
+            active_mesh = part.get("active_mesh", mesh)
+            if active_mesh is not mesh and active_mesh.n_points == mesh.n_points:
+                active_mesh.points = mesh.points
+
             if part["actor"] and hasattr(part["actor"], "mapper"):
                 part["actor"].mapper.SetInputData(mesh)
-        
-        # [WHT-FIX] Ensure symbolic markers (BC/Load) follow the warped mesh nodes
+
         self._sync_symbolic_positions()
 
         if hasattr(self.plotter, 'update'): self.plotter.update()
@@ -2156,38 +2184,40 @@ class WHTVisualizer:
             if self.current_timestep < len(disp_all):
                 disp = np.nan_to_num(disp_all[self.current_timestep])
         
+        use_rigid = self._kabsch is not None and self.chk_rigid_body.isChecked()
+        k_idx = self._kabsch_frame(self.current_timestep) if use_rigid else 0
+
         for key in ["BC", "Load", "RIGIDS"]:
             if key in self.actors_misc:
                 actor = self.actors_misc[key]
                 mesh = actor.mapper.dataset
-                
+
                 if key == "RIGIDS":
-                    # [WHT-FIX] Use VTK's original point IDs to map displacement
                     if "vtkOriginalPointIds" in mesh.point_data:
                         orig_nids = mesh.point_data["vtkOriginalPointIds"]
-                        pts = base_pts[orig_nids].copy()
-                        if disp is not None:
-                            pts += disp[orig_nids, :3] * scale
-                        mesh.points = pts
-                    else:
-                        # Fallback: skip update (vtkOriginalPointIds missing means
-                        # clear_point_data was called — do not corrupt mesh with wrong size)
-                        pass
+                        orig = base_pts[orig_nids]
+                        u = disp[orig_nids, :3] if disp is not None else np.zeros_like(orig)
+                        if use_rigid:
+                            mesh.points = self._kabsch.apply_rigid_body(orig, u, k_idx, scale)
+                        else:
+                            mesh.points = orig + u * scale
+                    # else: vtkOriginalPointIds 없으면 스킵
                 else:
-                    # BC/Load are PolyData with specific markers
                     poly = mesh
                     if "orig_idxs" in poly.point_data:
                         idxs = poly.point_data["orig_idxs"]
-                        pts = base_pts[idxs].copy()
-                        if disp is not None:
-                            pts += disp[idxs, :3] * scale
-                        
-                        # Apply BC offset (2mm) if it's the BC actor
+                        orig = base_pts[idxs]
+                        u = disp[idxs, :3] if disp is not None else np.zeros_like(orig)
+                        if use_rigid:
+                            pts = self._kabsch.apply_rigid_body(orig, u, k_idx, scale)
+                        else:
+                            pts = orig + u * scale
+
                         if key == "BC":
                             pts[:, 2] += 2.0
-                            
+
                         poly.points = pts
-                
+
                 actor.mapper.SetInputData(mesh)
 
     def _on_colormap_changed(self, cmap):
