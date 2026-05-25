@@ -856,6 +856,9 @@ class ESLExtractor:
             loadcase_name=lc_name,
         )
 
+        print(f"   {'코너':<6}  {'X_max(mm)':>10}  {'Y_max(mm)':>10}  {'Z_max(mm)':>10}  {'합계':>10}")
+        print(f"   {'─'*56}")
+        total_amp = 0.0
         for idx, (cname, cnids) in enumerate(self._bot_groups):
             center = np.mean([self.node_db[n] for n in cnids], axis=0)
             mnid   = 900000 + idx
@@ -863,11 +866,17 @@ class ESLExtractor:
             self.model.add_rbe3(mnid, mnid, cnids, dofs=(0, 1, 2))
             d = self._kabsch.deformation.get(cname)
             if d is None:
+                print(f"   {cname:<6}  [deformation 없음]")
                 continue
+            amps = [float(np.max(np.abs(d[:, i]))) for i in range(3)]
+            total_amp += sum(amps)
+            print(f"   {cname:<6}  {amps[0]:>10.4f}  {amps[1]:>10.4f}  {amps[2]:>10.4f}  {sum(amps):>10.4f}")
             for dof_idx, dof in enumerate([0, 1, 2]):   # X, Y, Z
                 self._load_groups.append(InterpLoadGroup(
                     [mnid], dof, self._time_arr, d[:, dof_idx], "SPCD"
                 ))
+        if total_amp < 1e-6:
+            print(f"   [WARN] 전체 SPCD 진폭 합계 {total_amp:.2e} mm ← Kabsch deformation ≈ 0, SE=0 예상")
 
     def _extract_global_z(self) -> dict:
         """CSV에서 글로벌 Z 상대 변위를 추출합니다."""
@@ -978,9 +987,65 @@ class ESLExtractor:
             )
         _endsec()
 
+    def _impact_segments(self) -> Optional[List[np.ndarray]]:
+        """Kabsch body-frame 가속도가 contact_threshold를 초과하는 연속 구간별
+        DynamicResult 저장 프레임 인덱스 목록을 반환합니다.
+
+        반환값: List[np.ndarray]  — 구간별 인덱스 배열 리스트 (시간 순)
+        산출 불가 시 None 반환 → 전체 프레임 단일 구간 fallback.
+        """
+        if self._kabsch is None or self._kabsch.accel_arr is None:
+            return None
+        if self._dyn_res is None:
+            return None
+
+        # body-frame 가속도 크기 (T_csv,)
+        a_world = self._kabsch.accel_arr.mean(axis=1)
+        a_body  = np.einsum('tji,tj->ti', self._kabsch.R_arr, a_world)
+        a_mag   = np.linalg.norm(a_body, axis=1)
+
+        impact_mask = a_mag > self.contact_threshold
+        impact_csv_idx = np.where(impact_mask)[0]
+
+        if len(impact_csv_idx) == 0:
+            print("   [ESL] 충격 구간 감지 없음 → 전체 프레임 사용")
+            return None
+
+        # 연속 구간 분리: 인덱스 차이 > 1이면 새 구간
+        breaks = np.where(np.diff(impact_csv_idx) > 1)[0] + 1
+        csv_segments = np.split(impact_csv_idx, breaks)
+
+        t_saved = self._dyn_res.t_saved
+        t_total = float(t_saved[-1]) if len(t_saved) > 1 else 1.0
+        segments: List[np.ndarray] = []
+        thr_g = self.contact_threshold / 9806.65
+        print(f"   [ESL] 충격 구간 감지 ({thr_g:.1f}g 기준): {len(csv_segments)}개 구간 (전후 3배 확장)")
+        for seg in csv_segments:
+            t_seg   = self._kabsch.time_arr[seg]
+            t0, t1  = float(t_seg[0]), float(t_seg[-1])
+            margin  = (t1 - t0) * 3.0          # 구간 지속시간의 3배
+            t_exp0  = max(0.0,     t0 - margin)
+            t_exp1  = min(t_total, t1 + margin)
+            dyn_idx = np.where(
+                (t_saved >= t_exp0) & (t_saved <= t_exp1)
+            )[0]
+            if len(dyn_idx) == 0:
+                continue
+            segments.append(dyn_idx)
+            print(f"     충격 t={t0:.3f}~{t1:.3f}s  →  확장 t={t_exp0:.3f}~{t_exp1:.3f}s "
+                  f"(동해석 {len(dyn_idx)}프레임)")
+
+        return segments if segments else None
+
     def _extract_esl_cases(self) -> None:
+        segments      = self._impact_segments()
+        scenario_name = Path(self.csv_path).parent.name or Path(self.csv_path).stem
         self._esl_cases = self._dyn_solver.extract_esl_advanced(
-            self._dyn_res, n_windows=self.n_windows, n_top=self.n_top
+            self._dyn_res,
+            n_windows     = self.n_windows,
+            n_top         = self.n_top,
+            impact_segments = segments,
+            scenario_name = scenario_name,
         )
 
     def _print_se_tables(self) -> None:
@@ -1706,19 +1771,22 @@ class TopographyPipeline:
             import copy
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
-            # ── 1단계: prepare() 순차 실행 (출력이 섞이지 않도록) ────────────
+            # ── 순차 모드: prepare() → solve_and_extract() 시나리오별 완전 순차 ──
+            if not use_parallel:
+                all_snaps = []
+                for (csv_path, t_start, t_end), w_dyn in zip(entries, w_list):
+                    ext = _make_extractor(csv_path, t_start, t_end, w_dyn, iteration, self.model)
+                    ext.prepare()
+                    all_snaps.extend(ext.solve_and_extract())
+                return all_snaps
+
+            # ── 병렬 모드: prepare() 순차 실행 후 solve_and_extract() 병렬 실행 ──
             extractors = []
             for (csv_path, t_start, t_end), w_dyn in zip(entries, w_list):
-                model_copy = copy.deepcopy(self.model) if use_parallel else self.model
+                model_copy = copy.deepcopy(self.model)
                 ext = _make_extractor(csv_path, t_start, t_end, w_dyn, iteration, model_copy)
                 ext.prepare()
                 extractors.append(ext)
-
-            if not use_parallel:
-                all_snaps = []
-                for ext in extractors:
-                    all_snaps.extend(ext.solve_and_extract())
-                return all_snaps
 
             # ── 2단계: solve_and_extract() 병렬 실행 ─────────────────────────
             n_proc = min(len(extractors), _n_par)
@@ -2936,8 +3004,8 @@ def main():
     g4.add_argument("--dynamic-opts", type=str, nargs='+', default=None,
                     metavar="CSV[,T_START[,T_END]]",
                     help="'CSV경로' / 'CSV경로,시작(s)' / 'CSV경로,시작(s),종료(s)' (모드 C/D)")
-    g4.add_argument("--add-inertia",  action="store_true",     help="관성 하중(-ma) 인가")
-    g4.add_argument("--n-top",        type=int, default=10,    help="추출 ESL 개수 (기본: 10)")
+    g4.add_argument("--add-inertia", "--add_inertia", action="store_true",     help="관성 하중(-ma) 인가")
+    g4.add_argument("--n-top",        type=int, default=5,    help="추출 ESL 개수 (기본: 5)")
     g4.add_argument("--n-windows",    type=int, default=30,    help="시간 이력 분할 수 (기본: 30)")
     g4.add_argument("--n-save-esl",   type=int, default=30,    help="ESL 추출용 저장 스냅샷 수 (기본: 30).")
     g4.add_argument("--use-global-z",    action="store_true",      help="글로벌 Z 궤적 직접 사용 (현재 미사용)")
@@ -2946,8 +3014,9 @@ def main():
     g4.add_argument("--w-dynamic",       type=float, nargs='+', default=[1.0],
                     metavar="W", help="시간분할 ESL 스냅샷 가중치 (기본: 1.0). CSV별 복수 지정 가능.")
     g4.add_argument("--w-peak",          type=float, default=0.0,  help="요소별 최대SE 피크 ESL 가중치 (기본: 0.0)")
-    g4.add_argument("--iterative-esl",   action="store_true", default=True, help="매 이터레이션 ESL 재추출 (기본: 활성)")
-    g4.add_argument("--no-iterative-esl", action="store_false", dest="iterative_esl", help="ESL 1회 추출 후 고정")
+    esl_group = g4.add_mutually_exclusive_group()
+    esl_group.add_argument("--iterative-esl",   action="store_true", dest="iterative_esl", default=True, help="매 이터레이션 ESL 재추출 (기본: 활성)")
+    esl_group.add_argument("--no-iterative-esl", action="store_false", dest="iterative_esl", help="ESL 1회 추출 후 고정")
     g4.add_argument("--parallel-scenarios", type=int, default=1, metavar="N", help="복수 CSV 시나리오 동시 실행 프로세스 수")
     g4.add_argument("--esl-skip-tol",  type=float, default=0.0,
                     metavar="TOL", help="반복 ESL 재추출 스킵 임계값 (기본: 0.0)")
