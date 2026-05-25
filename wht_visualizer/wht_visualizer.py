@@ -31,8 +31,12 @@ if TYPE_CHECKING:
 
 class WHTRangeDialog(QtWidgets.QDialog):
     """
-    [WHT Premium UI] Interactive dialog for real-time scalar range adjustment.
-    Features text-input for scientific notation, quick-snap buttons, and custom robust calculation.
+    [WHT Premium UI] Scalar range adjustment dialog.
+
+    - Static 모드: 사용자가 입력한 min/max 고정 범위를 Apply 시 적용.
+                   Field Min/Max 는 프레임 이동으로 누적된 전체-프레임 범위 표시.
+    - Dynamic 모드: min/max 입력 비활성, colorbar 범위는 자동(Robust/Auto) 유지.
+    - Apply: 설정 적용 후 닫기.  Cancel: 이전 상태 복원 후 닫기.
     """
     def __init__(self, parent_vis, field_name: str, dummy_group, get_limits_fn, get_robust_fn):
         super().__init__(parent_vis.plotter.app_window)
@@ -41,174 +45,197 @@ class WHTRangeDialog(QtWidgets.QDialog):
         self.dummy_group = dummy_group
         self.get_limits_fn = get_limits_fn
         self.get_robust_fn = get_robust_fn
-        
+
         self.setWindowTitle(f"Adjust Range: {field_name}")
-        self.setMinimumWidth(550)
-        
-        # Physical limits of the current field via hook
-        self.g_min, self.g_max = self.get_limits_fn()
-        
-        # For slider relative mapping (allows adjustment outside limits)
-        span = self.g_max - self.g_min
+        self.setMinimumWidth(560)
+
+        # 열릴 때 현재 상태 저장 (Cancel 용)
+        self._saved_mode = self.vis.current_range_mode
+        self._saved_min  = self.vis.range_min
+        self._saved_max  = self.vis.range_max
+
+        # 전체-프레임 누적 범위 (Field Min/Max 라벨용)
+        self.af_min, self.af_max = self.vis.get_allframe_range(field_name)
+
+        # 슬라이더 매핑 범위 (af 기준으로 여유 50%)
+        span = self.af_max - self.af_min
         if span <= 0: span = 1e-6
-        self.s_min = self.g_min - 0.5 * span
-        self.s_max = self.g_max + 0.5 * span
-        
+        self.s_min = self.af_min - 0.5 * span
+        self.s_max = self.af_max + 0.5 * span
+
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(15)
-        
-        # Helper: Create Slider-LineEdit Pair with bidirectional sync and snap buttons
-        def create_entry(label, current_val, limit_val):
+        layout.setSpacing(12)
+
+        # ── 1. Static / Dynamic 라디오 버튼 ─────────────────────────────
+        grp_mode = QtWidgets.QGroupBox("Range Mode")
+        h_mode = QtWidgets.QHBoxLayout(grp_mode)
+        self.radio_static  = QtWidgets.QRadioButton("Static  (Fixed Min/Max)")
+        self.radio_dynamic = QtWidgets.QRadioButton("Dynamic  (Auto / Robust)")
+        h_mode.addWidget(self.radio_static)
+        h_mode.addWidget(self.radio_dynamic)
+        is_static = (self.vis.current_range_mode == "Static (Fixed)")
+        self.radio_static.setChecked(is_static)
+        self.radio_dynamic.setChecked(not is_static)
+        self.radio_static.toggled.connect(self._on_mode_toggled)
+        layout.addWidget(grp_mode)
+
+        # ── 2. Min / Max 입력 그룹 ────────────────────────────────────────
+        def create_entry(label, current_val, allframe_val):
             group = QtWidgets.QGroupBox(label)
             vbox = QtWidgets.QVBoxLayout(group)
-            
-            # Label for physical limit (Always visible context)
-            lbl_limit = QtWidgets.QLabel(f"Field {label.split()[0]} (Actual): {limit_val:.4e}")
-            lbl_limit.setStyleSheet("color: #888888; font-size: 8pt; font-family: 'Consolas', monospace;")
+
+            lbl_limit = QtWidgets.QLabel(
+                f"Field {label.split()[0]} (All Frames): {allframe_val:.4e}")
+            lbl_limit.setStyleSheet(
+                "color: #888888; font-size: 8pt; font-family: 'Consolas', monospace;")
             vbox.addWidget(lbl_limit)
-            
+
             hbox = QtWidgets.QHBoxLayout()
-            
-            # LineEdit for Scientific Notation Support
             edit = QtWidgets.QLineEdit(f"{current_val:.4e}")
             val_validator = QtGui.QDoubleValidator()
             val_validator.setNotation(QtGui.QDoubleValidator.ScientificNotation)
             edit.setValidator(val_validator)
             edit.setMinimumWidth(120)
-            
-            # Snap Button
+
             btn_snap = QtWidgets.QPushButton("⏮️" if "Minimum" in label else "⏭️")
             btn_snap.setFixedWidth(40)
-            btn_snap.setToolTip(f"Snap to actual field {label.lower()}")
-            
+            btn_snap.setToolTip(f"Snap to all-frame field {label.lower()}")
+
             slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
             slider.setRange(0, 1000)
-            
-            # Sync logic
+
             def update_slider_from_edit():
                 try:
                     v = float(edit.text())
-                    # Map v to 0-1000 based on s_min, s_max
                     pct = (v - self.s_min) / (self.s_max - self.s_min)
                     slider.blockSignals(True)
                     slider.setValue(int(np.clip(pct, 0, 1) * 1000))
                     slider.blockSignals(False)
-                    self._trigger_update()
-                except ValueError: pass
+                except ValueError:
+                    pass
 
             def update_edit_from_slider(v):
                 val = self.s_min + (v / 1000.0) * (self.s_max - self.s_min)
                 edit.blockSignals(True)
                 edit.setText(f"{val:.4e}")
                 edit.blockSignals(False)
-                self._trigger_update()
-                
+
             def snap_to_limit():
-                edit.setText(f"{limit_val:.4e}")
+                edit.setText(f"{allframe_val:.4e}")
                 update_slider_from_edit()
 
             edit.textChanged.connect(update_slider_from_edit)
-            edit.returnPressed.connect(self._trigger_update) # Apply on Enter
             slider.valueChanged.connect(update_edit_from_slider)
             btn_snap.clicked.connect(snap_to_limit)
-            
-            # Initial Slider position (Block signals to prevent crash during init)
+
             pct_init = (current_val - self.s_min) / (self.s_max - self.s_min)
             slider.blockSignals(True)
             slider.setValue(int(np.clip(pct_init, 0, 1) * 1000))
             slider.blockSignals(False)
-            
+
             hbox.addWidget(slider, 3)
             hbox.addWidget(edit, 1)
             hbox.addWidget(btn_snap)
             vbox.addLayout(hbox)
             return group, edit, slider
 
-        self.grp_min, self.edit_min, self.slider_min = create_entry("Minimum Threshold", self.vis.range_min, self.g_min)
-        self.grp_max, self.edit_max, self.slider_max = create_entry("Maximum Threshold", self.vis.range_max, self.g_max)
-        
+        self.grp_min, self.edit_min, self.slider_min = create_entry(
+            "Minimum Threshold", self.vis.range_min, self.af_min)
+        self.grp_max, self.edit_max, self.slider_max = create_entry(
+            "Maximum Threshold", self.vis.range_max, self.af_max)
         layout.addWidget(self.grp_min)
         layout.addWidget(self.grp_max)
-        
-        # Robust Tools Group
-        group_robust = QtWidgets.QGroupBox("Statistical Robustness")
+
+        # ── 3. Robust 도구 그룹 ───────────────────────────────────────────
+        group_robust = QtWidgets.QGroupBox("Statistical Robustness  (Static 모드 전용)")
         h_robust = QtWidgets.QHBoxLayout(group_robust)
-        
-        # User requested editable robust percentage (default 98%)
         self.spin_robust = QtWidgets.QDoubleSpinBox()
         self.spin_robust.setRange(50.0, 100.0)
         self.spin_robust.setValue(self.dummy_group.get_robust_pct())
         self.spin_robust.setSuffix(" %")
-        self.spin_robust.setToolTip("데이터 분포의 중심 백분율을 설정합니다.\n(예: 98% 설정 시 상/하위 1%씩을 특이점으로 간주하여 제외)")
-        
+        self.spin_robust.setToolTip("데이터 분포의 중심 백분율 (예: 98% → 상/하위 1% 특이점 제외)")
         btn_robust = QtWidgets.QPushButton("Apply Robust Auto")
-        btn_robust.setToolTip("설정된 백분율을 기반으로 특이점을 제외한 유효 범위를 자동 계산하여 적용합니다.")
         btn_robust.clicked.connect(self._apply_robust)
-        
         btn_global = QtWidgets.QPushButton("Full Global Auto")
-        btn_global.setToolTip("전체 데이터의 절대 최소/최대값으로 범위를 확장합니다.")
+        btn_global.setToolTip("전체-프레임 절대 최소/최대값으로 범위 설정")
         btn_global.clicked.connect(self._apply_global)
-        
+        btn_find = QtWidgets.QPushButton("🔍 Find Outliers")
+        btn_find.clicked.connect(self._find_outliers)
         h_robust.addWidget(QtWidgets.QLabel("Threshold:"))
         h_robust.addWidget(self.spin_robust)
         h_robust.addWidget(btn_robust)
         h_robust.addWidget(btn_global)
-        
-        btn_find = QtWidgets.QPushButton("🔍 Find Outliers")
-        btn_find.setToolTip("현재 입력된 최대값(Max Threshold)을 초과하는 노드들을 3D 뷰에서 강조 표시합니다.")
-        btn_find.clicked.connect(self._find_outliers)
         h_robust.addWidget(btn_find)
-        
+        self.group_robust = group_robust
         layout.addWidget(group_robust)
-        
-        # Footer
-        btn_close = QtWidgets.QPushButton("Done")
-        btn_close.clicked.connect(self.accept)
-        btn_close.setAutoDefault(False); btn_close.setDefault(False) # Prevent Enter from closing
-        layout.addWidget(btn_close)
-        
-        # Cleanup on close
+
+        # ── 4. Apply / Cancel 버튼 ────────────────────────────────────────
+        h_btns = QtWidgets.QHBoxLayout()
+        btn_apply  = QtWidgets.QPushButton("Apply")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_apply.setDefault(True)
+        btn_apply.clicked.connect(self._on_apply)
+        btn_cancel.clicked.connect(self._on_cancel)
+        h_btns.addStretch()
+        h_btns.addWidget(btn_apply)
+        h_btns.addWidget(btn_cancel)
+        layout.addLayout(h_btns)
+
         self.finished.connect(self._cleanup)
 
-    def _cleanup(self):
-        """Removes outlier highlights when the dialog is closed."""
-        self.vis.clear_outliers()
+        # 초기 활성화 상태 동기화
+        self._on_mode_toggled(self.radio_static.isChecked())
 
-    def _trigger_update(self):
-        """Live-sync with the main visualizer state."""
-        if not hasattr(self, 'edit_min') or not hasattr(self, 'edit_max'):
-            return
-            
-        try:
-            self.vis.range_min = float(self.edit_min.text())
-            self.vis.range_max = float(self.edit_max.text())
-            
-            # Force switch to Static mode so the manual values persist
+    def _on_mode_toggled(self, static_checked: bool):
+        """Static/Dynamic 전환에 따라 min/max 입력 활성화 여부 제어."""
+        self.grp_min.setEnabled(static_checked)
+        self.grp_max.setEnabled(static_checked)
+        self.group_robust.setEnabled(static_checked)
+
+    def _on_apply(self):
+        if self.radio_static.isChecked():
+            try:
+                self.vis.range_min = float(self.edit_min.text())
+                self.vis.range_max = float(self.edit_max.text())
+            except ValueError:
+                pass
             self.vis.current_range_mode = "Static (Fixed)"
-            self.vis._apply_colorbar_range()
-        except ValueError: pass
+        else:
+            self.vis.current_range_mode = "Robust (Auto)"
+        self.vis._apply_colorbar_range(show_stats=True)
+        self.accept()
+
+    def _on_cancel(self):
+        # 열리기 전 상태로 복원
+        self.vis.current_range_mode = self._saved_mode
+        self.vis.range_min = self._saved_min
+        self.vis.range_max = self._saved_max
+        self.vis._apply_colorbar_range()
+        self.reject()
+
+    def _cleanup(self):
+        self.vis.clear_outliers()
 
     def _apply_robust(self):
         pct = self.spin_robust.value()
         p_low = (100.0 - pct) / 2.0
-        p_high = 100.0 - p_low
-        rng = self.vis._calculate_robust_range(self.field, p_low=p_low, p_high=p_high)
+        rng = self.vis._calculate_robust_range(self.field, p_low=p_low, p_high=100.0 - p_low)
         self.edit_min.setText(f"{rng[0]:.4e}")
         self.edit_max.setText(f"{rng[1]:.4e}")
 
     def _apply_global(self):
-        self.edit_min.setText(f"{self.g_min:.4e}")
-        self.edit_max.setText(f"{self.g_max:.4e}")
+        self.edit_min.setText(f"{self.af_min:.4e}")
+        self.edit_max.setText(f"{self.af_max:.4e}")
 
     def _find_outliers(self):
-        """Triggers the visualizer to highlight nodes exceeding the currently entered max."""
         try:
             threshold = float(self.edit_max.text())
             self.vis._highlight_outliers(self.field, threshold)
-        except ValueError: pass
+        except ValueError:
+            pass
 
 
 class WHTVisualizer:
@@ -287,6 +314,9 @@ class WHTVisualizer:
         self.cb_levels = 10
         self.cb_decimals = 1
 
+        # Bead discrete levels (0 = continuous)
+        self._bead_steps = 0
+
         # 3. Setup UI Pipeline (Order Matters!)
         self._setup_tabbed_dock()     # Creates self.list_parts
         self._setup_playback_ui()     # Creates playback controls
@@ -295,6 +325,17 @@ class WHTVisualizer:
         self._setup_menubar()         # Creates pull-down menus
         
         self._is_ready = True
+
+    def set_bead_discrete_levels(self, bead_steps: int) -> None:
+        """
+        Bead_Height scalar bar를 이산 레벨 표시로 설정합니다.
+
+        bead_steps=0 → 연속 colormap (기본)
+        bead_steps=N → N+1 레벨 discrete colormap
+            bead_steps=1 → {0, h_max}  2색
+            bead_steps=2 → {0, 0.5, 1} 3색
+        """
+        self._bead_steps = bead_steps
 
     def _apply_ui_theme(self, is_dark: bool = True):
         """
@@ -487,6 +528,8 @@ class WHTVisualizer:
         self.range_max = 1.0
         self.current_range_mode = "Robust (Auto)"
         self.robust_pct = 98.0
+        # 프레임 이동 누적 전체-프레임 min/max 캐시 {field_name: (min, max)}
+        self._field_allframe_range: dict = {}
         
         # --- Colorbar Display Mode Group ---
         hbox_cb_mode = QtWidgets.QHBoxLayout()
@@ -877,6 +920,22 @@ class WHTVisualizer:
 
         self.list_parts.itemChanged.connect(self._on_part_item_changed)
 
+        # 툴바 우측 끝 고정 로고
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self.toolbar.addWidget(spacer)
+
+        logo_lbl = QtWidgets.QLabel()
+        _logo_path = os.path.join(os.path.dirname(__file__), "..", "wht_topo", "resources", "logo_icon_48x48.png")
+        _logo_path = os.path.normpath(_logo_path)
+        if os.path.exists(_logo_path):
+            _pix = QtGui.QPixmap(_logo_path).scaled(
+                36, 36, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            logo_lbl.setPixmap(_pix)
+        logo_lbl.setToolTip("WHT FEM Visualizer")
+        logo_lbl.setContentsMargins(4, 0, 8, 0)
+        self.toolbar.addWidget(logo_lbl)
+
     def _add_toolbar_action(self, text, tooltip, icon, func, checkable=False, checked=False):
         """Helper to create and add graphical actions to the toolbar."""
         action = QtGui.QAction(icon if isinstance(icon, QtGui.QIcon) else QtGui.QIcon(), text, self.plotter.app_window)
@@ -1172,9 +1231,20 @@ class WHTVisualizer:
             mesh.set_active_scalars(current_field)
 
         # 2. Add mesh to plotter
-        n_col = self.cb_levels if self.cb_mode == "Discrete" else 256
-        n_lbl = (self.cb_levels + 1) if self.cb_mode == "Discrete" else 11
-        fmt_str = f"%.{self.cb_decimals}e"
+        # Bead_Height scalar이고 discrete steps가 설정된 경우 이산 colormap 강제 적용
+        is_bead_discrete = (
+            current_field == "Bead_Height"
+            and getattr(self, "_bead_steps", 0) >= 1
+        )
+        if is_bead_discrete:
+            n_discrete = self._bead_steps + 1  # bead_steps=1→2색, =2→3색
+            n_col = n_discrete
+            n_lbl = n_discrete
+            fmt_str = "%.2f"
+        else:
+            n_col = self.cb_levels if self.cb_mode == "Discrete" else 256
+            n_lbl = (self.cb_levels + 1) if self.cb_mode == "Discrete" else 11
+            fmt_str = f"%.{self.cb_decimals}e"
         
         actor = self.plotter.add_mesh(
             mesh, 
@@ -1221,7 +1291,16 @@ class WHTVisualizer:
             )
             # [WHT] 폭을 60px로 고정 (사용자 요청 사항)
             self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
-        
+            # Bead_Height discrete: scalar bar 레벨 경계를 이산값으로 명시
+            if is_bead_discrete:
+                import numpy as _np
+                levels = _np.linspace(0.0, 1.0, self._bead_steps + 1)
+                sb = self.plotter.scalar_bar
+                sb.SetNumberOfLabels(len(levels))
+                lut = actor.mapper.lookup_table
+                lut.n_values = self._bead_steps + 1
+                lut.scalar_range = (0.0, 1.0)
+
         # Trigger explicit update if Body Color
         if current_field == "Body Color":
             actor.prop.color = 'lightgrey'
@@ -1821,9 +1900,10 @@ class WHTVisualizer:
             
             self._bind_data_to_mesh(t_idx)
             self._apply_warping()
-            # [WHT Performance] Scalar range is usually held static during playback 
+            self._update_allframe_range()
+            # [WHT Performance] Scalar range is usually held static during playback
             # unless Dynamic mode is on.
-            self._apply_colorbar_range(show_stats=False) 
+            self._apply_colorbar_range(show_stats=False)
             self.plotter.render()
         finally:
             self._is_updating = False
@@ -1909,7 +1989,7 @@ class WHTVisualizer:
             self._update_active_result()
 
     def _get_field_global_range(self, field_name: str) -> Tuple[float, float]:
-        """Calculates absolute min/max for a field across all parts."""
+        """Calculates absolute min/max for a field across all parts (current frame)."""
         rng = [float('inf'), float('-inf')]
         for part in self.parts.values():
             m = part["mesh"]
@@ -1919,6 +1999,24 @@ class WHTVisualizer:
                 rng[1] = max(rng[1], r[1])
         if rng[0] == float('inf'): return 0.0, 1.0
         return float(rng[0]), float(rng[1])
+
+    def _update_allframe_range(self):
+        """프레임 이동 시 현재 프레임의 활성 필드 범위를 누적하여 전체-프레임 min/max 캐시를 갱신한다."""
+        field = self._get_active_field_name()
+        if not field or field == "Body Color":
+            return
+        cur_min, cur_max = self._get_field_global_range(field)
+        prev = self._field_allframe_range.get(field)
+        if prev is None:
+            self._field_allframe_range[field] = (cur_min, cur_max)
+        else:
+            self._field_allframe_range[field] = (min(prev[0], cur_min), max(prev[1], cur_max))
+
+    def get_allframe_range(self, field_name: str) -> Tuple[float, float]:
+        """field_name 의 전체-프레임 누적 min/max 를 반환한다. 미탐색 프레임은 현재 프레임 범위로 fallback."""
+        if field_name in self._field_allframe_range:
+            return self._field_allframe_range[field_name]
+        return self._get_field_global_range(field_name)
 
     def _resolve_shell_layer_category(self, base_category: str) -> str:
         """Shell Layer 콤보 선택에 따라 실제 cell_data 키를 결정합니다.

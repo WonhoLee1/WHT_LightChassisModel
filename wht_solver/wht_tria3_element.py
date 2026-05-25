@@ -147,7 +147,7 @@ def _element_K_tria3(c1, c2, c3, t, E, nu):
     #   모든 검증 타겟 주파수(~250 Hz 이하)와 충분히 분리됨.
     #
     #   QUAD4(1.0) 대비 100배 약하므로 굽힘·전단·막(membrane) 거동에는 영향 없음.
-    Ktt = 1.0e-2 * G * t
+    Ktt = 1.0e-5 * G * t
     Bd = np.zeros((1, 18))
     for i in range(3):
         Bd[0, 6*i] = -0.5 * dN_dy[i]; Bd[0, 6*i+1] = 0.5 * dN_dx[i]; Bd[0, 6*i+5] = -1.0/3.0
@@ -183,15 +183,19 @@ def M_tria3_lumped(wht_model, ndof: int, sorted_nids, nid_to_idx) -> np.ndarray:
     nid_arr = list(sorted_nids); nid_to_crds = {nid: [wht_model.nodes[nid].x, wht_model.nodes[nid].y, wht_model.nodes[nid].z] for nid in nid_arr}
     for eid, elem in wht_model.elements.items():
         if elem.type not in ("TRIA3", "TRIA"): continue
-        pid = elem.pid; prop = wht_model.properties.get(pid); mat = wht_model.materials.get(prop.mid) if prop else None
-        if not prop: continue
+        pid = getattr(elem, "pid", None)
+        if pid is None or pid == 0:
+            raise ValueError(f"TRIA 요소 {eid}에 유효한 pid 속성이 누락되었습니다. 모달 해석 시 0 질량 에러의 원인이 됩니다.")
+        prop = wht_model.properties.get(pid)
+        if not prop:
+            raise ValueError(f"TRIA 요소 {eid}의 pid={pid}에 해당하는 속성(Property)을 찾을 수 없습니다.")
+        mat = wht_model.materials.get(prop.mid)
         t = prop.t; rho = mat.rho if mat else 7.85e-9
         c1, c2, c3 = [np.array(nid_to_crds[nid]) for nid in elem.node_ids]
         area = tri_area(c1, c2, c3)
         m_node = (area * t * rho) / 3.0
-        # Characteristic length for rotational inertia calculation
-        L_char = np.sqrt(4.0 * area / np.sqrt(3.0))
-        rot_inert = max(m_node * (L_char**2) / 12.0, 1e-8)
+        # 회전 관성에 1e-8 하한값을 고정으로 주면 고밀도 메쉬에서 회전 관성이 과대계상되어 벤딩 모드 형상을 심각하게 왜곡함.
+        rot_inert = m_node * (t**2 + area) / 12.0
         for nid in elem.node_ids:
             idx = nid_to_idx[nid] * 6; M_diag[idx:idx+3] += m_node; M_diag[idx+3:idx+6] += rot_inert
     return M_diag

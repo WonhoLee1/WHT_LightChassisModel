@@ -112,7 +112,7 @@ def _element_K_mitc4_plus_jax(c1, c2, c3, c4, t, E, nu):
     K_loc = jnp.zeros((24, 24))
     K_drill = jnp.zeros((24, 24))
     gp = jnp.array([-1.0/jnp.sqrt(3), 1.0/jnp.sqrt(3)])
-    Ktt = 1.0 * G * t 
+    Ktt = 1.0e-5 * G * t 
 
     for xi_g in gp:
         for eta_g in gp:

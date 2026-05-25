@@ -284,6 +284,139 @@ class WHTSolverResult:
             
         return eff_mass, total_mass_cg
 
+    def save_modal_report(self, filepath: str) -> None:
+        """
+        CalculiX의 .dat 파일 형식과 동일한 양식으로 모달 해석 결과를 파일로 출력합니다.
+        지정된 filepath에 UTF-8 인코딩으로 저장됩니다.
+
+        Parameters
+        ----------
+        filepath : str
+            출력 파일의 절대 또는 상대 경로
+        """
+        if self.analysis_type != "modal":
+            raise ValueError("모달 해석 결과가 아닙니다. save_modal_report는 모달 해석 결과에서만 사용 가능합니다.")
+        if self.frequencies is None or self.mode_shapes is None:
+            raise ValueError("주파수 및 모드 형상 데이터가 존재하지 않습니다.")
+
+        n_modes = len(self.frequencies)
+        eigenvalues = (2.0 * np.pi * self.frequencies) ** 2
+
+        n_nodes = self.n_nodes
+        if not hasattr(self, 'node_coords') or not hasattr(self, 'nodal_mass'):
+            raise ValueError("물리량 계산을 위한 node_coords 또는 nodal_mass 데이터가 결과 객체에 포함되어 있지 않습니다.")
+
+        M = self.nodal_mass.reshape(n_nodes, 6)  # (N, 6)
+        coords = self.node_coords  # (N, 3)
+
+        # 1. Center of Gravity (CG)
+        total_m = np.sum(M[:, :3], axis=0)
+        cg = np.sum(M[:, :3] * coords, axis=0) / total_m
+
+        # 2. Rigid Body Matrix R
+        R = np.zeros((n_nodes, 6, 6))
+        I3 = np.eye(3)
+        R[:, 0:3, 0:3] = I3
+        R[:, 3:6, 3:6] = I3
+        r = coords - cg
+        R[:, 0, 4] = r[:, 2]
+        R[:, 0, 5] = -r[:, 1]
+        R[:, 1, 3] = -r[:, 2]
+        R[:, 1, 5] = r[:, 0]
+        R[:, 2, 3] = r[:, 1]
+        R[:, 2, 4] = -r[:, 0]
+
+        # 3. Modal Participation Factors L
+        L = np.zeros((n_modes, 6))
+        for m in range(n_modes):
+            phi_m = self.mode_shapes[m]
+            L[m] = np.sum(phi_m[:, :, np.newaxis] * M[:, :, np.newaxis] * R, axis=(0, 1))
+
+        # 4. Effective Mass meff = L^2
+        eff_mass = L ** 2
+
+        # Cumulative sum of effective mass
+        total_eff_mass = np.sum(eff_mass, axis=0)
+
+        # Total physical mass/inertia components at CG
+        total_mass_cg = np.zeros(6)
+        total_mass_cg[:3] = total_m
+        for i in range(n_nodes):
+            r_i = coords[i] - cg
+            total_mass_cg[3] += M[i, 0] * (r_i[1]**2 + r_i[2]**2)
+            total_mass_cg[4] += M[i, 1] * (r_i[0]**2 + r_i[2]**2)
+            total_mass_cg[5] += M[i, 2] * (r_i[0]**2 + r_i[1]**2)
+
+        # Fraction of totals
+        fraction_of_totals = total_eff_mass / total_mass_cg
+
+        # Format lines mimicking CalculiX .dat
+        lines = []
+        lines.append("")
+        lines.append("                        S T E P       1")
+        lines.append("")
+        lines.append("")
+        lines.append("      E I G E N V A L U E   O U T P U T")
+        lines.append("")
+        lines.append(" MODE NO    EIGENVALUE                       FREQUENCY   ")
+        lines.append("                                     REAL PART            IMAGINARY PART")
+        lines.append("                            (RAD/TIME)      (CYCLES/TIME     (RAD/TIME)")
+        lines.append("")
+
+        for m in range(n_modes):
+            mode_num = m + 1
+            eig_val = eigenvalues[m]
+            freq_rad = 2.0 * np.pi * self.frequencies[m]
+            freq_hz = self.frequencies[m]
+            imag_part = 0.0
+
+            lines.append(f"{mode_num:8d}  {eig_val:15.7E}   {freq_rad:13.7E}   {freq_hz:13.7E}   {imag_part:13.7E}")
+
+        lines.append("")
+        lines.append("      P A R T I C I P A T I O N   F A C T O R S")
+        lines.append("")
+        lines.append(" MODE NO.   X-COMPONENT     Y-COMPONENT     Z-COMPONENT     X-ROTATION      Y-ROTATION      Z-ROTATION")
+        lines.append("")
+
+        for m in range(n_modes):
+            mode_num = m + 1
+            lines.append(f"{mode_num:8d}  {L[m, 0]:14.7E}  {L[m, 1]:14.7E}  {L[m, 2]:14.7E}  {L[m, 3]:14.7E}  {L[m, 4]:14.7E}  {L[m, 5]:14.7E}")
+
+        lines.append("")
+        lines.append("      E F F E C T I V E   M O D A L   M A S S")
+        lines.append("")
+        lines.append(" MODE NO.   X-COMPONENT     Y-COMPONENT     Z-COMPONENT     X-ROTATION      Y-ROTATION      Z-ROTATION")
+        lines.append("")
+
+        for m in range(n_modes):
+            mode_num = m + 1
+            lines.append(f"{mode_num:8d}  {eff_mass[m, 0]:14.7E}  {eff_mass[m, 1]:14.7E}  {eff_mass[m, 2]:14.7E}  {eff_mass[m, 3]:14.7E}  {eff_mass[m, 4]:14.7E}  {eff_mass[m, 5]:14.7E}")
+
+        lines.append(f" TOTAL     {total_eff_mass[0]:14.7E}  {total_eff_mass[1]:14.7E}  {total_eff_mass[2]:14.7E}  {total_eff_mass[3]:14.7E}  {total_eff_mass[4]:14.7E}  {total_eff_mass[5]:14.7E}")
+        
+        lines.append("")
+        lines.append("      T O T A L   E F F E C T I V E   M A S S")
+        lines.append("")
+        lines.append("            X-COMPONENT     Y-COMPONENT     Z-COMPONENT     X-ROTATION      Y-ROTATION      Z-ROTATION")
+        lines.append("")
+        lines.append(f"           {total_mass_cg[0]:14.7E}  {total_mass_cg[1]:14.7E}  {total_mass_cg[2]:14.7E}  {total_mass_cg[3]:14.7E}  {total_mass_cg[4]:14.7E}  {total_mass_cg[5]:14.7E}")
+        
+        lines.append("")
+        lines.append("")
+        lines.append("      F R A C T I O N   O F   T O T A L S")
+        lines.append("")
+        lines.append("            X-COMPONENT     Y-COMPONENT     Z-COMPONENT     X-ROTATION      Y-ROTATION      Z-ROTATION")
+        lines.append("")
+        lines.append(f"           {fraction_of_totals[0]:14.7E}  {fraction_of_totals[1]:14.7E}  {fraction_of_totals[2]:14.7E}  {fraction_of_totals[3]:14.7E}  {fraction_of_totals[4]:14.7E}  {fraction_of_totals[5]:14.7E}")
+        lines.append("")
+        lines.append("")
+
+        import os
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+        print(f"    - [Output] Modal analysis report saved to: {filepath}")
+
     def truncate(self, n: int):
         """Truncate the result set to the first n modes."""
         if self.frequencies is not None and len(self.frequencies) > n:

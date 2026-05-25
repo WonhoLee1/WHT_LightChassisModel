@@ -29,12 +29,27 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QTabWidget, QHeaderView,
     QComboBox, QLabel, QPushButton, QSlider, QFileDialog,
     QMessageBox, QSizePolicy,
+    QMenu, QDialog, QFormLayout, QDialogButtonBox,
 )
 from PySide6.QtCore import Signal, QObject, QThread, Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QAction
 import matplotlib
 matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
+
+# ────────────────────────────────────────────────────────────────────────────
+# AutoCalculix API Dynamic Path & Import
+# ────────────────────────────────────────────────────────────────────────────
+import sys
+AUTOCALCULIX_PATH = "D:/PythonCodeStudy/AutoCalculix"
+if AUTOCALCULIX_PATH not in sys.path:
+    sys.path.append(AUTOCALCULIX_PATH)
+
+try:
+    from src.autocalculix_api import run_calculix_analysis
+except ImportError:
+    # 예외 처리: 경로가 아직 유효하지 않거나 오타가 난 경우에 대비
+    run_calculix_analysis = None
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
 plt.rcParams['font.size'] = 9
@@ -165,6 +180,311 @@ class _ReAnalysisWorker(QThread):
             })
 
         except Exception:
+            self.error.emit(traceback.format_exc())
+
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CalculiX Re-analysis worker (QThread)
+# ────────────────────────────────────────────────────────────────────────────
+
+class _CalculixReAnalysisWorker(QThread):
+    """
+    별도 QThread 에서 CalculiX를 사용한 모달/정적 재해석을 구동하고
+    CalculiX가 뱉어낸 3D 가시화 mesh(VTU) 자체로부터 WHTResultData를 직접 빌드하여
+    원래 2D 모델 노드 개수와의 불일치(ValueError: broadcast)를 우회하고 3D 볼륨 가시화를 실현합니다.
+    """
+    finished = Signal(dict)
+    error    = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, snap_dir: str, iter_num: int, case_name: str,
+                 num_modal_modes: int = 20, parent=None):
+        super().__init__(parent)
+        self.snap_dir         = snap_dir
+        self.iter_num         = iter_num
+        self.case_name        = case_name
+        self.num_modal_modes  = num_modal_modes
+
+    def run(self):
+        try:
+            import numpy as np
+            import pickle
+            from pathlib import Path
+            snap_dir = Path(self.snap_dir)
+
+            self.progress.emit("Snapshots 정보 로드 및 변형 메시 생성 중...")
+            with open(snap_dir / "init.pkl", "rb") as f:
+                init = pickle.load(f)
+
+            model       = init["model"]
+            bead_dir    = init["bead_dir"]
+            design_nids = init["design_nids"]
+            aggr_src    = init["aggr_src"]
+            aggr_dst    = init["aggr_dst"]
+            orig_coords = init["orig_coords"]
+
+            # 원본 좌표 복원
+            for nid, (x, y, z) in orig_coords.items():
+                nd = model.nodes[nid]
+                nd.x, nd.y, nd.z = x, y, z
+
+            # 이터레이션 비드 높이 적용
+            if self.iter_num == 0:
+                h_elem = np.zeros(len(init["design_elems"]))
+                load_cases_raw = init.get("static_load_cases", [])
+                load_cases     = [(lc.name, w, lc) for lc, w in load_cases_raw]
+            else:
+                iter_file = snap_dir / f"iter_{self.iter_num:03d}.pkl"
+                self.progress.emit(f"iter_{self.iter_num:03d}.pkl 로드 중...")
+                with open(iter_file, "rb") as f:
+                    snap = pickle.load(f)
+                h_elem = snap["h_elem"]
+                load_cases = snap.get("load_cases", [])
+
+            # h_elem -> h_node
+            n_int      = len(design_nids)
+            h_node_sum = np.zeros(n_int)
+            np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+            node_adj   = np.bincount(aggr_src, minlength=n_int)
+            h_node     = h_node_sum / (node_adj + 1e-12)
+
+            for i, nid in enumerate(design_nids):
+                ox, oy, oz = orig_coords[nid]
+                nd = model.nodes[nid]
+                dh = float(h_node[i])
+                nd.x = ox + dh * bead_dir[0]
+                nd.y = oy + dh * bead_dir[1]
+                nd.z = oz + dh * bead_dir[2]
+
+            # ── CalculiX 용 입력 매핑 ─────────────────────────────────────────
+            nodes_dict = {nid: (nd.x, nd.y, nd.z) for nid, nd in model.nodes.items()}
+            
+            elements_list = []
+            for eid, elem in model.elements.items():
+                etype = getattr(elem, "element_type", "QUAD4")
+                pid   = getattr(elem, "pid", 1)
+                elements_list.append((eid, etype, list(elem.node_ids), pid))
+                
+            properties_dict = {}
+            for pid, prop in getattr(model, "properties", {}).items():
+                t = getattr(prop, "t", 1.2)
+                mid = getattr(prop, "mid", 1)
+                mat = getattr(model, "materials", {}).get(mid)
+                E = getattr(mat, "E", 210000.0)
+                nu = getattr(mat, "nu", 0.3)
+                rho = getattr(mat, "rho", 7.85e-9)
+                properties_dict[pid] = (t, E, nu, rho)
+                
+            if not properties_dict:
+                properties_dict[1] = (1.2, 210000.0, 0.3, 7.85e-9)
+
+            job_name = f"ccx_iter{self.iter_num:03d}_{self.case_name.replace(' ', '_')}"
+            analysis_config = {
+                "job_name": job_name,
+                "num_modes": self.num_modal_modes
+            }
+            
+            bcs = []
+            forces = []
+            analysis_type = "modal" if self.case_name == "Modal Analysis" else "static"
+            
+            if analysis_type == "static":
+                lc_obj = None
+                for entry in load_cases:
+                    if entry[0] == self.case_name:
+                        lc_obj = entry[2]
+                        break
+                if lc_obj is None:
+                    raise ValueError(f"하중 케이스 '{self.case_name}'를 찾을 수 없습니다.")
+                
+                # SPC 구속조건 매핑
+                for bc in lc_obj.bcs:
+                    bcs.append((bc.node_id, list(bc.dofs), getattr(bc, "value", 0.0)))
+                # FORCE 하중조건 매핑
+                for fc in lc_obj.forces:
+                    forces.append((fc.node_id, list(fc.load_vector)))
+
+            # ── AutoCalculix API 호출 ─────────────────────────────────────────
+            self.progress.emit("CalculiX 솔버 및 변환 스레드 구동 중...")
+            
+            if run_calculix_analysis is None:
+                raise ImportError("AutoCalculix API 모듈을 임포트하지 못했습니다. D:/PythonCodeStudy/AutoCalculix 경로를 점검하십시오.")
+                
+            ccx_result = run_calculix_analysis(
+                nodes=nodes_dict,
+                elements=elements_list,
+                properties=properties_dict,
+                analysis_type=analysis_type,
+                analysis_config=analysis_config,
+                bcs=bcs,
+                forces=forces,
+                workspace_dir=str(snap_dir) # 스냅샷 디렉토리를 작업공간으로 활용
+            )
+            
+            if analysis_type == "modal" and "workspace" in ccx_result and "job_name" in ccx_result:
+                dat_path = Path(ccx_result["workspace"]) / f"{ccx_result['job_name']}.dat"
+                self._print_calculix_dat_summary(dat_path)
+            
+            vtu_base_str = ccx_result.get("vtu_base", "")
+            if not vtu_base_str:
+                raise RuntimeError(f"CalculiX 해석이 비정상 종료되었거나 .frd 가시화 파일 생성에 실패했습니다.")
+
+            # ── CalculiX 결과 3D Volume Mesh -> WHTResultData 직접 가공 ───────
+            self.progress.emit("CalculiX 3D 볼륨 결과 및 가시화 포맷 변환 중...")
+            
+            import pyvista as pv
+            from wht_converter.wht_models import WHTResultData, WHTMetadata
+            
+            if analysis_type == "modal":
+                freq_list = ccx_result.get("frequencies", [])
+                n_modes = len(freq_list)
+                if n_modes == 0:
+                    raise RuntimeError("파싱된 고유진동수가 존재하지 않습니다.")
+                    
+                frequencies = np.array([f["hz"] for f in freq_list])
+                
+                # 1번 모드 파일 로드하여 공통 3D Volume 기하 정보 추출
+                vtu_path_1 = Path(f"{vtu_base_str}.1.vtu")
+                if not vtu_path_1.exists():
+                    vtu_path_1 = Path(f"{vtu_base_str}.01.vtu")
+                if not vtu_path_1.exists():
+                    vtu_path_1 = Path(f"{vtu_base_str}.001.vtu")
+                    
+                if not vtu_path_1.exists():
+                    raise FileNotFoundError(f"CalculiX 모달 해석 1번 결과를 찾을 수 없습니다: {vtu_path_1} (.1.vtu 또는 .01.vtu 검색 실패)")
+                    
+                mesh_1 = pv.read(str(vtu_path_1))
+                vtu_nodes = np.array(mesh_1.points, dtype=np.float32)
+                
+                # CSR 메쉬 토폴로지 추출
+                raw_cells = np.array(mesh_1.cells)
+                offsets = []
+                connectivity = []
+                idx = 0
+                while idx < len(raw_cells):
+                    n_nodes = raw_cells[idx]
+                    offsets.append(len(connectivity))
+                    for o_idx in range(1, n_nodes + 1):
+                        connectivity.append(raw_cells[idx + o_idx])
+                    idx += (n_nodes + 1)
+                offsets.append(len(connectivity))
+                offsets = np.array(offsets, dtype=np.int32)
+                connectivity = np.array(connectivity, dtype=np.int32)
+                cell_types = np.array(mesh_1.celltypes if hasattr(mesh_1, "celltypes") else mesh_1.cell_types, dtype=np.uint8)
+                
+                # 모든 모드 파일 순회하며 'U' 변형 데이터(ModeShape) 수집
+                mode_shapes = []
+                for i in range(1, n_modes + 1):
+                    vtu_path = Path(f"{vtu_base_str}.{i}.vtu")
+                    if not vtu_path.exists():
+                        vtu_path = Path(f"{vtu_base_str}.{i:02d}.vtu")
+                    if not vtu_path.exists():
+                        vtu_path = Path(f"{vtu_base_str}.{i:03d}.vtu")
+                        
+                    if not vtu_path.exists():
+                        continue
+                    mesh_m = pv.read(str(vtu_path))
+                    disp_key = next((k for k in mesh_m.point_data.keys() if k.upper() in ('U', 'DISP', 'DISPLACEMENTS')), None)
+                    if disp_key is None:
+                        raise ValueError("VTU 모드 결과에서 변위 데이터('U')를 찾지 못했습니다.")
+                        
+                    disp_arr = np.array(mesh_m.point_data[disp_key])
+                    mode_shapes.append(disp_arr[:, :3]) # (N, 3)
+                    
+                mode_shapes = np.array(mode_shapes) # (n_modes, N, 3)
+                
+                point_data = {
+                    "ModeShape": mode_shapes
+                }
+                field_data = {
+                    "Frequency_Hz": frequencies
+                }
+                
+                meta = WHTMetadata(
+                    solver_name="CalculiX", solver_version="2.23",
+                    analysis_type="modal", coordinate_system="cartesian",
+                    unit_length="mm", unit_force="N",
+                )
+                
+                rd = WHTResultData(
+                    nodes=vtu_nodes,
+                    connectivity=connectivity,
+                    offsets=offsets,
+                    cell_types=cell_types,
+                    point_data=point_data,
+                    field_data=field_data,
+                    time_values=frequencies,
+                    metadata=meta
+                )
+                
+            else:
+                # 정적 해석 단일 변위 파싱
+                vtu_path = Path(f"{vtu_base_str}.vtu")
+                if not vtu_path.exists():
+                    vtu_path = Path(f"{vtu_base_str}.01.vtu")
+                if not vtu_path.exists():
+                    vtu_path = Path(f"{vtu_base_str}.1.vtu")
+                if not vtu_path.exists():
+                    vtu_paths = sorted(Path(vtu_base_str).parent.glob(f"{Path(vtu_base_str).name}*.vtu"))
+                    if vtu_paths:
+                        vtu_path = vtu_paths[0]
+                    else:
+                        raise FileNotFoundError(f"CalculiX VTU 정적 해석 결과 파일을 찾을 수 없습니다.")
+                        
+                mesh_s = pv.read(str(vtu_path))
+                vtu_nodes = np.array(mesh_s.points, dtype=np.float32)
+                
+                raw_cells = np.array(mesh_s.cells)
+                offsets = []
+                connectivity = []
+                idx = 0
+                while idx < len(raw_cells):
+                    n_nodes = raw_cells[idx]
+                    offsets.append(len(connectivity))
+                    for o_idx in range(1, n_nodes + 1):
+                        connectivity.append(raw_cells[idx + o_idx])
+                    idx += (n_nodes + 1)
+                offsets.append(len(connectivity))
+                offsets = np.array(offsets, dtype=np.int32)
+                connectivity = np.array(connectivity, dtype=np.int32)
+                cell_types = np.array(mesh_s.celltypes if hasattr(mesh_s, "celltypes") else mesh_s.cell_types, dtype=np.uint8)
+                
+                disp_key = next((k for k in mesh_s.point_data.keys() if k.upper() in ('U', 'DISP', 'DISPLACEMENTS')), None)
+                if disp_key is None:
+                    raise ValueError("VTU 정적 결과에서 변위 데이터('U')를 찾지 못했습니다.")
+                    
+                disp_arr = np.array(mesh_s.point_data[disp_key]) # (N, 3)
+                
+                point_data = {
+                    "Displacement": disp_arr[np.newaxis, :, :3] # (1, N, 3)
+                }
+                
+                meta = WHTMetadata(
+                    solver_name="CalculiX", solver_version="2.23",
+                    analysis_type="static", coordinate_system="cartesian",
+                    unit_length="mm", unit_force="N",
+                )
+                
+                rd = WHTResultData(
+                    nodes=vtu_nodes,
+                    connectivity=connectivity,
+                    offsets=offsets,
+                    cell_types=cell_types,
+                    point_data=point_data,
+                    time_values=np.array([0.0]),
+                    metadata=meta
+                )
+
+            self.finished.emit({
+                "type":   analysis_type,
+                "wht_result_data": rd,
+                "lc_name": self.case_name,
+                "is_ccx": True
+            })
+
+        except Exception:
+            import traceback
             self.error.emit(traceback.format_exc())
 
 
@@ -359,7 +679,7 @@ class WHTMonitorWindow(QMainWindow):
         # ── 데이터 저장소 ──────────────────────────────────────────────────
         self.history = {
             "iter": [], "compliance": [], "avg_h": [], "max_h": [],
-            "dx": [], "area_ratio": [], "frequencies": [], "cases": {},
+            "dx": [], "area_ratio": [], "min_width": [], "frequencies": [], "cases": {},
         }
         self.height_snapshots: list = []  # {"iter", "coords", "heights"}
         self.mesh_edge_segs = None  # Optional[np.ndarray]
@@ -375,6 +695,7 @@ class WHTMonitorWindow(QMainWindow):
         self.height_slider = self.btn_prev_h = self.btn_next_h = None
         self.iter_case_combo = None   # Load Case 콤보 (Iteration Results 탭)
         self.iter_run_btn = None      # Run Analysis 버튼
+        self.iter_ccx_btn = None      # Run CalculiX 버튼
         self.iter_export_btn = None   # Export OptiStruct 버튼
         self.iter_mesh_btn = None     # Mesh View 버튼
         self.iter_status_label = None # 해석 상태 텍스트
@@ -397,17 +718,19 @@ class WHTMonitorWindow(QMainWindow):
 
         # ── 로고 + 상단 컨트롤 바 ────────────────────────────────────────
         top_widget = QWidget()
-        top_widget.setFixedHeight(100)
+        top_widget.setFixedHeight(64)
         top_bar = QHBoxLayout(top_widget)
         top_bar.setContentsMargins(0, 0, 0, 0)
         top_bar.setSpacing(4)
 
         logo_label = QLabel()
-        logo_label.setFixedSize(100, 100)
-        logo_path = os.path.join(os.path.dirname(__file__), "resources", "sidebar_logo.png")
+        logo_label.setFixedSize(64, 64)
+        logo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resources", "logo_icon_64x64.png")
+        if not os.path.exists(logo_path):
+            logo_path = os.path.join(os.path.dirname(__file__), "resources", "logo_icon_64x64.png")
         if os.path.exists(logo_path):
             pix = QPixmap(logo_path).scaled(
-                100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
             logo_label.setPixmap(pix)
         else:
@@ -460,6 +783,8 @@ class WHTMonitorWindow(QMainWindow):
     def _build_tab_summary(self):
         tab = QWidget(); lay = QVBoxLayout(tab)
         self.table = QTableWidget(0, 0)
+        self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.horizontalHeader().customContextMenuRequested.connect(self._on_table_header_context_menu)
         lay.addWidget(self.table)
         self.tabs.addTab(tab, "Summary Table")
 
@@ -467,9 +792,10 @@ class WHTMonitorWindow(QMainWindow):
         tab = QWidget(); lay = QVBoxLayout(tab)
         ctrl = QHBoxLayout()
         self.metric_combo = QComboBox()
+        self.metric_combo.setMaxVisibleItems(25)
         self.metric_combo.addItems([
             "ALL (Normalized)", "Compliance", "Avg_h", "Max_h",
-            "dx", "Area_Ratio", "Natural Frequencies",
+            "dx", "Area_Ratio", "Min_Width", "Natural Frequencies",
         ])
         self.metric_combo.currentTextChanged.connect(self._update_curves)
         ctrl.addWidget(QLabel("Select Metric:"))
@@ -492,6 +818,7 @@ class WHTMonitorWindow(QMainWindow):
         ctrl_iter = QHBoxLayout(ctrl_iter_w)
         ctrl_iter.setContentsMargins(0, 0, 0, 0)
         self.height_iter_combo = QComboBox()
+        self.height_iter_combo.setMaxVisibleItems(25)
         self.height_iter_combo.addItem("Latest")
         self.height_iter_combo.currentIndexChanged.connect(self._on_height_combo_changed)
         self.btn_prev_h = QPushButton("<"); self.btn_prev_h.setFixedWidth(30)
@@ -529,6 +856,7 @@ class WHTMonitorWindow(QMainWindow):
 
         ctrl_action.addWidget(QLabel("  Load Case:"))
         self.iter_case_combo = QComboBox(); self.iter_case_combo.setMinimumWidth(160)
+        self.iter_case_combo.setMaxVisibleItems(25)
         self.iter_case_combo.addItem("Modal Analysis")
         ctrl_action.addWidget(self.iter_case_combo)
 
@@ -537,6 +865,12 @@ class WHTMonitorWindow(QMainWindow):
         self.iter_run_btn.setToolTip("선택 하중 케이스로 wht_solver 해석 후 결과를 visualizer에 표시")
         self.iter_run_btn.clicked.connect(self._on_run_analysis)
         ctrl_action.addWidget(self.iter_run_btn)
+
+        self.iter_ccx_btn = QPushButton("Run CalculiX")
+        self.iter_ccx_btn.setStyleSheet("font-weight:bold; background-color:#1e3d59; color:white;")
+        self.iter_ccx_btn.setToolTip("선택 하중 케이스로 CalculiX 해석 후 결과를 visualizer에 표시")
+        self.iter_ccx_btn.clicked.connect(self._on_run_calculix)
+        ctrl_action.addWidget(self.iter_ccx_btn)
 
         self.iter_export_btn = QPushButton("Export OptiStruct .fem")
         self.iter_export_btn.setStyleSheet("font-weight:bold;")
@@ -557,13 +891,100 @@ class WHTMonitorWindow(QMainWindow):
     def _build_tab_modal(self):
         tab = QWidget(); lay = QVBoxLayout(tab)
         n = self.num_modal_modes
-        self.modal_table = QTableWidget(n, 2)
-        self.modal_table.setHorizontalHeaderLabels(["Mode", "Ref. (Hz)"])
-        self.modal_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        for i in range(n):
-            self.modal_table.setItem(i, 0, QTableWidgetItem(f"Mode {i+1}"))
+        # Mode N은 vertical header(행 제목), 데이터 컬럼은 "Ref. (Hz)" + Iter 별 추가
+        self.modal_table = QTableWidget(n, 1)
+        self.modal_table.setHorizontalHeaderLabels(["Ref. (Hz)"])
+        self.modal_table.setVerticalHeaderLabels([f"Mode {i+1}" for i in range(n)])
+        # 가로 스크롤 허용: Stretch 대신 고정 폭 사용 (이터레이션마다 컬럼 증가)
+        self.modal_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.modal_table.horizontalHeader().setDefaultSectionSize(80)
+        self.modal_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.modal_table.setColumnWidth(0, 80)
         lay.addWidget(self.modal_table)
         self.tabs.addTab(tab, "Modal Analysis")
+
+
+    def _on_table_header_context_menu(self, pos):
+        menu = QMenu(self)
+        
+        col_menu = menu.addMenu("Toggle Columns")
+        for i in range(self.table.columnCount()):
+            col_name = self.table.horizontalHeaderItem(i).text()
+            action = QAction(col_name, self)
+            action.setCheckable(True)
+            action.setChecked(not self.table.isColumnHidden(i))
+            action.triggered.connect(lambda checked, i=i: self.table.setColumnHidden(i, not checked))
+            col_menu.addAction(action)
+            
+        menu.addSeparator()
+        
+        plot_action = QAction("Plot Custom Graph", self)
+        plot_action.triggered.connect(self._show_custom_plot_dialog)
+        menu.addAction(plot_action)
+        
+        header = self.table.horizontalHeader()
+        global_pos = header.mapToGlobal(pos)
+        menu.exec(global_pos)
+
+    def _show_custom_plot_dialog(self):
+        if self.table.rowCount() == 0:
+            QMessageBox.warning(self, "No Data", "플롯할 데이터가 없습니다.")
+            return
+            
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Custom Plot")
+        dlg.setMinimumWidth(300)
+        lay = QFormLayout(dlg)
+        
+        combo_x = QComboBox()
+        combo_y = QComboBox()
+        combo_x.setMaxVisibleItems(25)
+        combo_y.setMaxVisibleItems(25)
+        
+        headers = [self.table.horizontalHeaderItem(i).text() for i in range(self.table.columnCount())]
+        combo_x.addItems(headers)
+        combo_y.addItems(headers)
+        
+        lay.addRow("X-Axis:", combo_x)
+        lay.addRow("Y-Axis:", combo_y)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        lay.addRow(btn_box)
+        
+        if dlg.exec() == QDialog.Accepted:
+            idx_x = combo_x.currentIndex()
+            idx_y = combo_y.currentIndex()
+            
+            x_data = []
+            y_data = []
+            for r in range(self.table.rowCount()):
+                try:
+                    x_val = float(self.table.item(r, idx_x).text())
+                    y_val = float(self.table.item(r, idx_y).text())
+                    x_data.append(x_val)
+                    y_data.append(y_val)
+                except Exception as e:
+                    pass
+                    
+            if not x_data: return
+            
+            plot_win = QDialog(self)
+            plot_win.setWindowTitle(f"{headers[idx_y]} vs {headers[idx_x]}")
+            plot_win.resize(600, 450)
+            plot_lay = QVBoxLayout(plot_win)
+            canvas = PlotCanvas(plot_win)
+            plot_lay.addWidget(canvas)
+            
+            canvas.ax.plot(x_data, y_data, marker='o', linestyle='-', color='b')
+            canvas.ax.set_xlabel(headers[idx_x])
+            canvas.ax.set_ylabel(headers[idx_y])
+            canvas.ax.grid(True, linestyle='--', alpha=0.7)
+            canvas.fig.tight_layout()
+            canvas.draw()
+            
+            plot_win.show()
 
     # ────────────────────────────────────────────────────────────────────────
     # 단축키 / 버튼 핸들러
@@ -634,8 +1055,8 @@ class WHTMonitorWindow(QMainWindow):
             if "mesh_edge_segs" in data and self.mesh_edge_segs is None:
                 self.mesh_edge_segs = data["mesh_edge_segs"]
 
-            # ── 리셋 감지 (iter 1이 다시 오면 새 최적화 시작) ────────────────
-            if it == 1 and len(self.history["iter"]) > 0:
+            # ── 리셋 감지 (iter 0이 다시 오면 새 최적화 시작) ────────────────
+            if it == 0 and len(self.history["iter"]) > 0:
                 self._clear_history()
 
             # ── 히스토리 축적 ────────────────────────────────────────────
@@ -645,10 +1066,11 @@ class WHTMonitorWindow(QMainWindow):
             self.history["max_h"].append(data.get("max_h", 0.0))
             self.history["dx"].append(data.get("dx", 0.0))
             self.history["area_ratio"].append(data.get("area_ratio", 0.0))
+            self.history["min_width"].append(data.get("min_width", 0.0))
             freqs = data.get("frequencies", [])
             self.history["frequencies"].append(freqs)
 
-            # Modal Ref. 초기화 (최초 수신 시)
+            # Modal Ref. 초기화 (최초 수신 시) — column 0 = "Ref. (Hz)"
             if self.ref_freqs is None and freqs:
                 self.ref_freqs = freqs
                 if self.modal_table:
@@ -656,7 +1078,7 @@ class WHTMonitorWindow(QMainWindow):
                     for i, f in enumerate(freqs):
                         if i < n:
                             self.modal_table.setItem(
-                                i, 1, QTableWidgetItem(f"{f:.2f}")
+                                i, 0, QTableWidgetItem(f"{f:.2f}")
                             )
 
             # ── 하중 케이스 등록 ─────────────────────────────────────────
@@ -675,7 +1097,7 @@ class WHTMonitorWindow(QMainWindow):
                         self.iter_case_combo.addItem(name)
                 # Summary Table 헤더
                 if self.table:
-                    headers = ["Iter", "C_total", "Avg_h", "Max_h", "dx", "Area_Ratio"]
+                    headers = ["Iter", "C_total", "Avg_h", "Max_h", "dx", "Area_Ratio", "Min_Width"]
                     for name in self.case_names:
                         headers += [f"U_{name}", f"D_{name}", f"S_{name}"]
                     self.table.setColumnCount(len(headers))
@@ -736,7 +1158,8 @@ class WHTMonitorWindow(QMainWindow):
                         f"{data.get('avg_h', 0):.2f}",
                         f"{data.get('max_h', 0):.2f}",
                         f"{data.get('dx', 0):.4f}",
-                        f"{ar:.3f}"]
+                        f"{ar:.3f}",
+                        f"{data.get('min_width', 0):.1f}"]
                 for col, v in enumerate(vals):
                     self.table.setItem(row, col, QTableWidgetItem(v))
                 c_off = len(vals)
@@ -753,6 +1176,7 @@ class WHTMonitorWindow(QMainWindow):
                 n_rows = self.modal_table.rowCount()
                 col = self.modal_table.columnCount()
                 self.modal_table.insertColumn(col)
+                self.modal_table.setColumnWidth(col, 80)
                 self.modal_table.setHorizontalHeaderItem(
                     col, QTableWidgetItem(f"Iter {it}")
                 )
@@ -761,7 +1185,11 @@ class WHTMonitorWindow(QMainWindow):
                         self.modal_table.setItem(
                             i, col, QTableWidgetItem(f"{f:.2f}")
                         )
+                # 가로 스크롤: 새로 추가된 컬럼이 보이도록 오른쪽 끝으로 이동
                 self.modal_table.scrollToBottom()
+                hbar = self.modal_table.horizontalScrollBar()
+                if hbar is not None:
+                    hbar.setValue(hbar.maximum())
 
             self._update_curves()
             self._update_height_plot()
@@ -785,7 +1213,7 @@ class WHTMonitorWindow(QMainWindow):
     def _clear_history(self):
         self.history = {
             "iter": [], "compliance": [], "avg_h": [], "max_h": [],
-            "dx": [], "area_ratio": [], "frequencies": [], "cases": {},
+            "dx": [], "area_ratio": [], "min_width": [], "frequencies": [], "cases": {},
         }
         self.height_snapshots = []
         self.mesh_edge_segs   = None
@@ -797,15 +1225,18 @@ class WHTMonitorWindow(QMainWindow):
             self.metric_combo.clear()
             self.metric_combo.addItems([
                 "ALL (Normalized)", "Compliance", "Avg_h", "Max_h",
-                "dx", "Area_Ratio", "Natural Frequencies",
+                "dx", "Area_Ratio", "Min_Width", "Natural Frequencies",
             ])
             self.metric_combo.blockSignals(False)
         if self.table:
             self.table.setRowCount(0); self.table.setColumnCount(0)
         if self.modal_table:
-            for i in range(10):
-                self.modal_table.setItem(i, 1, QTableWidgetItem(""))
-                self.modal_table.setItem(i, 2, QTableWidgetItem(""))
+            n_rows = self.modal_table.rowCount()
+            n_cols = self.modal_table.columnCount()
+            # Iter 컬럼들 모두 초기화 (column 0 = "Ref. (Hz)" 는 유지)
+            for i in range(n_rows):
+                for c in range(1, n_cols):
+                    self.modal_table.setItem(i, c, QTableWidgetItem(""))
         if self.height_iter_combo:
             self.height_iter_combo.blockSignals(True)
             self.height_iter_combo.clear()
@@ -869,6 +1300,7 @@ class WHTMonitorWindow(QMainWindow):
                 ("Max_h",      self.history["max_h"],      '^-'),
                 ("dx",         self.history["dx"],         'd-'),
                 ("Area_Ratio", self.history["area_ratio"], 'x-'),
+                ("Min_Width",  self.history["min_width"],  'v-'),
             ]
             fmts = ['--', '-.', ':', '-', '--', '-.']
             for i, name in enumerate(self.case_names):
@@ -906,7 +1338,7 @@ class WHTMonitorWindow(QMainWindow):
                     color='darkorange', label="Area Ratio")
             ax.set_ylabel("Bead Area Ratio")
             ax.set_ylim(0, 1.05)
-        elif metric in ("Compliance", "Avg_h", "Max_h", "dx"):
+        elif metric in ("Compliance", "Avg_h", "Max_h", "dx", "Min_Width"):
             ax.plot(iters, self.history[metric.lower()], 'o-', label=metric)
             ax.set_ylabel(metric)
         else:
@@ -970,31 +1402,54 @@ class WHTMonitorWindow(QMainWindow):
         ax.clear()
 
         x, y = coords[:, 0], coords[:, 1]
-        max_abs = max(1e-5, float(np.max(np.abs(heights))))
+
+        # 고정 컬러 범위 = ±h_max (--bead-height 값 고정, 이터레이션 무관)
+        h_max      = float(snap.get("h_max", 15.0))   # 기본 15mm (bead-height 기본값)
+        bead_steps = int(snap.get("bead_steps", 0))
 
         from scipy.interpolate import griddata
+        from matplotlib.colors import BoundaryNorm
+        from matplotlib import cm
         # 격자 해상도: 요소 수에 비례, 최소 64 — 흐릿함 방지
         n_grid = max(64, int(len(x) ** 0.5) * 3)
         xi = np.linspace(x.min(), x.max(), n_grid)
         yi = np.linspace(y.min(), y.max(), n_grid)
         Xi, Yi = np.meshgrid(xi, yi)
-        # linear: convex hull 내부만 보간 → NaN 발생
         Zi = griddata((x, y), heights, (Xi, Yi), method='linear')
-        # nearest로 NaN(볼록 껍질 밖, 배제 영역 구멍 등)을 가장 가까운 값으로 채움
         Zi_near = griddata((x, y), heights, (Xi, Yi), method='nearest')
         Zi = np.where(np.isnan(Zi), Zi_near, Zi)
+        Zi = np.clip(Zi, -h_max, h_max)   # 보간 아티팩트가 범위 밖으로 나가지 않도록
+
+        # 이산 colormap: 항상 ±h_max 대칭 범위, coolwarm 발산형
+        # - 단방향(+): [0, h_max] 구간에 값 분포 → 파란쪽이 0(비드 없음)
+        # - 단방향(-): [-h_max, 0] 구간에 값 분포
+        # - 양방향:    [-h_max, h_max] 전체 범위 활용
+        n_steps = bead_steps if bead_steps >= 1 else 5
+        pos_levels  = np.linspace(0, h_max, n_steps + 1)
+        full_levels = np.concatenate([-pos_levels[::-1], pos_levels[1:]])  # -(n_steps+1)레벨
+        vmin, vmax  = -h_max, h_max
+
+        boundaries = (full_levels[:-1] + full_levels[1:]) * 0.5
+        boundaries = np.concatenate([[vmin - 1e-6], boundaries, [vmax + 1e-6]])
+        cmap_disc = cm.get_cmap('coolwarm', len(full_levels))
+        norm = BoundaryNorm(boundaries, ncolors=cmap_disc.N, clip=True)
         sc = ax.imshow(
             Zi, origin='lower', aspect='equal',
             extent=[x.min(), x.max(), y.min(), y.max()],
-            cmap='coolwarm', vmin=-max_abs, vmax=max_abs,
-            interpolation='nearest',  # 격자 해상도가 충분하므로 추가 블러 불필요
+            cmap=cmap_disc, norm=norm,
+            interpolation='nearest',
         )
+
+        _cb_label = "Bead Height (mm)  [+: outward / −: inward]"
 
         if self._height_colorbar is None:
             self._height_colorbar = fig.colorbar(sc, ax=ax)
-            self._height_colorbar.set_label("Bead Height (mm)  [+: outward / −: inward]")
+            self._height_colorbar.set_label(_cb_label)
         else:
             self._height_colorbar.update_normal(sc)
+            self._height_colorbar.set_label(_cb_label)
+        self._height_colorbar.set_ticks(full_levels)
+        self._height_colorbar.set_ticklabels([f"{v:.1f}" for v in full_levels])
 
         ax.set_aspect('equal')
         ax.set_title(f"Height Distribution — Iter {it_lbl}")
@@ -1104,6 +1559,59 @@ class WHTMonitorWindow(QMainWindow):
         worker.start()
         self._re_worker = worker   # GC 방지
 
+    def _on_run_calculix(self):
+        if not self.snap_dir:
+            QMessageBox.warning(self, "경고", "스냅샷 디렉토리가 아직 수신되지 않았습니다.\n최적화가 시작되면 재시도하세요.")
+            return
+        if self._re_worker and self._re_worker.isRunning():
+            QMessageBox.information(self, "실행 중", "이전 해석이 아직 실행 중입니다.")
+            return
+
+        iter_num  = self._get_selected_iter_num()
+        case_name = self.iter_case_combo.currentText() if self.iter_case_combo else "Modal Analysis"
+
+        self._set_iter_status(f"CalculiX [Iter {iter_num} / {case_name}] 실행 중...", "blue")
+        if self.iter_ccx_btn:
+            self.iter_ccx_btn.setEnabled(False)
+
+        self._re_worker = _CalculixReAnalysisWorker(self.snap_dir, iter_num, case_name,
+                                                   num_modal_modes=self.num_modal_modes)
+        self._re_worker.progress.connect(lambda msg: self._set_iter_status(msg, "blue"))
+        self._re_worker.finished.connect(self._on_calculix_analysis_finished)
+        self._re_worker.error.connect(self._on_calculix_analysis_error)
+        self._re_worker.start()
+
+    def _on_calculix_analysis_finished(self, result: dict):
+        if self.iter_ccx_btn:
+            self.iter_ccx_btn.setEnabled(True)
+
+        rtype = result.get("type")
+        rd    = result["wht_result_data"]
+
+        try:
+            if rtype == "modal":
+                freqs = [float(f) for f in rd.time_values]
+                freq_str = "  ".join(f"f{i+1}={f:.2f}Hz" for i, f in enumerate(freqs))
+                self._set_iter_status(f"CCX 모달: {freq_str}", "#2a7a2a")
+                title = f"CalculiX Modal Analysis — Iter {self._get_selected_iter_num()}"
+            else:
+                lc_name = result.get("lc_name", "Static")
+                disp = rd.point_data["Displacement"][0] # shape (N, 3)
+                u_max = float(np.max(np.abs(disp[:, :3])))
+                self._set_iter_status(f"CCX {lc_name}  Max|U|={u_max:.4f} mm", "#2a7a2a")
+                title = f"CalculiX Static: {lc_name} — Iter {self._get_selected_iter_num()}"
+
+            self._open_visualizer(rd, title)
+
+        except Exception:
+            self._set_iter_status(f"CCX 결과 변환 오류: {traceback.format_exc()[:120]}", "red")
+
+    def _on_calculix_analysis_error(self, msg: str):
+        if self.iter_ccx_btn:
+            self.iter_ccx_btn.setEnabled(True)
+        self._set_iter_status(f"CCX 오류: {msg[:120]}", "red")
+        QMessageBox.critical(self, "CalculiX 해석 오류", msg[:400])
+
     def _on_run_analysis(self):
         if not self.snap_dir:
             QMessageBox.warning(self, "경고", "스냅샷 디렉토리가 아직 수신되지 않았습니다.\n최적화가 시작되면 재시도하세요.")
@@ -1118,6 +1626,8 @@ class WHTMonitorWindow(QMainWindow):
         self._set_iter_status(f"Iter {iter_num} / {case_name} 해석 실행 중...", "blue")
         if self.iter_run_btn:
             self.iter_run_btn.setEnabled(False)
+        if self.iter_ccx_btn:
+            self.iter_ccx_btn.setEnabled(False)
 
         self._re_worker = _ReAnalysisWorker(self.snap_dir, iter_num, case_name,
                                              num_modal_modes=self.num_modal_modes)
@@ -1129,6 +1639,8 @@ class WHTMonitorWindow(QMainWindow):
     def _on_analysis_finished(self, result: dict):
         if self.iter_run_btn:
             self.iter_run_btn.setEnabled(True)
+        if self.iter_ccx_btn:
+            self.iter_ccx_btn.setEnabled(True)
 
         rtype     = result.get("type")
         model     = result["model"]
@@ -1145,7 +1657,7 @@ class WHTMonitorWindow(QMainWindow):
 
             if rtype == "modal":
                 freqs = [float(f) for f in solver_result.frequencies]
-                freq_str = "  ".join(f"f{i+1}={f:.2f}Hz" for i, f in enumerate(freqs[:6]))
+                freq_str = "  ".join(f"f{i+1}={f:.2f}Hz" for i, f in enumerate(freqs))
                 self._set_iter_status(f"모달: {freq_str}", "#2a7a2a")
                 title = "Modal Analysis"
             else:
@@ -1163,6 +1675,8 @@ class WHTMonitorWindow(QMainWindow):
     def _on_analysis_error(self, msg: str):
         if self.iter_run_btn:
             self.iter_run_btn.setEnabled(True)
+        if self.iter_ccx_btn:
+            self.iter_ccx_btn.setEnabled(True)
         self._set_iter_status(f"오류: {msg[:120]}", "red")
         QMessageBox.critical(self, "해석 오류", msg[:400])
 

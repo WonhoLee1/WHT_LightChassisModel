@@ -52,6 +52,47 @@ Topography Optimization Solver — wht_solver 기반 정밀 구현.
          df₁/dh ≈ φ₁ᵀ(∂K/∂h)φ₁ / (4π²f₁)   — 단위 모달 질량 가정
          (φ₁ = 첫 번째 탄성 모드 형상, 동일한 JAX vmap 민감도 인프라 재사용)
 
+[비드 패턴 형성 파이프라인 — 우주 구조 형성 유추]
+
+  MMA 최적화는 초기 균일 밀도장에서 민감도(complinace gradient)를 따라
+  비드 패턴을 진화시킨다. 우주 초기 밀도 요동이 중력 불안정으로 별과 은하를
+  형성하는 과정과 구조적으로 유사하다.
+
+  단계별 대응:
+    초기 섭동(양자 요동)  ←→  --diversity-noise (초기 노이즈)
+    Jeans length          ←→  --min-width R (필터 반경: 이 이하 파장의 요동 억제)
+    중력 수렴             ←→  MMA 업데이트 (민감도 높은 곳으로 비드 집중)
+    별 탄생 임계 밀도     ←→  --projection β (임계값 초과 시 비드로 확정)
+    은하 팔 형성          ←→  --bead-connect-alg (분리된 비드 섬 연결 방식)
+
+[비드 연결 알고리즘 — bead_connect_alg]
+
+  MMA 수렴 후 비드가 분리된 섬(island)으로 나타날 수 있다.
+  --bead-connect-alg 로 섬들을 잇는 경로 알고리즘을 선택한다.
+  별들이 은하 팔로 이어지는 방식을 선택하는 것과 같다.
+
+  closing   : 형태학적 폐합(Morphological Closing: Dilation → Erosion).
+              binary 이미지를 팽창 후 수축하여 인근 섬 연결.
+              단순하고 빠름. 섬 간격이 좁고 패턴이 균일할 때 적합.
+              단점: 섬이 멀리 분산된 경우 미연결 잔존 가능.
+
+  mst       : 최소 신장 트리(Minimum Spanning Tree, Kruskal).
+              scipy.ndimage.label 로 섬 식별 → 섬 간 최단 픽셀 거리로 MST 구성
+              → 각 엣지를 Bresenham 직선으로 브릿지.
+              모든 섬의 연결을 수학적으로 보장. 경로가 직선적.
+              권장: 섬이 많고 광범위하게 분산된 경우.
+
+  geodesic  : 지오데식 최단 경로(multi-source Dijkstra).
+              가장 큰 섬을 source로 비활성 요소(cost=1)를 통과하는
+              최소 비용 경로로 각 섬을 연결. 기존 밀도장을 따라
+              자연스러운 경로로 수렴하는 경향.
+              권장: 비드 라인이 유기적으로 이어지길 원할 때.
+
+  hybrid    : MST + Geodesic 순차 적용.
+              MST로 전체 연결을 보장한 후 Geodesic으로 경로를 다듬음.
+              두 알고리즘의 장점 결합. 계산 비용이 가장 높음.
+              권장: 분산된 섬 + 자연스러운 경로 모두 원할 때.
+
 wht_solver 활용:
     - WHTSolver.solve_static(WHTLoadCase)  → 각 하중 케이스별 변위 해석
     - wht_solver.wht_quad4_element._element_K_mitc4_plus  → 요소 K 계산
@@ -223,12 +264,24 @@ class WHTopographySolver:
         freq_target: float = 0.0,
         exclude_zones: Optional[List[dict]] = None,
         n_workers: int = 4,
+        modal_modes: int = 20,
+        vol_ramp_iters: int = 5,
+        bidirectional: bool = False,
+        min_width_init: float = -1.0,
+        min_width_ramp_iters: int = 0,
     ):
         self.model          = model
         self.load_manager   = load_manager
         self.h_max          = bead_height_max
         self.h_ratio        = bead_height_ratio
-        self.rmin           = min_width
+        self.vol_ramp_iters = vol_ramp_iters
+        self.bidirectional  = bidirectional    # True: x→(x-0.5)*2*h_max, ±방향 모두 허용
+        _rmin_start         = min_width_init if min_width_init > min_width else min_width
+        self.rmin           = _rmin_start
+        self._rmin_start    = _rmin_start    # 루프 시작 시 rmin (init > final 이면 큰 값)
+        self._rmin_final    = min_width      # 목표 최종 rmin (--min-width)
+        self._rmin_ramp_n   = min_width_ramp_iters
+        self._rmin_current  = _rmin_start
         self.mesh_size_z    = mesh_size_z
         self.fd_dz          = fd_dz
         self.sym_x          = sym_x
@@ -239,11 +292,13 @@ class WHTopographySolver:
         self.filter_type    = filter_type         # "linear" | "gaussian"
         self.use_projection = use_projection      # Heaviside projection 활성화
         self.proj_beta_max  = proj_beta_max       # beta 최대값 (continuation)
-        self.proj_eta       = proj_eta            # Heaviside 임계값 (0.5=중간)
+        # Heaviside 임계값 (0.5=중간)
+        self.proj_eta       = proj_eta
         # 다중 설계 탐색용 반발 패널티
-        self.diversity_weight  = 0.0              # λ: 반발 강도 (0=비활성)
-        self.diversity_sigma   = 0.3              # σ: 반발 범위 (설계 변수 공간)
-        self._reference_designs: List[np.ndarray] = []  # 수렴된 이전 설계들
+        self.diversity_weight      = 0.0   # λ: 반발 강도 (0=비활성)
+        self.diversity_sigma       = 0.3   # σ: 반발 범위 (설계 변수 공간)
+        self.diversity_start_iter  = -1    # -1=수렴 후 등록 방식, >=0=해당 iter부터 적용
+        self._reference_designs: List[np.ndarray] = []  # 반발 기준 설계들
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
         self.load_cases_input    = load_cases
         self._load_case_provider = load_case_provider
@@ -257,6 +312,7 @@ class WHTopographySolver:
         self._C_0_cases: Dict[str, float] = {}  # 케이스별 기준 컴플라이언스 (정규화용)
         self.exclude_zones       = exclude_zones or []  # 비드 배제 영역 목록
         self.n_workers           = max(1, n_workers)
+        self.modal_modes         = max(1, int(modal_modes))
 
         # ... (중략) ...
         self._beta = 1.0
@@ -327,6 +383,7 @@ class WHTopographySolver:
             self._static_load_cases = self.load_manager.get_load_cases(
                 mesh_size_z=mesh_size_z,
                 weights=self.weights,
+                loads=getattr(self.load_manager, '_scaled_loads', None),
             )
         else:
             print(" -> [Error] 하중 케이스 정보가 없습니다.")
@@ -349,9 +406,22 @@ class WHTopographySolver:
             self._connect_grid = self._build_connect_grid()
             print(f" -> [Solver] 비드 연결 활성화: alg={self.bead_connect_alg}  gap={self.bead_connect:.0f}mm")
 
-        # 초기 비드 높이 (0 = 평탄)
-        self.heights = np.zeros(self._n_design)
-        self.mma     = MMAOptimizer(n_vars=self._n_design, vol_frac=bead_height_ratio)
+        # 초기 비드 높이 — vol_frac 근방 + 큰 랜덤 분산
+        # 균일 x=1.0으로 시작하면 OC 업데이트의 alpha clip이 모든 요소에 동시
+        # 적용되어 공간 정보가 소실됨(vol_frac 도달까지 ~5 이터 균일 감소).
+        # 대신 초기부터 [0, ~0.6] 범위에 크게 분산시키면 raw x 자체가 비드/비비드
+        # 패턴을 가지므로, MMA는 mean(x)=vol_frac 제약 하에 패턴을 정제만 수행.
+        rng = np.random.default_rng(0)
+        x0 = rng.uniform(0.0, 1.0, self._n_design)
+        if self.bidirectional:
+            # 양방향: x=0.5 중심, 분산이 큰 초기값 (일부는 +, 일부는 -)
+            # area = mean(|x-0.5| > 0.1) ≈ 1.0 에서 시작해 vol_ramp로 감소
+            x0 = np.clip(x0, 0.01, 0.99)
+            self.heights = (x0 - 0.5) * 2.0 * self.h_max
+        else:
+            x0 = np.clip(x0 * (bead_height_ratio / max(x0.mean(), 1e-6)), 0.01, 0.99)
+            self.heights = x0 * self.h_max
+        self.mma = MMAOptimizer(n_vars=self._n_design, vol_frac=bead_height_ratio)
 
         # 민감도 계산용 정적 데이터 사전 캐싱 (최적화 루프 내 재생성 방지)
         self._bead_dir_jnp = jnp.array(self.bead_dir, dtype=jnp.float64)
@@ -496,16 +566,38 @@ class WHTopographySolver:
         z_min = min(all_z)
         z_threshold = z_min + max(self.mesh_size_z * 0.5, 5.0)
 
+        # ─── Pass 1: 둘레 1-ring 침식
+        # 플랜지/경사면 노드를 포함하는 요소(ring 0)의 모든 노드를 "확장 둘레"로 등록.
+        # Pass 2에서 이 확장 둘레 노드를 가진 요소는 설계 영역에서 제외 → 둘레로부터
+        # 1개 요소 안쪽까지 모두 비드 생성 영역에서 빼냄 (경사 인접부 노이즈 방지).
+        extended_boundary_nids = set(flange_nids)
+        for eid in self.elem_ids:
+            elem = self.model.elements[eid]
+            if elem.type.upper() not in self._SHELL_TYPES:
+                continue
+            nids = elem.node_ids
+            coords = [self.model.nodes[nid] for nid in nids]
+            z_centroid = float(np.mean([n.z for n in coords]))
+            if z_centroid > z_threshold:
+                continue   # 바닥면 요소만 고려
+            if any(nid in flange_nids for nid in nids):
+                extended_boundary_nids.update(nids)
+
         design_elems: List[int] = []
         all_design_nids: set = set()
         n_excluded = 0
+        n_eroded = 0
 
         for eid in self.elem_ids:
             elem = self.model.elements[eid]
             if elem.type.upper() not in self._SHELL_TYPES:
                 continue
             nids = elem.node_ids
-            if any(nid in flange_nids for nid in nids):
+            if any(nid in extended_boundary_nids for nid in nids):
+                if any(nid in flange_nids for nid in nids):
+                    pass   # ring 0 (직접 둘레), 별도 카운트 안 함
+                else:
+                    n_eroded += 1   # ring 1 (내측 1칸)
                 continue
             coords = [self.model.nodes[nid] for nid in nids]
             z_centroid = float(np.mean([n.z for n in coords]))
@@ -519,6 +611,8 @@ class WHTopographySolver:
             design_elems.append(eid)
             all_design_nids.update(nids)
 
+        if n_eroded:
+            print(f"    - 둘레 1-ring 침식: {n_eroded}개 내측 요소 추가 제외")
         if n_excluded:
             print(f"    - 배제 영역 필터: {n_excluded}개 요소 제외됨 ({len(self.exclude_zones)}개 영역)")
 
@@ -886,8 +980,8 @@ class WHTopographySolver:
             return x
 
         n = self.bead_steps + 1          # 단계 수 → 레벨 수
-        thresholds = np.linspace(0, 1, n * 2 + 1)[1:-1:2]
         levels = np.linspace(0, 1, n)
+        thresholds = (levels[:-1] + levels[1:]) * 0.5  # 인접 레벨의 중점
 
         x_proj = np.full_like(x, levels[0])
         for i in range(n - 1):
@@ -902,8 +996,8 @@ class WHTopographySolver:
             return np.ones_like(x)
 
         n = self.bead_steps + 1
-        thresholds = np.linspace(0, 1, n * 2 + 1)[1:-1:2]
         levels = np.linspace(0, 1, n)
+        thresholds = (levels[:-1] + levels[1:]) * 0.5  # 인접 레벨의 중점
 
         grad = np.zeros_like(x)
         for i in range(n - 1):
@@ -945,18 +1039,20 @@ class WHTopographySolver:
         """
         요소별 비드 높이 h_elem을 설계 노드 좌표에 반영합니다.
 
-        노드 높이 = 인접 설계 요소 높이의 평균:
-            h_n = (Σ_{e adj n} h_e) / n_adj(n)
-        → 요소 내 모든 노드가 동일 높이로 이동(평탄 비드 보장).
+        노드 높이 = 인접 설계 요소 높이의 **최댓값**:
+            h_n = max_{e adj n} h_e
+        → 활성 비드 요소의 모든 노드가 비드 높이 전체로 올라옴 (평탄 plateau 보장).
+           인접 비활성 요소와의 경계 노드는 비드 쪽으로 끌어올려져 노드 단위 스파이크
+           ("뾰족 솟음")가 발생하지 않음. 비드 경계는 한 노드만큼 외측으로 확장.
 
         Parameters
         ----------
         h_elem : (n_design,) 요소별 비드 높이 배열 [mm]
         """
         n_int = len(self._design_nids)
-        h_node_sum = np.zeros(n_int)
-        np.add.at(h_node_sum, self._aggr_src, h_elem[self._aggr_dst])
-        h_node = h_node_sum / (self._node_adj_count_arr + 1e-12)
+        h_node = np.zeros(n_int)
+        # in-place max: 각 노드에 인접한 요소들의 h_elem 중 최댓값으로 누적
+        np.maximum.at(h_node, self._aggr_src, h_elem[self._aggr_dst])
 
         for i, nid in enumerate(self._design_nids):
             orig_xyz = self._coords_orig[nid]
@@ -1278,10 +1374,8 @@ class WHTopographySolver:
         for lc, w in self._load_cases:
             print(f"     * {lc.name}: weight={w:.2f}, BC={len(lc.bcs)}개, F={len(lc.forces)}개")
 
-        # MMA용 정규화 변수 x [0, 1]
+        # MMA용 정규화 변수 x [0, 1]  (초기값: 최대 높이 = 1.0)
         x = self.heights.copy() / (self.h_max + 1e-12)
-        if np.max(x) < 1e-6:
-            x = np.full_like(x, 0.01)
 
         # FEA 솔버 인스턴스 생성
         from wht_solver.wht_solver import WHTSolver
@@ -1349,30 +1443,100 @@ class WHTopographySolver:
             print(f" -> [Snapshot] init.pkl 저장 실패: {_e}")
 
         C_0 = None
+        f0_init = None   # Iter 0 목적함수값 (개선율 계산 기준)
+        change_history: List[float] = []   # 정체(stagnation) 기반 수렴 감지용
         _mesh_edge_segs_sent = False
 
+        # ── [Iter 0] 완전 평탄 초기 상태 평가 (UI/Monitor 요구사항) ─────────────
+        h_phys_flat = np.zeros(self._n_design, dtype=np.float32)
+        self._apply_heights(h_phys_flat)
+        C_total_0, C_responses_0, _, _ = self._compute_total_compliance(fea_solver, iter_num=-1)
+        
+        if callback:
+            coords = np.array([
+                np.mean([[self.model.nodes[nid].x,
+                          self.model.nodes[nid].y,
+                          self.model.nodes[nid].z]
+                         for nid in self.model.elements[eid].node_ids], axis=0)
+                for eid in self._design_elems
+            ])
+            case_data = {}
+            for name, res in C_responses_0.items():
+                case_data[name] = {
+                    "U": 0.5 * res["C"],
+                    "max_disp": res["max_disp"],
+                    "max_stress": res["max_stress"]
+                }
+            
+            data_0 = {
+                "iter": 0,
+                "compliance": float(C_total_0),
+                "area_ratio": 0.0,
+                "cases": case_data,
+                "frequencies": [],
+                "avg_h": 0.0,
+                "max_h": 0.0,
+                "dx": 0.0,
+                "coords": coords,
+                "heights": h_phys_flat,
+                "h_max": float(self.h_max),
+                "bead_steps": int(self.bead_steps),
+                "bead_dir_sign": 0 if self.bidirectional else int(np.sign(self.bead_dir[int(np.argmax(np.abs(self.bead_dir)))])),
+                "snap_dir": str(_snap_dir),
+                "min_width": float(self.rmin),
+                "mesh_edge_segs": mesh_edge_segs,
+            }
+            callback(data_0)
+            _mesh_edge_segs_sent = True
+
+            try:
+                with open(_snap_dir / "iter_000.pkl", "wb") as _f:
+                    pickle.dump({
+                        "iter": 0,
+                        "h_elem": h_phys_flat.copy(),
+                        "load_cases": [(lc.name, w, lc) for lc, w in self._load_cases],
+                    }, _f)
+            except Exception:
+                pass
+                
+        self._restore_heights()
+
         for i in range(max_iter):
+            # min-width 필터 반경 연속화 (filter continuation)
+            # rmin을 _rmin_start(초기 큰 값)에서 _rmin_final(목표)까지 선형 감소
+            if self._rmin_final < self._rmin_start and self._rmin_ramp_n > 0:
+                _t_rmin = min(1.0, i / self._rmin_ramp_n)
+                _rmin_i = self._rmin_start - _t_rmin * (self._rmin_start - self._rmin_final)
+                if abs(_rmin_i - self._rmin_current) > 0.5:  # 0.5mm 이상 변화 시에만 재조립
+                    _prev = self._rmin_current
+                    self._rmin_current = _rmin_i
+                    self.rmin = _rmin_i
+                    self._H = self._build_filter()
+                    print(f"   [filter-cont] rmin {_prev:.1f} → {_rmin_i:.1f}mm 필터 재조립")
+
             # 좌우 대칭 강제 (변수 동기화)
             if self.sym_x:
                 x = 0.5 * (x + x[self._sym_map])
 
             x_old = x.copy()
 
-            # ── 1. Discrete Projection & Filtering ──
-            # beta continuation: 선형 증가, 전체 반복의 80%에서 max(50) 도달
-            # (기존 100 → 60으로 완화: 패턴 안정화 전 조기 이산화 방지)
-            if self.bead_steps >= 1:
-                self._beta = min(50.0, 1.0 + (i / max_iter) * 60.0)
-                x_proj = self._project_x(x, self._beta)
-            else:
-                x_proj = x
+            # ── 1. Filter → Discrete Projection → Heaviside (표준 SIMP) ──
+            # 흐름: x → H@x → x_filt → project({0,0.5,1}) → heaviside → x_proj
+            #     → *h_max → h_phys → FEA (필터가 x에 적용되어 h_phys가 곧 물리값)
+            # min-width(필터 반경)가 직접 비드 폭을 제어. x_proj가 area_ratio 측정 대상.
 
-            # Heaviside projection (use_projection=True 시)
-            # β-continuation: 초기 β_h≈1(부드러운 S-커브) → 선형 증가 → β_max(거의 계단함수)
-            # 표준 Heaviside: H_β(x;η) = [tanh(β·η) + tanh(β·(x−η))] / [tanh(β·η) + tanh(β·(1−η))]
-            #   η=0.5: x<0.5→0, x>0.5→1 에 수렴. β→∞이면 완전한 계단.
-            # 체인룰을 위해 입력값 x_proj_in을 반드시 별도 보존해야 함.
-            x_proj_in = x_proj  # Heaviside 입력값 (gradient 계산에 사용)
+            # (a) 공간 필터: 설계변수 평활화 → 최소 비드 폭 강제
+            x_filt = self._H @ x
+
+            # (b) 이산 투사: bead_steps 단계로 양자화
+            # β-continuation: 초기 β=4로 시작 → max 50 도달
+            if self.bead_steps >= 1:
+                self._beta = min(50.0, 4.0 + (i / max_iter) * 80.0)
+                x_proj_in = self._project_x(x_filt, self._beta)
+            else:
+                x_proj_in = x_filt
+
+            # (c) Heaviside projection (use_projection=True 시)
             if self.use_projection:
                 _beta_h = min(self.proj_beta_max, 1.0 + (i / max_iter) * (self.proj_beta_max - 1.0))
                 _eta    = self.proj_eta
@@ -1380,10 +1544,17 @@ class WHTopographySolver:
                 _t2 = np.tanh(_beta_h * (1.0 - _eta))
                 x_proj = (_t1 + np.tanh(_beta_h * (x_proj_in - _eta))) / (_t1 + _t2 + 1e-12)
                 x_proj = np.clip(x_proj, 0.0, 1.0)
+            else:
+                x_proj = x_proj_in
 
-            # 현재 비드 높이 (물리량) 계산 및 적용
-            h_phys     = x_proj * self.h_max
-            h_filtered = self._H @ h_phys
+            # (d) 물리 높이 계산
+            # 단방향: h = x_proj × h_max            (0 → h_max)
+            # 양방향: h = (x_proj - 0.5) × 2 × h_max  (-h_max → +h_max)
+            if self.bidirectional:
+                h_phys = (x_proj - 0.5) * 2.0 * self.h_max
+            else:
+                h_phys = x_proj * self.h_max
+            h_filtered = h_phys
             self._apply_heights(h_filtered)
 
             # 동적 ESL 재추출 (provider 등록 시 매 이터레이션 실행)
@@ -1405,10 +1576,27 @@ class WHTopographySolver:
                     for name in C_responses
                 }
 
-            # ── 고유진동수 해석 (10차 모드) ──
+            # ── 고유진동수 해석 (--modal-modes로 모드 수 제어) ──
             try:
-                modal_results = fea_solver.solve_modal(num_modes=10, exclude_rigid_body=False)
+                modal_results = fea_solver.solve_modal(num_modes=self.modal_modes, exclude_rigid_body=False)
                 freqs = modal_results.frequencies  # Hz
+                
+                # 모드 해석 결과 터미널 출력 (주파수 및 질량 기여도)
+                eff_mass, total_mass_cg = modal_results.calculate_effective_mass()
+                if eff_mass is not None and total_mass_cg is not None:
+                    print(f"\n{'='*60}")
+                    print(f" [Internal Solver Modal Analysis Summary] : Iter {i}")
+                    print(f"{'='*60}")
+                    print(" MODE NO.   FREQUENCY(Hz)   X-MASS(%)   Y-MASS(%)   Z-MASS(%)")
+                    total_mass_sum = total_mass_cg[:3].copy()
+                    total_mass_sum[total_mass_sum < 1e-12] = 1.0 # prevent div by zero
+                    for m_idx, f in enumerate(freqs):
+                        x_pct = (eff_mass[m_idx, 0] / total_mass_sum[0]) * 100.0
+                        y_pct = (eff_mass[m_idx, 1] / total_mass_sum[1]) * 100.0
+                        z_pct = (eff_mass[m_idx, 2] / total_mass_sum[2]) * 100.0
+                        print(f" {m_idx+1:7d}   {f:13.4f}   {x_pct:9.2f}   {y_pct:9.2f}   {z_pct:9.2f}")
+                    print(f"{'='*60}\n")
+                    
             except Exception as e:
                 print(f"    [경고] 고유진동수 해석 실패 (Iter {i}): {e}")
                 modal_results = None
@@ -1619,53 +1807,80 @@ class WHTopographySolver:
                     except Exception as _fe:
                         print(f"    [경고] 고유진동수 민감도 계산 실패: {_fe}")
 
+            if f0_init is None:
+                f0_init = f0val
+
             # ── 민감도 역전파 (Chain-rule) ─────────────────────────────────────
-            # 순전파 경로: x → [이산화] → x_proj_in → [Heaviside] → x_proj
-            #              → h_phys(=x_proj*h_max) → h_filt(=H@h_phys) → C
-            #
+            # 순전파: x → [H@] → x_filt → [project] → x_proj_in → [heaviside]
+            #         → x_proj → *h_max → h_phys → FEA
             # 역전파:
-            #   dC/dh_filt  : FEA 직접 계산 (dC_dh)
-            #   dC/dh_phys  = H^T · dC/dh_filt      (공간 필터 전치)
-            #   dC/dx_proj  = dC/dh_phys · h_max     (선형 스케일)
-            #   dC/dx_proj_in = dC/dx_proj · dH/dx_proj_in  (Heaviside 미분)
-            #   dC/dx       = dC/dx_proj_in · d_proj/dx    (이산화 미분)
+            #   dC/dh         : FEA 직접 계산 (dC_dh)
+            #   dC/dx_proj    = dC/dh · h_max
+            #   dC/dx_proj_in = dC/dx_proj · dH/dx_in    (heaviside)
+            #   dC/dx_filt    = dC/dx_proj_in · d_proj/dx_filt  (project at x_filt)
+            #   dC/dx         = H^T · dC/dx_filt        (필터 전치 — 맨 마지막)
 
-            # 1. 공간 필터 역전파
-            dC_dh_phys = self._H.T @ dC_dh
+            # 1. 높이 스케일 역전파
+            # 단방향: dh/dx_proj = h_max
+            # 양방향: dh/dx_proj = 2 × h_max
+            _h_scale = 2.0 * self.h_max if self.bidirectional else self.h_max
+            dC_dx_proj = dC_dh * _h_scale
 
-            # 2. 높이 스케일 역전파
-            dC_dx = dC_dh_phys * self.h_max
-
-            # 3. Heaviside 역전파: dH/dx_in = β·sech²(β·(x_in−η)) / (tanh(β·η)+tanh(β·(1−η)))
-            #    x_proj_in 이 Heaviside 입력이므로 반드시 x_proj_in 기준으로 계산
+            # 2. Heaviside 역전파
             if self.use_projection:
                 _beta_h = min(self.proj_beta_max, 1.0 + (i / max_iter) * (self.proj_beta_max - 1.0))
                 _eta    = self.proj_eta
                 _t1 = np.tanh(_beta_h * _eta)
                 _t2 = np.tanh(_beta_h * (1.0 - _eta))
-                # sech²(u) = 1 - tanh²(u), u = β·(x_in - η)
                 dH_dx = _beta_h * (1.0 - np.tanh(_beta_h * (x_proj_in - _eta)) ** 2) / (_t1 + _t2 + 1e-12)
-                dC_dx *= dH_dx
+                dC_dx_proj_in = dC_dx_proj * dH_dx
+            else:
+                dC_dx_proj_in = dC_dx_proj
 
-            # 4. 이산 투사(bead_steps) 역전파
+            # 3. 이산 투사 역전파: d_proj/dx_filt (x_filt 기준 — 순방향과 일관)
             if self.bead_steps >= 1:
-                dC_dx *= self._project_x_grad(x, self._beta)
+                dC_dx_filt = dC_dx_proj_in * self._project_x_grad(x_filt, self._beta)
+            else:
+                dC_dx_filt = dC_dx_proj_in
+
+            # 4. 공간 필터 역전파 (맨 마지막)
+            dC_dx = self._H.T @ dC_dx_filt
 
             df0dx = (dC_dx / C_0).flatten()
 
             # ── 반발 패널티 (다중 설계 탐색) ─────────────────────────────────
+            # diversity_start_iter >= 0: 해당 iter에 현재 x를 기준점으로 스냅샷 등록
+            if (self.diversity_weight > 0
+                    and self.diversity_start_iter >= 0
+                    and i == self.diversity_start_iter):
+                self._reference_designs.append(x.copy())
+                print(f"   [Diversity] iter {i}: 기준 설계 스냅샷 등록 "
+                      f"(총 {len(self._reference_designs)}개)")
+
             if self.diversity_weight > 0 and self._reference_designs:
-                sig2 = self.diversity_sigma ** 2
-                for x_ref in self._reference_designs:
-                    diff   = x - x_ref
-                    dist2  = np.dot(diff, diff)
-                    w_rep  = self.diversity_weight * np.exp(-dist2 / (2.0 * sig2))
-                    f0val += float(w_rep)
-                    df0dx += w_rep * (-diff / sig2)
+                # start_iter 방식: iter 진행에 따라 패널티 강도 ramp-in (0→λ, 10 iter)
+                if self.diversity_start_iter >= 0:
+                    _ramp = min(1.0, (i - self.diversity_start_iter) / 10.0)
+                    _w_eff = self.diversity_weight * max(0.0, _ramp)
+                else:
+                    _w_eff = self.diversity_weight
+                if _w_eff > 0:
+                    sig2 = self.diversity_sigma ** 2
+                    for x_ref in self._reference_designs:
+                        diff   = x - x_ref
+                        dist2  = np.dot(diff, diff)
+                        w_rep  = _w_eff * np.exp(-dist2 / (2.0 * sig2))
+                        f0val += float(w_rep)
+                        df0dx += w_rep * (-diff / sig2)
 
             # 좌우 대칭 강제 (민감도 동기화)
             if self.sym_x:
                 df0dx = 0.5 * (df0dx + df0dx[self._sym_map])
+
+            # ── vol_frac ramping: 1.0 → h_ratio (처음 vol_ramp_iters 구간) ──────
+            _ramp_n = max(1, self.vol_ramp_iters)
+            _t = min(1.0, i / _ramp_n)          # 0.0(iter=0) → 1.0(iter=ramp_n)
+            _vol_target = 1.0 - _t * (1.0 - self.h_ratio)
 
             # ── 비드 연결 phase 1: df0dx 승격 + vol_frac 사전 보정 ────────────────
             # _apply_bead_connect를 1회만 호출해 두 가지를 동시 처리:
@@ -1688,33 +1903,66 @@ class WHTopographySolver:
                             df0dx[k] = max(df0dx[k], max(nb_sens))
 
                     # bridge 추가 후 체적 증가분 계산 → MMA 목표에서 선제 차감
-                    if self.bead_steps >= 1:
-                        vol_before = float(np.mean(self._project_x(x, self._beta)))
-                        vol_after  = float(np.mean(self._project_x(x_bridged, self._beta)))
-                    else:
-                        vol_before = float(np.mean(x))
-                        vol_after  = float(np.mean(x_bridged))
-                    bridge_excess = max(0.0, vol_after - vol_before)
-                    self.mma.vol_frac = max(0.01, self.h_ratio - bridge_excess)
+                    # 비드 면적이 목표치(0.3)에 수축하는 버그 방지를 위해 선제 차감을 비활성화하고 h_ratio로 유지합니다.
+                    # if self.bead_steps >= 1:
+                    #     vol_before = float(np.mean(self._project_x(x, self._beta)))
+                    #     vol_after  = float(np.mean(self._project_x(x_bridged, self._beta)))
+                    # else:
+                    #     vol_before = float(np.mean(x))
+                    #     vol_after  = float(np.mean(x_bridged))
+                    # bridge_excess = max(0.0, vol_after - vol_before)
+                    # self.mma.vol_frac = max(0.01, self.h_ratio - bridge_excess)
+                    self.mma.vol_frac = _vol_target
                 else:
-                    self.mma.vol_frac = self.h_ratio
+                    self.mma.vol_frac = _vol_target
             else:
-                self.mma.vol_frac = self.h_ratio
+                self.mma.vol_frac = _vol_target
 
-            # 제약 조건 민감도 (Chain-rule: df/dx = (1/N) * dx_proj/dx)
-            dfdx = np.full(self._n_design, 1.0 / self._n_design)
-            if self.bead_steps >= 1:
-                dfdx *= self._project_x_grad(x, self._beta)
+            # 제약 조건: mean(H_area) = vol_target
+            # 단방향: H_area(x_proj)         → x_proj > 0.1 기준
+            # 양방향: H_area(|x_proj - 0.5|) → |x_proj - 0.5| > 0.1 기준
+            #         (x=0.5 근방 = 비드 없음, x=0 or x=1 = 비드 있음)
+            _beta_a  = 20.0
+            _eta_a   = 0.1
+            _t1a     = np.tanh(_beta_a * _eta_a)
+            _t2a     = np.tanh(_beta_a * (1.0 - _eta_a))
+            _denom_a = _t1a + _t2a + 1e-12
 
-            fval = np.array([float(np.mean(x_proj)) - self.h_ratio])
+            def _smooth_area(xp):
+                return (_t1a + np.tanh(_beta_a * (xp - _eta_a))) / _denom_a
 
-            # MMA 업데이트
-            # bead_steps >= 1: project_fn 전달 → 이분법이 mean(x_proj) = h_ratio 기준으로 수렴
-            # bead_steps  < 1: project_fn=None → 기존 mean(x) 기준 (연속 변수)
-            if self.bead_steps >= 1:
-                project_fn = lambda xv: self._project_x(np.array(xv), self._beta)
+            def _smooth_area_grad(xp):
+                return _beta_a * (1.0 - np.tanh(_beta_a * (xp - _eta_a)) ** 2) / _denom_a
+
+            if self.bidirectional:
+                _dev      = np.abs(x_proj_in - 0.5)          # [0, 0.5]
+                _dev_sign = np.sign(x_proj_in - 0.5)         # ±1
+                _area_density = _smooth_area(_dev)
+                _ha_grad_base = _smooth_area_grad(_dev) * _dev_sign  # chain: d|·|/dx_proj
             else:
-                project_fn = None
+                _area_density = _smooth_area(x_proj_in)
+                _ha_grad_base = _smooth_area_grad(x_proj_in)
+
+            fval = np.array([float(np.mean(_area_density)) - _vol_target])
+
+            if self.bead_steps >= 1:
+                _pg   = self._project_x_grad(x_filt, self._beta)
+                dfdx  = self._H.T @ (_ha_grad_base * _pg / self._n_design)
+            else:
+                dfdx  = self._H.T @ (_ha_grad_base / self._n_design)
+
+            # MMA 이분법도 smooth area 기준으로 체적 검사
+            _H_ref    = self._H
+            _beta_ref = self._beta
+            _bs_ref   = self.bead_steps
+            _bidir_ref = self.bidirectional
+            def project_fn(x_t):
+                xf  = _H_ref @ x_t
+                xp  = self._project_x(xf, _beta_ref) if _bs_ref >= 1 else xf
+                if _bidir_ref:
+                    return _smooth_area(np.abs(xp - 0.5))
+                return _smooth_area(xp)
+
             x = self.mma.update(
                 x, f0val, df0dx,
                 fval,
@@ -1753,7 +2001,7 @@ class WHTopographySolver:
                 data = {
                     "iter":       i + 1,
                     "compliance": float(C_total),
-                    "area_ratio": float(np.mean(x_proj > 0.1)),
+                    "area_ratio": float(np.mean(_area_density)),
                     "cases":      case_data,
                     "frequencies": freqs.tolist(),
                     "avg_h":      float(np.mean(h_phys)),
@@ -1763,7 +2011,11 @@ class WHTopographySolver:
                     "heights":    h_phys * float(np.sign(
                         self.bead_dir[int(np.argmax(np.abs(self.bead_dir)))]
                     )),
+                    "h_max":      float(self.h_max),
+                    "bead_steps": int(self.bead_steps),
+                    "bead_dir_sign": 0 if self.bidirectional else int(np.sign(self.bead_dir[int(np.argmax(np.abs(self.bead_dir)))])),
                     "snap_dir":   str(_snap_dir),
+                    "min_width":  float(self.rmin),
                 }
                 if not _mesh_edge_segs_sent:
                     data["mesh_edge_segs"] = mesh_edge_segs
@@ -1785,23 +2037,55 @@ class WHTopographySolver:
             # ── 이터레이션 요약 출력 ──────────────────────────────────────────
             _SW = 100
             f1_str = f"F1={elastic_freqs[0]:.1f}Hz" if elastic_freqs else "F1=--"
-            converged = change < tol
+            # 수렴 판정: (1) 단일 이터 엄격 기준 dx<tol, OR
+            #            (2) 정체 — 연속 5회 dx<tol*5 (MMA 미세 진동으로 수렴 못함 방지)
+            # Iter 0~2는 초기 균일/대칭 상태에서 dx≈0 위양성 방지 위해 체크 스킵
+            change_history.append(change)
+            stagnant = (
+                len(change_history) >= 5
+                and all(c < tol * 5.0 for c in change_history[-5:])
+            )
+            converged = (i >= 3) and (change < tol or stagnant)
             stop_req  = stop_event and stop_event.is_set()
 
             obj_tag = (f"[{self.obj_type}{'·N' if self.normalize_obj else ''}]"
                        if self.obj_type != 'sum' or self.normalize_obj else "")
+
+            # 목적함수 개선율 (Iter 0 대비)
+            f0_impv = (f0_init - f0val) / (abs(f0_init) + 1e-12) * 100.0
+
+            # 체적 제약 상태 (projected 기준 — fval과 동일 척도)
+            vol_cur = float(np.mean(_area_density))
+            vol_tgt = _vol_target
+            vol_vio = vol_cur - vol_tgt   # >0: 초과, <0: 미달
+            vol_mark = "OK" if abs(vol_vio) < 0.01 else ("HI" if vol_vio > 0 else "LO")
+
             print(f"\n  ┌─ Iter {i:03d} {'─' * (_SW - 15)}┐")
-            print(f"     C={C_total:.4e}  f0={f0val:.4f}{obj_tag}"
-                  f"   {f1_str}   Avg_h={np.mean(x*self.h_max):.2f}mm   dx={change:.4f}")
+            print(f"     Obj: f0={f0val:.4f}{obj_tag}  "
+                  f"impr={f0_impv:+.1f}%  (init={f0_init:.4f})"
+                  f"   dx={change:.4f}")
+            print(f"     Vol: {vol_cur*100:.1f}% / target {vol_tgt*100:.1f}%  [{vol_mark}]"
+                  f"   Avg_h={np.mean(x_proj_in*self.h_max):.2f}mm"
+                  f"   {f1_str}")
             for name, res in C_responses.items():
+                c_ratio = res['C'] / max(self._C_0_cases.get(name, 1e-10), 1e-10)
                 print(f"     [{name:28s}]  U={0.5*res['C']:.3e}J"
-                      f"  u={res['max_disp']:.1f}mm  sv={res['max_stress']:.0f}MPa")
-            if len(elastic_freqs) >= 3:
+                      f"  u={res['max_disp']:.1f}mm  sv={res['max_stress']:.0f}MPa"
+                      f"  ({c_ratio*100:.0f}%)")
+            if len(elastic_freqs) >= 1:
                 freq_str = "  ".join(f"f{k+1}={elastic_freqs[k]:.1f}Hz"
                                      for k in range(min(5, len(elastic_freqs))))
-                print(f"     Freq: {freq_str}")
+                freq_line = f"     Freq: {freq_str}"
+                if self.freq_target > 0.0:
+                    f1_cur = elastic_freqs[0]
+                    freq_ok = "OK" if f1_cur >= self.freq_target else f"need {self.freq_target:.1f}Hz"
+                    freq_line += f"  [{freq_ok}]"
+                print(freq_line)
             if converged:
-                print(f"     >> Converged  (dx={change:.2e} < tol={tol:.2e})")
+                if stagnant and change >= tol:
+                    print(f"     >> Converged (stagnation: 5 iters all dx<{tol*5:.2e})")
+                else:
+                    print(f"     >> Converged  (dx={change:.2e} < tol={tol:.2e})")
             elif stop_req:
                 print(f"     >> Stop requested")
             print(f"  └{'─' * (_SW - 4)}┘")
@@ -1811,8 +2095,25 @@ class WHTopographySolver:
 
         # 원본 좌표 복원 후 최종 형상 적용
         self._restore_heights()
-        # 최종 결과도 투사 적용
-        self.heights = self._project_x(x, self._beta) * self.h_max
+        # 최종 결과: filter → hard snap (β=∞ 등가 하드 threshold)
+        # 최적화 루프는 연속 근사(tanh)로 진행했지만, 최종 형상은 각 레벨의
+        # 경계(threshold)를 기준으로 가장 가까운 이산 레벨로 확정 snap한다.
+        x_final_filt = self._H @ x
+        if self.bead_steps >= 1:
+            n = self.bead_steps + 1
+            levels = np.linspace(0.0, 1.0, n)
+            # argmin으로 가장 가까운 레벨 선택 (hard snap)
+            idx = np.argmin(
+                np.abs(x_final_filt[:, None] - levels[None, :]), axis=1
+            )
+            x_final_proj = levels[idx]
+        else:
+            x_final_proj = x_final_filt
+
+        if self.bidirectional:
+            self.heights = (x_final_proj - 0.5) * 2.0 * self.h_max
+        else:
+            self.heights = x_final_proj * self.h_max
 
         # 수렴 설계를 레퍼런스로 등록 (다음 solve() 호출 시 반발 대상)
         if self.diversity_weight > 0:
@@ -1840,7 +2141,7 @@ class WHTopographySolver:
             x_new  = x_last + noise * np.random.randn(self._n_design)
             self.heights = np.clip(x_new, 0.0, 1.0) * self.h_max
         else:
-            self.heights = np.full(self._n_design, 0.01) * self.h_max
+            self.heights = np.ones(self._n_design) * self.h_max
         print(f" -> [Diversity] 설계 변수 초기화 완료 (noise={noise:.2f})")
 
     def apply_final_shape(self, skip_filter: bool = False):
@@ -1851,11 +2152,11 @@ class WHTopographySolver:
         Parameters
         ----------
         skip_filter : bool
-            True이면 공간 필터(_H)를 재적용하지 않습니다.
-            이산화(--height-steps) 후 호출 시 반드시 True로 설정해야
-            양자화된 높이값이 블러링되지 않습니다.
+            (deprecated) 표준 SIMP(filter→project) 순서 적용 후 self.heights는
+            이미 필터를 거친 물리값이므로 재적용 안 함. 호환성 유지용 인자.
         """
-        h = self.heights if skip_filter else self._H @ self.heights
+        del skip_filter
+        h = self.heights
         self._apply_heights(h)
         print(f" -> [Solver] 최종 비드 형상 적용 완료 "
               f"(Max: {np.max(h):.2f}mm, "
@@ -1866,8 +2167,10 @@ class WHTopographySolver:
         시각화용 전체 노드(sorted_nids 기준) 비드 높이 배열을 반환합니다.
 
         요소별 높이를 인접 요소 평균으로 노드에 집계합니다.
+        skip_filter는 호환성 인자(no-op) — heights는 이미 필터 거친 물리값.
         """
-        h_elem = self.heights if skip_filter else self._H @ self.heights
+        del skip_filter
+        h_elem = self.heights
         h_node_sum = np.zeros(len(self._design_nids))
         np.add.at(h_node_sum, self._aggr_src, h_elem[self._aggr_dst])
         h_node = h_node_sum / (self._node_adj_count_arr + 1e-12)

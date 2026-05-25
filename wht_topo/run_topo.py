@@ -4,13 +4,14 @@
 
 #모드 B | CSV 단독 동적 응답 해석 (최적화 생략)
 
-python wht_topo/run_topo.py --pos-data wht_topo\structural_dynamics_c235.csv --add-inertia
-python wht_topo/run_topo.py --pos-data wht_topo\structural_dynamics_c235.csv --add-inertia --use-global-z
+python wht_topo/run_topo.py --pos-data wht_topo/structural_dynamics_c235.csv --add-inertia
+python wht_topo/run_topo.py --pos-data wht_topo/structural_dynamics_c235.csv --add-inertia --use-global-z
 
 
 #모드 D
 python wht_topo/run_topo.py --dynamic-opts "wht_topo/structural_dynamics_rear.csv"  "wht_topo/structural_dynamics_c125.csv" "wht_topo/structural_dynamics_c235.csv" --add-inertia --sym-x --bead-connect 140 --height-steps 1 
 
+# python wht_topo/run_topo.py ... --bead-connect 140 --bead-connect-alg closing
 
 # MST 방식 - 모든 섬을 Bresenham 직선으로 강제 연결
 python wht_topo/run_topo.py ... --bead-connect 140 --bead-connect-alg mst
@@ -21,6 +22,12 @@ python wht_topo/run_topo.py ... --bead-connect 140 --bead-connect-alg geodesic
 # Hybrid - closing으로 좁은 갭 먼저, 남은 섬은 MST로 처리
 python wht_topo/run_topo.py ... --bead-connect 140 --bead-connect-alg hybrid
 
+
+--ignore-gooey
+
+python wht_topo/run_topo.py --iters 16 --min-width 80.0 --height-steps 2 --sym-x --obj-type max --projection 32 --normalize-obj 1.0 --bead-connect 150 --bead-area 0.25 --bead-connect-alg geodesic    
+
+python wht_topo/run_topo.py --iters 16 --min-width-init 150.0 --min-width 60.0 --min-width-ramp 5  --height-steps 2 --sym-x --obj-type max --projection 32 --bead-connect 150 --bead-area 0.50 --bead-connect-alg geodesic --diversity-start-iter 10                     
 
 '''
 
@@ -63,7 +70,7 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
       --add-inertia --no-iterative-esl
 
   모드 D | 고신뢰성 산업용 완전 제약 설계
-    반복 ESL + 관성 하중 + 좌우 대칭 + 비드 연결 + 이산화(0/h_max) + 배제 영역
+    반복 ESL + 관성 하중 + 좌우 대칭 + 비드 연결 + 이산화(0/h_max/2/h_max) + 배제 영역
     실행: python wht_topo/run_topo.py \
       --dynamic-opts "wht_topo/structural_dynamics_rear.csv,0.4,0.6" \
                      "wht_topo/structural_dynamics_c125.csv,1.5,1.8" \
@@ -225,11 +232,16 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
 """
 
 import argparse
+from gooey import Gooey, GooeyParser
 import math
 import re
 import sys
+import os
 import io
 import multiprocessing
+
+# Qt DPI 감지 시 비활성 보조 모니터 경고 억제
+os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.qpa.screen=false")
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -1494,7 +1506,8 @@ class PosDynamicPipeline:
             return
         print(" [7] WHTVisualizer 실행...")
         viz = WHTVisualizer(title="CSV Position Data - Dynamic Response")
-        viz.show_result(self.wht_data, group_name="DynamicTray")
+        viz.show_result(self.wht_data, group_name="DynamicTray",
+                        kabsch=self._kabsch)
         viz.plotter.view_isometric()
         viz.plotter.reset_camera()
         if hasattr(viz.plotter, 'app'):
@@ -1596,6 +1609,22 @@ class TopographyPipeline:
         모드 C/D + 1회 추출 (--no-iterative-esl): (static+ESL 병합, None)
         """
         if not getattr(self.cfg, 'dynamic_opts', None):
+            # 모드 A (정적 전용): 자중 계산 후 scaled_loads를 self에 저장
+            _section("정적 하중 케이스", "3")
+            w_bw = getattr(self.cfg, 'w_basic_weight', 1.0)
+            raw_loads = self._loads()
+            if w_bw != 0.0 and not getattr(self.cfg, 'no_static', False):
+                try:
+                    total_mass, W_N, x_cm, y_cm, z_cm, _, _ = self._calc_chassis_weight()
+                    self._scaled_loads = {k: math.copysign(W_N * w_bw, v) for k, v in raw_loads.items()}
+                    self._print_weight_report(total_mass, W_N, x_cm, y_cm, z_cm, self._scaled_loads)
+                except Exception as _we:
+                    print(f"     자중 자동계산 실패 ({_we}). 입력 하중값 그대로 사용.")
+                    self._scaled_loads = raw_loads
+            else:
+                print(f"     --w-basic-weight 0: 입력 하중값 그대로 사용.")
+                self._scaled_loads = raw_loads
+            _endsec()
             return None, None
 
         # CSV 엔트리 파싱: "path" / "path,t_start" / "path,t_start,t_end"
@@ -1626,13 +1655,17 @@ class TopographyPipeline:
             raw_loads = self._loads()
             if w_bw != 0.0:
                 # 자중 자동계산: 총 무게 * 스케일 * 입력 부호
-                total_mass, W_N, x_cm, y_cm, z_cm, _, _ = self._calc_chassis_weight()
-                scaled_loads = {
-                    k: math.copysign(W_N * w_bw, v)
-                    for k, v in raw_loads.items()
-                }
-                self._print_weight_report(total_mass, W_N, x_cm, y_cm, z_cm,
-                                          scaled_loads)
+                try:
+                    total_mass, W_N, x_cm, y_cm, z_cm, _, _ = self._calc_chassis_weight()
+                    scaled_loads = {
+                        k: math.copysign(W_N * w_bw, v)
+                        for k, v in raw_loads.items()
+                    }
+                    self._print_weight_report(total_mass, W_N, x_cm, y_cm, z_cm,
+                                              scaled_loads)
+                except Exception as _we:
+                    print(f"\n [3] 자중 자동계산 실패 ({_we}). 입력 하중값 그대로 사용.")
+                    scaled_loads = raw_loads
             else:
                 scaled_loads = raw_loads
                 print(f"\n [3] --w-basic-weight 0: 입력 하중값 그대로 사용.")
@@ -1748,6 +1781,7 @@ class TopographyPipeline:
         else:
             print("     ESL 방식: [1회 추출] 최적화 전 고정 하중 케이스로 진행.")
         load_manager = StochasticLoadManager(self.model)
+        load_manager._scaled_loads = getattr(self, '_scaled_loads', None)
         freq_w, freq_f0 = getattr(self.cfg, 'freq_penalty', [0.0, 0.0])
         exclude_zones = _parse_exclude_zones(
             getattr(self.cfg, 'exclude_rect', None),
@@ -1779,11 +1813,18 @@ class TopographyPipeline:
             freq_target       = freq_f0,
             exclude_zones     = exclude_zones,
             n_workers         = self.cfg.n_workers,
+            modal_modes       = self.cfg.modal_modes,
+            vol_ramp_iters       = getattr(self.cfg, 'bead_area_ramp', 5),
+            bidirectional        = getattr(self.cfg, 'bead_bidirectional', False),
+            min_width_init       = getattr(self.cfg, 'min_width_init', -1.0),
+            min_width_ramp_iters = getattr(self.cfg, 'min_width_ramp', 10),
         )
         n_designs = getattr(self.cfg, 'n_designs', 1)
-        if n_designs > 1:
-            self.solver.diversity_weight = getattr(self.cfg, 'diversity_weight', 0.3)
-            self.solver.diversity_sigma  = getattr(self.cfg, 'diversity_sigma',  0.3)
+        _div_start = getattr(self.cfg, 'diversity_start_iter', -1)
+        if n_designs > 1 or _div_start >= 0:
+            self.solver.diversity_weight     = getattr(self.cfg, 'diversity_weight', 0.3)
+            self.solver.diversity_sigma      = getattr(self.cfg, 'diversity_sigma',  0.3)
+            self.solver.diversity_start_iter = _div_start
 
     def _run_optimizer(self) -> None:
         """최적화를 실행합니다. GUI 지정 시 모니터링 프로세스를 병렬로 시작합니다."""
@@ -1814,8 +1855,8 @@ class TopographyPipeline:
                     print(f"{'='*60}")
                     if design_idx > 0:
                         self.solver.reset_for_next_design(noise=noise)
-                self.solver.solve(max_iter=self.cfg.iters, callback=callback,
-                                  stop_event=stop_event)
+                self.solver.solve(max_iter=self.cfg.iters, tol=self.cfg.tol,
+                                  callback=callback, stop_event=stop_event)
                 if n_designs > 1:
                     # 각 설계를 별도 파일로 저장
                     self._discretize()
@@ -1832,16 +1873,22 @@ class TopographyPipeline:
                 queue.put("STOP")
 
     def _discretize(self) -> None:
-        """height_steps >= 2 인 경우 비드 높이를 이산 레벨로 양자화합니다."""
-        if self.cfg.height_steps < 2:
+        """height_steps >= 1 인 경우 비드 높이를 이산 레벨로 양자화합니다.
+        레벨 수는 bead_steps + 1 — solver의 _project_x와 동일 규약.
+        예: bead_steps=2 → 3 레벨 {0, h_max/2, h_max}.
+        """
+        # 최종 양자화(ON-OFF)를 제거하고 최적화로 계산된 비드 높이의 연속적인 값을 그대로 반영합니다.
+        return
+
+        if self.cfg.height_steps < 1:
             return
-        n      = self.cfg.height_steps
-        levels = np.linspace(0.0, self.solver.h_max, n)
+        n_lvl  = self.cfg.height_steps + 1
+        levels = np.linspace(0.0, self.solver.h_max, n_lvl)
         self.solver.heights = levels[
             np.abs(self.solver.heights[:, None] - levels).argmin(axis=1)
         ]
         final = np.unique(np.round(self.solver.heights, 4))
-        print(f"\n [5] 이산화: {n}단계 → {final} mm")
+        print(f"\n [5] 이산화: {n_lvl}레벨 → {final} mm")
 
     def _apply_shape(self) -> None:
         """최종 비드 형상을 모델 노드 좌표에 적용합니다."""
@@ -1860,7 +1907,8 @@ class TopographyPipeline:
         if self.cfg.no_viz:
             return
         print(" [8] 시각화...")
-        discrete     = self.cfg.height_steps >= 2
+        bead_steps   = self.cfg.height_steps
+        discrete     = bead_steps >= 1
         result_data  = self.model.to_wht_result_data()
         heights_full = self.solver.get_full_heights(skip_filter=discrete)
         result_data.point_data["Bead_Height"] = (
@@ -1868,6 +1916,8 @@ class TopographyPipeline:
         )
         viz = WHTVisualizer(title="Industrial Topography Result")
         viz.load_results(result_data)
+        # discrete bead_steps 정보를 visualizer에 전달 → scalar bar 이산화
+        viz.set_bead_discrete_levels(bead_steps if discrete else 0)
         viz.show()
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
@@ -1906,9 +1956,11 @@ class TopographyPipeline:
         m_diag     : array   노드 질량 대각 벡터
         n2i        : dict    nid -> jaxsso index
         """
+        print(f"     [자중계산] node_db 크기: {len(self.node_db) if self.node_db else 'None'}")
         temp = WHTDynamicSolver(self.model)
         jm, s_nids, n2i = temp._build_jaxsso_model()
         m_diag = temp._assemble_lumped_mass(jm, jm.ndof, s_nids, n2i)
+        print(f"     [자중계산] n2i 크기: {len(n2i)}, m_diag 합: {float(sum(m_diag[n2i[nid]*6+2] for nid in n2i)):.4e}")
 
         total_mass = 0.0
         mx = my = mz = 0.0
@@ -1933,6 +1985,9 @@ class TopographyPipeline:
             x_cm = y_cm = z_cm = 0.0
 
         W_N = total_mass * GRAVITY_MM
+        print(f"     [자중계산] total_mass={total_mass*1e3:.4f} kg  W_N={W_N:.2f} N")
+        if W_N < 1.0:
+            print("     [자중계산] 경고: 자중이 0에 가깝습니다. 재료 밀도(rho) 설정을 확인하세요.")
         return total_mass, W_N, x_cm, y_cm, z_cm, m_diag, n2i
 
     def _print_weight_report(self, total_mass: float, W_N: float,
@@ -2135,9 +2190,138 @@ def _resolve_input_dir(parser) -> list:
     return final_argv
 
 
+_WIZARD_PRESETS = {
+    "A": {
+        "label": "빠른 탐색 (패턴 확인용, ~5분)",
+        "args": "--iters 20 --min-width 80 --filter-type gaussian "
+                "--bead-connect 120 --normalize-obj 1.0",
+    },
+    "B": {
+        "label": "표준 단일 설계 (권장 시작점, ~15분)",
+        "args": "--iters 40 --min-width 100 --filter-type gaussian "
+                "--projection 32 --bead-connect 120 --height-steps 2 "
+                "--sym-x --normalize-obj 1.0 --obj-type sum+max",
+    },
+    "C": {
+        "label": "체커보드 억제 강화 (픽셀화 문제 시)",
+        "args": "--iters 40 --min-width 120 --filter-type gaussian "
+                "--projection 32 --bead-connect 150 "
+                "--sym-x --normalize-obj 1.0 --obj-type sum+max",
+    },
+    "D": {
+        "label": "다중 설계 탐색 (3개 다른 형태 생성)",
+        "args": "--iters 35 --n-designs 3 "
+                "--min-width 100 --filter-type gaussian --projection 32 "
+                "--bead-connect 120 --sym-x "
+                "--normalize-obj 1.3 --obj-type sum+max "
+                "--diversity-weight 0.3 --diversity-sigma 0.3 --diversity-noise 0.15",
+    },
+    "E": {
+        "label": "정적 전용 — 굽힘·비틀림·리프팅, 절대값 기반 기여도",
+        "args": "--iters 40 --min-width 100 "
+                "--bead-connect 120 --height-steps 2 "
+                "--sym-x --normalize-obj 1.0 --obj-type sum",
+    },
+    "F": {
+        "label": "산업용 고신뢰성 — 동적 ESL 포함 (CSV 필수)",
+        "args": "--iters 40 --min-width 100 "
+                "--projection 32 --bead-connect 120 --height-steps 2 "
+                "--sym-x --normalize-obj 1.0 --obj-type sum+max "
+                "--w-dynamic 1.0 --w-peak 0.5 --add-inertia "
+                "--n-windows 30 --n-top 10",
+        "requires_dynamic": True,
+    },
+    "G": {
+        "label": "다중 정하중 케이스",
+        "args": "--iters 16 --min-width-init 150.0 --min-width 60.0 --min-width-ramp 5 "
+                "--height-steps 2 --sym-x --obj-type max --projection 32 "
+                "--bead-connect 150 --bead-area 0.50 --bead-connect-alg geodesic "
+                "--diversity-start-iter 10",
+    },
+}
+
+import os
+import sys
+
+# Gooey가 터미널 출력을 읽을 때 utf-8로 디코딩하므로, 
+# 하위 프로세스의 모든 파이썬 출력을 utf-8로 강제하고 오류 문자는 대체(replace)합니다.
+os.environ["PYTHONIOENCODING"] = "utf-8:replace"
+os.environ["PYTHONUTF8"] = "1"
+
+
+def _inject_topo_arg_for_gooey() -> None:
+    """
+    Gooey 렌더링 전에 --input-dir 의 topo_arg.txt 를 sys.argv 에 주입한다.
+
+    use_cmd_args=True 는 Gooey가 GUI 위젯 초기값을 sys.argv 에서 읽으므로,
+    @Gooey 데코레이터가 실행되기 전에 sys.argv 를 교체해야 한다.
+
+    Gooey 내부 실행(--ignore-gooey 플래그 존재 시)에서는 _resolve_input_dir 가
+    이미 처리하므로 이 함수는 아무 것도 하지 않는다.
+    """
+    import shlex
+    argv = sys.argv[1:]
+
+    # Gooey 내부 실행 시 (--ignore-gooey) 또는 input-dir 없으면 건너뜀
+    if "--ignore-gooey" in argv:
+        return
+    input_dir = None
+    for i, tok in enumerate(argv):
+        if tok == "--input-dir" and i + 1 < len(argv):
+            input_dir = Path(argv[i + 1].strip('"').strip("'"))
+            break
+        if tok.startswith("--input-dir="):
+            input_dir = Path(tok.split("=", 1)[1].strip('"').strip("'"))
+            break
+    if input_dir is None or not input_dir.is_dir():
+        return
+
+    arg_file = input_dir / "topo_arg.txt"
+    if not arg_file.exists():
+        return
+
+    # topo_arg.txt 파싱
+    base_argv: list = []
+    raw = arg_file.read_text(encoding="utf-8")
+    for line in raw.splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        base_argv.extend(shlex.split(line))
+
+    # --dynamic-opts / --pos-data 상대경로를 절대경로로 변환
+    _path_opts = {"--dynamic-opts", "--pos-data"}
+    _in_path = False
+    for k, tok in enumerate(base_argv):
+        if tok in _path_opts:
+            _in_path = True
+            continue
+        if _in_path:
+            if tok.startswith("--"):
+                _in_path = False
+            else:
+                parts = tok.split(",", 1)
+                p = Path(parts[0])
+                if not p.is_absolute():
+                    parts[0] = str((input_dir / p).resolve())
+                    base_argv[k] = ",".join(parts)
+
+    # sys.argv 교체: [script] + base_argv(파일) + argv(명령줄)
+    # argv가 뒤에 오면 argparse 중복 시 마지막 값(명령줄) 우선 적용
+    sys.argv = [sys.argv[0]] + base_argv + argv
+
+
+_inject_topo_arg_for_gooey()
+
+
+@Gooey(program_name="WHTOOLs FEM TV Chassis Topography Optimizer Tool", default_size=(1024, 768), navigation='TABBED', tabbed_groups=True, clear_before_run=True, language='korean', image_dir=os.path.join(os.path.dirname(__file__), 'resources'), terminal_font_family='D2Coding', terminal_font_size=8, use_cmd_args=True, encoding='utf-8')
 def main():
-    parser = argparse.ArgumentParser(
-        description="WHT 산업용 섀시 비드 최적화 도구 (Dynamic-ESL 통합형)",
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    parser = GooeyParser(
+        description="WHTOOLs FEM TV Chassis Topography Optimizer Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2146,8 +2330,9 @@ def main():
 
 [모드 A] 기본 정적 최적화
   python wht_topo/run_topo.py
-  python wht_topo/run_topo.py --iters 20 --bead-height 12
-  python wht_topo/run_topo.py --iters 30 --bead-area 0.30 --min-width 50 --height-steps 2
+  python wht_topo/run_topo.py --iters 20 --bead-height 12 --normalize-obj 1
+  python wht_topo/run_topo.py --iters 30 --bead-area 0.30 --bead-area-ramp 10 --min-width 50 --height-steps 1
+  python wht_topo/run_topo.py --iters 50 --bead-area 0.25 --bead-area-ramp 15 --height-steps 2 --bead-bidirectional
 
   섀시 크기·재료 변경:
     python wht_topo/run_topo.py \\
@@ -2399,19 +2584,79 @@ def main():
     권장: 32 (8~16: 완만한 수렴, 32: 표준, 64+: 불안정 위험)
 
 --bead-connect N mm  (기본: 120, 0=비활성)
-    형태학적 폐합(Morphological Closing: Dilation→Erosion)으로
-    N mm 이하의 단절된 비드 구간을 자동 연결.
+    N mm 이하의 단절된 비드 섬(island)을 자동 연결.
     ① bridge 노드 민감도를 이웃 최대값으로 승격 → MMA가 연결 유지
     ② bridge 추가로 인한 체적 증가를 사전에 vol_frac에서 차감
     연속된 비드 라인은 제조성(프레스 성형)과 강성 기여 모두에 필수.
     권장: 100~150 (메시 간격 30mm 기준 약 3~5 요소 간격)
 
---height-steps N  (기본: 1=연속)
+--bead-connect-alg {closing|mst|geodesic|hybrid}  (기본: closing)
+
+    비드 패턴은 MMA 밀도 최적화 결과로 초기에 분리된 섬(island)으로
+    나타날 수 있다. 이 섬들을 어떤 경로로 이어줄지를 선택하는 옵션이다.
+    우주 구조 형성에서 별(비드 섬)들이 은하 팔(연결 경로)로 이어지는
+    방식을 선택하는 것과 유사하다.
+
+    closing   : 형태학적 폐합(Morphological Closing: Dilation → Erosion).
+                binary 이미지를 팽창시킨 뒤 수축하여 인근 섬을 연결.
+                구조가 단순하고 빠르다. 섬 간격이 좁고 패턴이 균일할 때 적합.
+                단점: 섬이 멀리 떨어져 있거나 여러 개로 분산된 경우 미연결 잔존.
+
+    mst       : 최소 신장 트리(Minimum Spanning Tree).
+                scipy.ndimage.label로 연결 성분(섬)을 식별하고,
+                섬 간 최단 픽셀 거리를 엣지 비용으로 Kruskal MST를 구성.
+                각 엣지를 Bresenham 직선으로 연결 → 모든 섬이 반드시 연결됨.
+                장점: 연결 보장. 단점: 직선 경로라 자연스럽지 않을 수 있음.
+                권장: 섬이 많고 광범위하게 분산된 경우.
+
+    geodesic  : 지오데식 최단 경로.
+                가장 큰 섬을 source로 multi-source Dijkstra 실행.
+                비활성 요소(cost=1)를 통과하는 최소 비용 경로로 각 섬을 연결.
+                기존 비드 밀도장을 따라 자연스러운 경로로 수렴하는 경향.
+                장점: 경로가 유기적. 단점: closing보다 느림.
+                권장: 비드 라인이 자연스럽게 이어지길 원할 때.
+
+    hybrid    : MST + Geodesic 순차 적용.
+                먼저 MST로 전체 연결을 보장한 뒤, Geodesic으로 경로를 다듬음.
+                두 알고리즘의 장점 결합. 계산 비용이 가장 높음.
+                권장: 분산된 섬 + 자연스러운 경로 모두 원할 때.
+
+--height-steps N  (기본: 1=이진)
     비드 높이 이산화 단계 수.
-    1  : 연속 변수 (0~h_max 사이 임의값)
-    2  : 이진({0, h_max}) → 완전한 ON/OFF 비드
-    3+ : N개 등간격 레벨. tanh 계단 함수로 근사, β-continuation으로 점진 이산화.
+    0  : 연속 변수 (0~h_max 사이 임의값, discrete projection 없음)
+    1  : 이진 {0, h_max} → 완전한 ON/OFF 비드
+    2  : 3단계 {0, h_max/2, h_max}
+    N  : N+1 단계 균등 분할 {0, h_max/N, ..., h_max}
+         tanh 계단 함수로 근사, β-continuation으로 점진 이산화.
     권장: 초기 탐색=1, 최종 제조 설계=2
+
+--bead-bidirectional  (기본: 비활성)
+    양방향 비드 허용.
+    x=0.5 → 높이 0 (비드 없음), x=0 → -h_max (인장), x=1 → +h_max (압축).
+    --height-steps N 기준: 단방향 N+1개 레벨이 양방향 2N+1개 레벨로 확장.
+    예) steps=1 → {-h_max, 0, +h_max} (3레벨)
+        steps=2 → {-h_max, -h_max/2, 0, +h_max/2, +h_max} (5레벨)
+    colorbar 자동 전환: coolwarm 발산형, 범위 ±h_max.
+    권장: steps>=1 (steps=0 연속형과 조합 가능).
+
+--bead-area-ramp N  (기본: 5)
+    비드 면적 제약(--bead-area)을 초기 1.0에서 목표값까지
+    N 이터레이션에 걸쳐 선형 감소.
+    초반 자유도 확보 → 위상 패턴 형성 후 점진적 면적 제한.
+    0  : 즉시 목표값 적용 (ramp 없음).
+    권장: 5~15. bead-area가 작을수록 ramp 길게.
+
+--min-width-init F  (기본: -1=비활성)
+    필터 연속화(filter continuation) 초기 최소 비드 폭 mm.
+    지정 시: F(초기 큰 값)에서 --min-width(최종 목표)까지 --min-width-ramp 이터에 걸쳐 선형 감소.
+    전략: 초기 넓은 필터 → 주요 뼈대 형성, 후반 좁은 필터 → 비드 선 얇아짐.
+    면적 제약(bead-area)을 유지하면서 위상 연결성은 보존되고 비드 폭만 감소.
+    권장: --min-width의 2~3배. 예) --min-width 35 --min-width-init 100
+
+--min-width-ramp N  (기본: 10)
+    --min-width-init → --min-width 선형 감소 이터레이션 수.
+    너무 짧으면(< 5) 격자화(checkerboard) 불안정 위험. 충분히 길게 설정.
+    권장: 전체 iters의 30~50%. 예) --iters 30 → --min-width-ramp 10~15
 
 --sym-x / --no-sym-x  (기본: 활성)
     X축 기준 좌우 대칭 강제. 설계 변수와 민감도를 좌우 평균하여 동기화.
@@ -2448,6 +2693,15 @@ def main():
     반발 패널티와 함께 새로운 국소 최적해 탐색을 보조.
     너무 크면(>0.4) 체적 제약 위반으로 초기 이터 불안정.
     권장: 0.1~0.2
+
+--diversity-start-iter N  (기본: -1=비활성)
+    수렴 판정 없이 N번째 iter부터 반발 패널티를 즉시 적용하는 인라인 다형성 모드.
+    -1 (기본): --n-designs 방식 — 설계 수렴 후 재시작하며 반발 패널티 추가.
+    N >= 0   : 단일 solve() 루프 내에서 iter N에 현재 x를 기준으로 스냅샷 등록,
+               이후 10 iter에 걸쳐 패널티 강도를 0 → λ(--diversity-weight)로 ramp-in.
+    전략: 초기 자유 탐색으로 뼈대 확보 → N iter 이후 현재 형태에서 멀어지는 방향 탐색.
+    주의: --n-designs 1(기본값)에서 단일 루프 내 적용.
+    권장: 전체 iters의 50~70%. 예) --iters 40 --diversity-start-iter 25
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 목적함수 옵션
@@ -2528,197 +2782,215 @@ def main():
   --normalize-obj 1.3 --obj-type sum+max
   --diversity-weight 0.3 --diversity-sigma 0.3 --diversity-noise 0.15
 
-[E] 산업용 고신뢰성 (동적 ESL 포함)
+[E] 정적 하중 전용 (동적 ESL 없이 굽힘·비틀림·리프팅만)
+  --iters 40 --min-width 100 --filter-type gaussian
+  --projection 32 --bead-connect 120 --height-steps 2
+  --sym-x --normalize-obj 0 --obj-type sum+max
+  굽힘·비틀림 하중이 리프팅보다 크므로 절대값(normalize-obj 0) 기반
+  목적함수가 큰 케이스(굽힘/비틀림)를 자연스럽게 우선 최적화.
+  정적 케이스 간 하중 크기가 유사하면 --normalize-obj 1.0 도 무방.
+
+  케이스별 하중 크기를 명시적으로 조정할 경우:
+    python wht_topo/run_topo.py \\
+      --iters 40 --min-width 100 --filter-type gaussian \\
+      --projection 32 --bead-connect 120 --height-steps 2 \\
+      --sym-x --normalize-obj 0 --obj-type sum+max \\
+      --w-bending 1.0 -500 --w-twisting 1.0 -300 --w-lifting 1.0 200
+    -> 굽힘 500N 우선, 비틀림 300N, 리프팅 200N 명시. 절대값 기반 기여도 반영.
+
+[F] 산업용 고신뢰성 (동적 ESL 포함)
   --iters 40 --min-width 100 --filter-type gaussian
   --projection 32 --bead-connect 120 --height-steps 2
   --sym-x --normalize-obj 1.0 --obj-type sum+max
   --w-dynamic 1.0 --w-peak 0.5 --add-inertia
   --n-windows 30 --n-top 10
+
+[bead-connect-alg 선택 가이드]
+  비드 섬이 촘촘하고 간격이 좁음    → closing   (기본, 가장 빠름)
+  섬이 많고 넓게 분산됨             → mst       (연결 보장)
+  자연스러운 비드 흐름 원함         → geodesic  (유기적 경로)
+  분산 + 자연스러운 경로 모두 원함  → hybrid    (MST+Geodesic, 가장 느림)
+
+  예시:
+    python wht_topo/run_topo.py --bead-connect 120 --bead-connect-alg mst
+    python wht_topo/run_topo.py --bead-connect 120 --bead-connect-alg geodesic
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 """
     )
 
-    # 섀시 형상 파라미터
-    g = parser.add_argument_group("섀시 형상 (mm)")
-    g.add_argument("--tray-width",   type=float, default=TRAY_W,      help=f"섀시 폭 mm (기본: {TRAY_W})")
-    g.add_argument("--tray-length",  type=float, default=TRAY_L,      help=f"섀시 길이 mm (기본: {TRAY_L})")
-    g.add_argument("--tray-height",  type=float, default=TRAY_H,      help=f"섀시 높이 mm (기본: {TRAY_H})")
-    g.add_argument("--mesh-xy",      type=float, default=MESH_XY,     help=f"XY면 메시 크기 mm (기본: {MESH_XY})")
-    g.add_argument("--mesh-z",       type=float, default=MESH_Z,      help=f"Z방향 메시 크기 mm (기본: {MESH_Z})")
-    g.add_argument("--draft-angle",  type=float, default=DRAFT_ANGLE, help=f"측면 드래프트 각도 deg (기본: {DRAFT_ANGLE})")
-
-    # 재료 물성
-    g = parser.add_argument_group("재료 물성")
-    g.add_argument("--mat-E",   type=float, default=MAT['E'],   help=f"탄성계수 MPa (기본: {MAT['E']})")
-    g.add_argument("--mat-nu",  type=float, default=MAT['nu'],  help=f"포아송비 (기본: {MAT['nu']})")
-    g.add_argument("--mat-rho", type=float, default=MAT['rho'], help=f"밀도 tonne/mm³ (기본: {MAT['rho']:.2e})")
-    g.add_argument("--mat-t",   type=float, default=MAT['t'],   help=f"기본 판 두께 mm (기본: {MAT['t']})")
-
-    # 최적화 기본 제어
-    g = parser.add_argument_group("최적화 기본 설정")
-    g.add_argument("--iters",       type=int,   default=20,   help="최대 반복 횟수 (기본: 15)")
-    g.add_argument("--bead-height", type=float, default=15.0, help="최대 비드 높이 mm (기본: 10.0)")
-    g.add_argument("--min-width",   type=float, default=120.0, help="최소 비드 폭 mm (기본: 30.0)")
-    g.add_argument("--bead-area",   type=float, default=0.30, help="비드 점유 면적 비율 0~1 (기본: 0.30)")
-
-    # 목적함수 옵션
-    g = parser.add_argument_group("목적함수 옵션")
-    g.add_argument("--normalize-obj",    type=float, default=1.0,
-                   help="케이스별 정규화 활성화 및 가중치 변동 폭. "
-                        "0=비활성(기본), 1.0=정규화(변동 없음), "
-                        "1.4=정규화+케이스별 ±0.4 랜덤 가중치 부여 (의외성 유도)")
-    g.add_argument("--obj-type",    choices=["sum", "max", "sum+max"], default="sum+max",
-                   help="목적함수 유형: sum=가중합(기본), max=softmax 최악케이스, "
-                        "sum+max=0.5·sum+0.5·softmax")
-    g.add_argument("--obj-alpha",   type=float, default=10.0,
-                   help="softmax 온도 (--obj-type max/sum+max 시). "
-                        "1~3=케이스 평균에 가까움, 10=최악케이스 집중(기본), "
-                        "50+=hard-max 근접(수렴 불안정 주의) (기본: 10.0)")
-    g.add_argument("--freq-penalty", type=float, nargs=2, default=[0.0, 0.0],
-                   metavar=("W", "F0_HZ"),
-                   help="고유진동수 패널티: W·(max(0,F0-f1)/F0)². "
-                        "예: --freq-penalty 5.0 50  → f1 < 50Hz 시 패널티 부과")
-
-    # 다중 설계 탐색 옵션
-    g = parser.add_argument_group("다중 설계 탐색 (Multi-Design Exploration)")
-    g.add_argument("--n-designs",        type=int,   default=1,
-                   help="생성할 설계 수 (기본: 1). >1이면 수렴 후 반발 패널티로 다른 설계 탐색")
-    g.add_argument("--diversity-weight", type=float, default=0.3,
-                   help="반발 패널티 강도 λ (기본: 0.3). 클수록 이전 설계에서 멀리 떨어짐")
-    g.add_argument("--diversity-sigma",  type=float, default=0.3,
-                   help="반발 범위 σ (기본: 0.3). 클수록 넓은 영역 회피")
-    g.add_argument("--diversity-noise",  type=float, default=0.15,
-                   help="설계 재시작 시 노이즈 강도 (기본: 0.15)")
-
-    # 병렬 해석 옵션
-    g = parser.add_argument_group("병렬 해석 옵션")
-    g.add_argument("--n-workers", type=int, default=4,
-                   help="하중 케이스 병렬 해석 스레드 수 (기본: 4). "
-                        "케이스 수보다 크게 지정해도 케이스 수로 자동 제한. "
-                        "BLAS 멀티스레드와 충돌 방지를 위해 CPU 코어 수의 절반 권장.")
-
-    # 비드 형상 및 제조 제약
-    g = parser.add_argument_group("비드 형상 및 제조 제약")
-    g.add_argument("--sym-x",          action="store_true", default=True,  help="좌우 대칭 활성화 (기본: 활성)")
-    g.add_argument("--no-sym-x",       action="store_false", dest="sym_x", help="좌우 대칭 해제")
-    g.add_argument("--bead-connect",   type=float, default=120.0,
-                   help="비드 자동 연결 최대 갭 mm. 0=비활성, >0=해당 갭 이하 단절 비드 연결 (기본: 120.0)")
-    g.add_argument("--bead-connect-alg", type=str, default="closing",
-                   choices=["closing", "mst", "geodesic", "hybrid"],
-                   help="비드 연결 알고리즘 (기본: closing)")
-    g.add_argument("--height-steps",   type=int,   default=1,    help="비드 이산화 단계 (기본: 2 → {0, h_max})")
-    g.add_argument("--filter-type",    type=str,   default="linear", choices=["linear", "gaussian"],
-                   help="공간 필터 커널. linear=hat(기본), gaussian=부드러운 덩어리 형태 유도")
-    g.add_argument("--projection",     type=float, default=0.0,
-                   help="Heaviside projection beta 최대값. 0=비활성, >0=활성화 (기본: 0). "
-                        "8~16=부드러운 경계, 32=표준, 64+=hard 경계(수렴 불안정 주의)")
-    g.add_argument("--draw-dir", type=str, default="0,0,-1",
-                   help="비드 돌출 방향 (쉼표 구분, 기본: 0,0,-1 = 아래). 예: 0,0,1  또는  0,0,-1")
-    g.add_argument("--exclude-rect", type=str, action='append', default=None,
-                   metavar="CX,CY,W,H",
-                   help="비드 배제 사각형 영역 (중심 X,Y + 가로W 세로H, mm). "
-                        "여러 영역: --exclude-rect 500,300,100,80 --exclude-rect 200,400,60,60")
-    g.add_argument("--exclude-poly", type=str, action='append', default=None,
-                   metavar="X1,Y1,X2,Y2,...",
-                   help="비드 배제 다각형 영역 (꼭짓점 XY 좌표 나열, mm). "
-                        "여러 영역: --exclude-poly 100,200,150,200,150,250,100,250")
-
-    # CSV 단독 동적 해석 (모드 B)
-    g = parser.add_argument_group("CSV 단독 동적 응답 해석 (모드 B, 최적화 생략)")
-    g.add_argument("--pos-data",  type=str,   default=None,  help="CSV 경로: 지정 시 동적 해석만 실행")
-    g.add_argument("--t-start",   type=float, default=None,
-                   help="분석 시작 시점 s (기본: CSV 헤더 start_time 자동 적용)")
-    g.add_argument("--t-end",     type=float, default=None,
-                   help="분석 종료 시점 s (기본: CSV 마지막 프레임)")
-    g.add_argument("--dt",        type=float, default=0.005,  help="적분 시간 스텝 s (기본: None=CSV 샘플링 간격 그대로). ESL 모드에도 동일 적용.")
-    g.add_argument("--zeta",      type=float, default=0.02,  help="Rayleigh 감쇠비 (기본: 0.02)")
-    g.add_argument("--corner-r",  type=float, default=150.0, help="코너 탐색 반경 mm (fallback 전용)")
-
-    # 동적 ESL 통합 최적화 (모드 C/D)
-    g = parser.add_argument_group("동적 ESL 통합 최적화 (모드 C/D)")
-    g.add_argument("--dynamic-opts", type=str, nargs='+', default=None,
-                   metavar="CSV[,T_START[,T_END]]",
-                   help="'CSV경로' / 'CSV경로,시작(s)' / 'CSV경로,시작(s),종료(s)'. "
-                        "복수 시나리오 지원: --dynamic-opts drop.csv,1.6,3.0 bump.csv,0.5")
-    g.add_argument("--add-inertia",  action="store_true",     help="관성 하중(-ma) 인가")
-    g.add_argument("--n-top",        type=int, default=10,    help="추출 ESL 개수 (기본: 10)")
-    g.add_argument("--n-windows",    type=int, default=30,    help="시간 이력 분할 수 (기본: 30)")
-    g.add_argument("--n-save-esl",   type=int, default=30,
-                   help="ESL 추출용 저장 스냅샷 수 (기본: 30). "
-                        "n_windows*2 보다 작으면 자동으로 n_windows*2 로 상향. "
-                        "줄일수록 동해석 메모리·I/O 감소.")
-    g.add_argument("--use-global-z",    action="store_true",      help="글로벌 Z 궤적 직접 사용")
-    g.add_argument("--contact-threshold", type=float, default=24516.6,
-                   metavar="A",
-                   help="Kabsch fit 제외 임계 상대 Z가속도 [mm/s²] (기본: 24517≈2.5g). "
-                        "충격 임펄스 순간에 이 값을 초과하는 코너는 강체 fit에서 제외됩니다.")
-    g.add_argument("--w-dynamic",       type=float, nargs='+', default=[1.0],
-                   metavar="W",
-                   help="시간분할 ESL 스냅샷 가중치 (기본: 1.0). CSV별 복수 지정 가능: --w-dynamic 1.0 0.8")
-    g.add_argument("--w-peak",          type=float, default=0.0,  help="요소별 최대SE 피크 ESL 가중치 (기본: 0.0=비활성)")
-    g.add_argument("--iterative-esl",   action="store_true", default=True,
-                   help="매 이터레이션 ESL 재추출 (기본: 활성)")
-    g.add_argument("--no-iterative-esl", action="store_false", dest="iterative_esl",
-                   help="ESL 1회 추출 후 고정 (최적화 전 1회만 동해석)")
-    g.add_argument("--parallel-scenarios", type=int, default=1, metavar="N",
-                   help="복수 CSV 시나리오 동시 실행 프로세스 수 (기본: 1=순차). "
-                        "2 이상 지정 시 ProcessPoolExecutor로 N개 시나리오를 동시 동해석. "
-                        "CPU 코어 수 절반 권장. 예: --parallel-scenarios 4")
-    g.add_argument("--esl-skip-tol",  type=float, default=0.0,
-                   metavar="TOL",
-                   help="반복 ESL 재추출 스킵 임계값 (기본: 0.0=항상 재실행). "
-                        "이전 이터레이션 대비 Δh_rms < TOL 이면 동해석 생략하고 "
-                        "직전 ESL을 재사용. 예: --esl-skip-tol 0.05")
-    g.add_argument("--n-modes",       type=int, default=0,
-                   metavar="N",
-                   help="모달 중첩법 사용 모드 수 (기본: 0=직접 Newmark-β 적분). "
-                        "0 초과 시 모달 중첩법으로 동해석 수행—직접 적분 대비 "
-                        "수십~수백 배 빠름. 예: --n-modes 20")
-    g.add_argument("--jax-dynamic",   action="store_true", default=False,
-                   help="직접 Newmark-β를 JAX 가속 솔버로 실행 (기본: scipy)")
-    g.add_argument("--no-static",        action="store_true", default=False,
-                   help="정적 하중 케이스 전체 비활성 — 동적 ESL만 사용 (--dynamic-opts 병용 시)")
-
-    # 하중 케이스 가중치 + 하중 크기 (W LOAD_N 두 값 입력)
-    g = parser.add_argument_group(
-        "정적 하중 케이스 설정 (가중치 하중N, 예: --w-bending 1.0 -10)"
+    # [1] 입력 & 프리셋
+    g1 = parser.add_argument_group(
+        "입력 & 프리셋", 
+        description="초기 설정 위자드 프리셋 및 입력 파일 경로 등 일괄 설정 옵션입니다."
     )
-    g.add_argument("--w-bending",       type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="중앙 굽힘        가중치·하중 (기본: 1.0 -5)")
-    g.add_argument("--w-bending-xspan", type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="X스팬 굽힘       가중치·하중 (기본: 1.0 -5)")
-    g.add_argument("--w-bending-yspan", type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="Y스팬 굽힘       가중치·하중 (기본: 1.0 -5)")
-    g.add_argument("--w-twisting",      type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="대각 비틀림      가중치·하중 (기본: 1.0 -5)")
-    g.add_argument("--w-twisting-alt",  type=float, nargs=2, default=[1.0, -10.0],
-                   metavar=("W", "F_N"), help="반전 대각 비틀림 가중치·하중 (기본: 1.0 -5)")
-    g.add_argument("--w-lifting",       type=float, nargs=2, default=[1.0,  10.0],
-                   metavar=("W", "F_N"), help="4코너 리프팅     가중치·하중 (기본: 1.0 5)")
-    g.add_argument("--w-basic-weight",  type=float, default=1.0,
-                   metavar="SCALE",
-                   help="자중 기반 하중 스케일 (기본: 1.0). "
-                        "0 이외의 값: 자중(total_mass*9806 N)*SCALE 을 각 하중값으로 대체. "
-                        "0: 입력된 --w-xxx F_N 값을 그대로 사용.")
+    preset_choices = [f"[{k}] {v['label']}" for k, v in _WIZARD_PRESETS.items()]
+    g1.add_argument("--preset", type=str, choices=preset_choices, default=None,
+                    help="프리셋을 선택하면 지정된 옵션들이 일괄 적용됩니다. (기타 개별 옵션들을 덮어씁니다)")
+    g1.add_argument("--input-dir", type=str, default=None, widget='DirChooser',
+                    metavar="DIR",
+                    help="입력 디렉토리 경로. 해당 폴더의 topo_arg.txt를 기본 옵션으로 로드하고, "
+                         "하위 폴더 안의 첫 번째 .csv 파일을 --dynamic-opts에 자동 추가합니다.")
+    g1.add_argument("--pos-data", type=str, default=None, widget='FileChooser',
+                    metavar="CSV",
+                    help="[모드 B] 단독 동적 응답 해석 (최적화 미진행). "
+                         "CSV 위치 데이터 경로를 지정하면 Kabsch 전처리 → 과도 응답 해석 → 결과 시각화만 실행합니다.")
+    g1.add_argument("--wizard", action="store_true",
+                    help="대화형 설정 위자드 실행. 추천 설정 선택 후 추가 옵션 입력으로 즉시 최적화 시작.")
+    g1.add_argument("--show-help", action="store_true",
+                    help="전체 사용 설명(epilog 포함)을 출력하고 종료합니다.")
 
-    # 출력 및 시각화
-    g = parser.add_argument_group("출력 및 시각화")
-    g.add_argument("--export",    type=str,  default="industrial_bead.k", help="LS-DYNA .k 저장 경로")
-    g.add_argument("--no-gui",       action="store_true", help="모니터링 GUI 비활성화")
-    g.add_argument("--no-viz",       action="store_true", help="최종 3D 시각화 생략")
-    g.add_argument("--modal-modes",  type=int, default=20,
-                   help="모달 재해석 모드 수 (기본: 20). 모니터 GUI Modal Analysis 탭에 반영됨")
-    g.add_argument("--mesh-size", type=float, default=10.0, help="BC 탐색 기준 메시 크기 mm")
+    # [2] 형상 & 재료 물성
+    g2 = parser.add_argument_group(
+        "형상 & 재료", 
+        description="섀시의 기본 크기(mm), 메시 크기 및 재료의 기계적 물성을 정의합니다."
+    )
+    g2.add_argument("--tray-width",   type=float, default=TRAY_W,      help=f"섀시 폭 mm (기본: {TRAY_W})")
+    g2.add_argument("--tray-length",  type=float, default=TRAY_L,      help=f"섀시 길이 mm (기본: {TRAY_L})")
+    g2.add_argument("--tray-height",  type=float, default=TRAY_H,      help=f"섀시 높이 mm (기본: {TRAY_H})")
+    g2.add_argument("--mesh-xy",      type=float, default=MESH_XY,     help=f"XY면 메시 크기 mm (기본: {MESH_XY})")
+    g2.add_argument("--mesh-z",       type=float, default=MESH_Z,      help=f"Z방향 메시 크기 mm (기본: {MESH_Z})")
+    g2.add_argument("--draft-angle",  type=float, default=DRAFT_ANGLE, help=f"측면 드래프트 각도 deg (기본: {DRAFT_ANGLE})")
+    g2.add_argument("--mat-E",   type=float, default=MAT['E'],   help=f"탄성계수 MPa (기본: {MAT['E']})")
+    g2.add_argument("--mat-nu",  type=float, default=MAT['nu'],  help=f"포아송비 (기본: {MAT['nu']})")
+    g2.add_argument("--mat-rho", type=float, default=MAT['rho'], help=f"밀도 tonne/mm³ (기본: {MAT['rho']:.2e})")
+    g2.add_argument("--mat-t",   type=float, default=MAT['t'],   help=f"기본 판 두께 mm (기본: {MAT['t']})")
 
-    # 입력 디렉토리 (topo_arg.txt + 하위 폴더 CSV 자동 수집)
-    g = parser.add_argument_group("입력 디렉토리 (일괄 설정)")
-    g.add_argument("--input-dir", type=str, default=None,
-                   metavar="DIR",
-                   help="입력 디렉토리 경로. 해당 폴더의 topo_arg.txt를 기본 옵션으로 로드하고, "
-                        "하위 폴더(폴더명=loadcase 이름) 안의 첫 번째 .csv 파일을 "
-                        "--dynamic-opts 항목으로 자동 추가. 파일명은 무관.")
+    # [3] 최적화 & 비드 제약
+    g3 = parser.add_argument_group(
+        "최적화 & 제약", 
+        description="위상최적화 수렴 조건, 비드의 폭/높이 제한, 목적함수 가중치 및 설계 다양성 탐색 제약 조건입니다."
+    )
+    g3.add_argument("--iters",       type=int,   default=20,   help="최대 반복 횟수 (기본: 20)")
+    g3.add_argument("--bead-height", type=float, default=15.0, help="최대 비드 높이 mm (기본: 15.0)")
+    g3.add_argument("--min-width",      type=float, default=80.0, help="최소 비드 폭 mm, 최종 목표값 (기본: 80.0)")
+    g3.add_argument("--min-width-init", type=float, default=-1.0, help="필터 연속화 초기 최소 비드 폭 mm (기본: -1=고정, 값 지정 시 ramp 활성, min-width보다 크게)")
+    g3.add_argument("--min-width-ramp", type=int,   default=10,   help="min-width-init → min-width 감소 이터레이션 수 (기본: 10)")
+    g3.add_argument("--bead-area",   type=float, default=0.40, help="비드 점유 면적 비율 0~1 (기본: 0.40)")
+    g3.add_argument("--bead-bidirectional", action="store_true", default=False,
+                    help="양방향 비드 허용: x=0.5 기준 + 방향(outward)·- 방향(inward) 동시 최적화. "
+                         "--height-steps 1 → {-h_max, 0, +h_max} (3레벨). colorbar: coolwarm ±h_max.")
+    g3.add_argument("--bead-area-ramp", type=int, default=5,
+                    help="비드 면적 제약을 1.0→목표값까지 선형 감소시킬 이터레이션 수 (기본: 5). "
+                         "초반 이터에서 형상 자유도를 높여 위상 패턴 형성을 돕습니다.")
+    g3.add_argument("--tol",         type=float, default=1e-4,
+                    help="설계변수 수렴 허용오차 (기본: 1e-4). "
+                         "이터레이션 간 max|x_new - x_old| < tol 이면 수렴 처리. "
+                         "정체 감지(stagnation): 연속 5회 dx<tol*5 이어도 수렴. "
+                         "엄격: 1e-5 (오래 걸림) / 표준: 1e-4 / 느슨: 1e-3 (빠르게 종료)")
+    g3.add_argument("--normalize-obj",    type=float, default=1.0,
+                    help="목적함수 정규화 (기본 1.0)")
+    g3.add_argument("--obj-type",    choices=["sum", "max", "sum+max"], default="sum+max",
+                    help="목적함수 유형: sum=가중합(기본), max=softmax 최악케이스, sum+max=0.5·sum+0.5·softmax")
+    g3.add_argument("--obj-alpha",   type=float, default=10.0,
+                    help="softmax 온도 (--obj-type max/sum+max 시). (기본: 10.0)")
+    g3.add_argument("--freq-penalty", type=float, nargs=2, default=[0.0, 0.0],
+                    metavar="W F0_HZ", help="고유진동수 패널티: W·(max(0,F0-f1)/F0)².")
+    g3.add_argument("--n-designs",        type=int,   default=1,
+                    help="생성할 설계 수 (기본: 1). >1이면 수렴 후 반발 패널티로 다른 설계 탐색")
+    g3.add_argument("--diversity-weight",     type=float, default=0.3,
+                    help="반발 패널티 강도 λ (기본: 0.3). 클수록 이전 설계에서 멀리 떨어짐")
+    g3.add_argument("--diversity-sigma",      type=float, default=0.3, help="반발 범위 σ (기본: 0.3).")
+    g3.add_argument("--diversity-noise",      type=float, default=0.15, help="설계 재시작 시 노이즈 강도 (기본: 0.15)")
+    g3.add_argument("--diversity-start-iter", type=int, default=-1,
+                    dest="diversity_start_iter",
+                    help="지정 iter부터 반발 패널티 적용 (-1=수렴 후 재시작 방식, 기본: -1). "
+                         "예) --diversity-start-iter 20: iter 20에 현재 x를 기준으로 스냅샷 등록 후 패널티 ramp-in.")
+    sym_group = g3.add_mutually_exclusive_group()
+    sym_group.add_argument("--sym-x",          action="store_true", default=True,  help="좌우 대칭 활성화 (기본: 활성)")
+    sym_group.add_argument("--no-sym-x",       action="store_false", dest="sym_x", help="좌우 대칭 해제")
+    g3.add_argument("--bead-connect",   type=float, default=120.0,
+                    help="비드 자동 연결 최대 갭 mm. 0=비활성, >0=해당 갭 이하 단절 비드 연결 (기본: 120.0)")
+    g3.add_argument("--bead-connect-alg", type=str, default="closing",
+                    choices=["closing", "mst", "geodesic", "hybrid"], help="비드 연결 알고리즘 (기본: closing)")
+    g3.add_argument("--height-steps",   type=int,   default=1,    help="비드 높이 이산화 단계 수 (기본: 1=이진 {0,h_max}).")
+    g3.add_argument("--filter-type",    type=str,   default="linear", choices=["linear", "gaussian"],
+                    help="공간 필터 커널. linear=hat(기본), gaussian=부드러운 덩어리 유도")
+    g3.add_argument("--projection",     type=float, default=32.0,
+                    help="Heaviside projection beta 최대값. 0=비활성, >0=활성화 (기본: 0).")
+    g3.add_argument("--draw-dir", type=str, default="0,0,-1", help="비드 돌출 방향 (기본: 0,0,-1 = 아래).")
+    g3.add_argument("--exclude-rect", type=str, action='append', default=None,
+                    metavar="CX,CY,W,H", help="비드 배제 사각형 영역 (중심 X,Y + 가로W 세로H, mm).")
+    g3.add_argument("--exclude-poly", type=str, action='append', default=None,
+                    metavar="X1,Y1,X2,Y2,...", help="비드 배제 다각형 영역 (꼭짓점 XY 좌표 나열, mm).")
+
+    # [4] 하중 & 해석 조건
+    g4 = parser.add_argument_group(
+        "하중 & 동적해석", 
+        description="정적 굽힘/비틀림 하중 케이스와 동적 충격 가속도(CSV) 응답 해석 및 ESL 변환을 위한 파라미터입니다."
+    )
+    g4.add_argument("--w-bending",       type=float, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="중앙 굽힘        가중치·하중 (기본: 1.0 -10)")
+    g4.add_argument("--w-bending-xspan", type=float, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="X스팬 굽힘       가중치·하중 (기본: 1.0 -10)")
+    g4.add_argument("--w-bending-yspan", type=float, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="Y스팬 굽힘       가중치·하중 (기본: 1.0 -10)")
+    g4.add_argument("--w-twisting",      type=float, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="대각 비틀림      가중치·하중 (기본: 1.0 -10)")
+    g4.add_argument("--w-twisting-alt",  type=float, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="반전 대각 비틀림 가중치·하중 (기본: 1.0 -10)")
+    g4.add_argument("--w-lifting",       type=float, nargs=2, default=[1.0,  10.0],
+                    metavar="W F_N", help="4코너 리프팅     가중치·하중 (기본: 1.0 10)")
+    g4.add_argument("--w-basic-weight",  type=float, default=1.0,
+                    metavar="SCALE", help="자중 기반 하중 스케일 (기본: 1.0).")
+    g4.add_argument("--dynamic-opts", type=str, nargs='+', default=None,
+                    metavar="CSV[,T_START[,T_END]]",
+                    help="'CSV경로' / 'CSV경로,시작(s)' / 'CSV경로,시작(s),종료(s)' (모드 C/D)")
+    g4.add_argument("--add-inertia",  action="store_true",     help="관성 하중(-ma) 인가")
+    g4.add_argument("--n-top",        type=int, default=10,    help="추출 ESL 개수 (기본: 10)")
+    g4.add_argument("--n-windows",    type=int, default=30,    help="시간 이력 분할 수 (기본: 30)")
+    g4.add_argument("--n-save-esl",   type=int, default=30,    help="ESL 추출용 저장 스냅샷 수 (기본: 30).")
+    g4.add_argument("--use-global-z",    action="store_true",      help="글로벌 Z 궤적 직접 사용 (현재 미사용)")
+    g4.add_argument("--contact-threshold", type=float, default=24516.6,
+                    metavar="A", help="Kabsch fit 제외 임계 상대 Z가속도 [mm/s²] (기본: 24517≈2.5g).")
+    g4.add_argument("--w-dynamic",       type=float, nargs='+', default=[1.0],
+                    metavar="W", help="시간분할 ESL 스냅샷 가중치 (기본: 1.0). CSV별 복수 지정 가능.")
+    g4.add_argument("--w-peak",          type=float, default=0.0,  help="요소별 최대SE 피크 ESL 가중치 (기본: 0.0)")
+    g4.add_argument("--iterative-esl",   action="store_true", default=True, help="매 이터레이션 ESL 재추출 (기본: 활성)")
+    g4.add_argument("--no-iterative-esl", action="store_false", dest="iterative_esl", help="ESL 1회 추출 후 고정")
+    g4.add_argument("--parallel-scenarios", type=int, default=1, metavar="N", help="복수 CSV 시나리오 동시 실행 프로세스 수")
+    g4.add_argument("--esl-skip-tol",  type=float, default=0.0,
+                    metavar="TOL", help="반복 ESL 재추출 스킵 임계값 (기본: 0.0)")
+    g4.add_argument("--n-modes",       type=int, default=0,
+                    metavar="N", help="모달 중첩법 사용 모드 수 (기본: 0=직접 적분).")
+    g4.add_argument("--jax-dynamic",   action="store_true", default=False, help="직접 Newmark-β를 JAX 가속 솔버로 실행")
+    g4.add_argument("--no-static",        action="store_true", default=False, help="정적 하중 케이스 전체 비활성")
+    g4.add_argument("--t-start",   type=float, default=None, help="분석 시작 시점 s (기본: CSV 헤더)")
+    g4.add_argument("--t-end",     type=float, default=None, help="분석 종료 시점 s")
+    g4.add_argument("--dt",        type=float, default=0.005,  help="적분 시간 스텝 s (기본: None=CSV 간격 그대로).")
+    g4.add_argument("--zeta",      type=float, default=0.02,  help="Rayleigh 감쇠비 (기본: 0.02)")
+    g4.add_argument("--corner-r",  type=float, default=150.0, help="코너 탐색 반경 mm (fallback 전용)")
+    g4.add_argument("--n-workers", type=int, default=4, help="하중 케이스 병렬 해석 스레드 수 (기본: 4)")
+
+    # [5] 출력 & 시각화
+    g5 = parser.add_argument_group(
+        "출력 & 시각화", 
+        description="최적화된 비드 패턴의 LS-DYNA(.k) 포맷 내보내기 및 3D 시각화 관련 설정입니다."
+    )
+    g5.add_argument("--export",    type=str,  default="industrial_bead.k", widget='FileSaver', help="LS-DYNA .k 저장 경로")
+    g5.add_argument("--no-gui",       action="store_true", help="모니터링 GUI 비활성화")
+    g5.add_argument("--no-viz",       action="store_true", help="최종 3D 시각화 생략")
+    g5.add_argument("--modal-modes",  type=int, default=20, help="모달 재해석 모드 수 (기본: 20).")
+    g5.add_argument("--mesh-size", type=float, default=10.0, help="BC 탐색 기준 메시 크기 mm")
 
     args = parser.parse_args(_resolve_input_dir(parser))
+
+    if hasattr(args, 'preset') and args.preset:
+        preset_key = args.preset.split("]")[0].strip("[")
+        preset_args_str = _WIZARD_PRESETS[preset_key]["args"]
+        import shlex
+        preset_argv = shlex.split(preset_args_str)
+        final_argv = _resolve_input_dir(parser) + preset_argv
+        args = parser.parse_args(final_argv)
+        print(f"\n[INFO] 프리셋 '{preset_key}' 이 적용되었습니다. 적용 인자: {preset_args_str}\n")
+
+    if getattr(args, 'show_help', False):
+        print(parser.format_help())
+        return
+
+    if args.wizard or len(sys.argv) == 1:
+        _run_wizard(parser)
+        return
 
     if args.pos_data:
         PosDynamicPipeline(args).run()
@@ -2726,7 +2998,156 @@ def main():
         TopographyPipeline(args).run()
 
 
-if __name__ == "__main__": 
+# ────────────────────────────────────────────────────────────────────────────
+# 대화형 설정 위자드
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _wizard_input(prompt: str, default: str = "") -> str:
+    """입력 프롬프트. 빈 입력이면 default 반환."""
+    suffix = f" [{default}]" if default else ""
+    try:
+        val = input(f"{prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    return val if val else default
+
+
+def _run_wizard(parser):
+    """대화형 설정 위자드."""
+    SEP = "─" * 70
+
+    print()
+    print("=" * 70)
+    print("  WHT 토포그래피 최적화 — 설정 위자드")
+    print("=" * 70)
+    print()
+    print("추천 초기 설정을 선택하세요:")
+    print()
+    for key, preset in _WIZARD_PRESETS.items():
+        dyn_tag = "  [동적 CSV 필요]" if preset.get("requires_dynamic") else ""
+        print(f"  [{key}] {preset['label']}{dyn_tag}")
+        # 옵션 줄바꿈 표시
+        tokens = preset["args"].split()
+        line, parts = "       ", []
+        for tok in tokens:
+            if line and len(line) + len(tok) + 1 > 68:
+                parts.append(line)
+                line = "       " + tok
+            else:
+                line = (line + " " + tok).lstrip()
+                line = "       " + line.lstrip()
+        if line.strip():
+            parts.append(line)
+        print("\n".join(parts))
+        print()
+
+    print(SEP)
+
+    # 설정 선택
+    while True:
+        choice = _wizard_input("선택 (A~F)", "B").upper()
+        if choice in _WIZARD_PRESETS:
+            break
+        print(f"  '{choice}' 는 유효하지 않습니다. A~F 중 선택하세요.")
+
+    preset = _WIZARD_PRESETS[choice]
+    base_args = preset["args"]
+    requires_dynamic = preset.get("requires_dynamic", False)
+
+    print()
+    print(f"  선택: [{choice}] {preset['label']}")
+    print(SEP)
+
+    # 동적 하중 여부
+    dynamic_opts_args = ""
+    if not requires_dynamic:
+        use_dyn = _wizard_input("동적 하중(ESL)을 추가하시겠습니까? (y/n)", "n").lower()
+        requires_dynamic = use_dyn in ("y", "yes")
+
+    if requires_dynamic:
+        print()
+        print("동적 하중 입력 방식을 선택하세요:")
+        print("  [1] CSV 파일 직접 입력  (파일 경로 하나씩 입력)")
+        print("  [2] 디렉토리 지정       (하위 폴더 = 로드케이스명, 폴더내 첫 .csv 자동 수집)")
+        print()
+        dyn_mode = _wizard_input("선택 (1/2)", "1")
+
+        if dyn_mode == "2":
+            dyn_dir = _wizard_input("입력 디렉토리 경로 (예: D:/data/session_01)", "")
+            if dyn_dir:
+                dynamic_opts_args = f'--input-dir "{dyn_dir}"'
+                # input-dir 방식은 base_args와 병합해서 실행
+            else:
+                print("  디렉토리 미입력 → 정적 전용으로 실행합니다.")
+                requires_dynamic = False
+        else:
+            # CSV 직접 입력
+            csv_entries = []
+            print()
+            print("CSV 파일 경로와 시간 범위를 입력하세요.")
+            print("형식: 경로[,t_start[,t_end]]  예) drop.csv,1.6,3.0")
+            print("비워두고 Enter → 입력 종료")
+            idx = 1
+            while True:
+                entry = _wizard_input(f"  CSV {idx}", "").strip()
+                if not entry:
+                    break
+                csv_entries.append(entry)
+                idx += 1
+
+            if csv_entries:
+                dynamic_opts_args = "--dynamic-opts " + " ".join(
+                    f'"{e}"' for e in csv_entries
+                )
+                add_inertia = _wizard_input("관성 하중(--add-inertia) 적용? (y/n)", "y").lower()
+                if add_inertia in ("y", "yes"):
+                    # base_args 에 --add-inertia 없으면 추가
+                    if "--add-inertia" not in base_args:
+                        dynamic_opts_args += " --add-inertia"
+            else:
+                print("  CSV 미입력 → 정적 전용으로 실행합니다.")
+                requires_dynamic = False
+
+    print()
+    print(SEP)
+    extra = _wizard_input(
+        "추가 옵션 입력 (없으면 Enter)  예) --iters 50 --no-gui", ""
+    )
+    print(SEP)
+
+    # 최종 인자 조합
+    combined = base_args
+    if dynamic_opts_args:
+        combined = f"{combined} {dynamic_opts_args}"
+    if extra:
+        combined = f"{combined} {extra}"
+
+    import shlex
+    final_argv = shlex.split(combined)
+
+    print()
+    print("실행 명령:")
+    print(f"  python run_topo.py {combined}")
+    print()
+    confirm = _wizard_input("위 설정으로 실행하시겠습니까? (y/n)", "y").lower()
+    if confirm not in ("y", "yes"):
+        print("취소되었습니다.")
+        return
+
+    print()
+    # parser 재파싱 후 실행
+    args = parser.parse_args(final_argv)
+    if hasattr(args, "wizard"):
+        args.wizard = False  # 재귀 방지
+    if args.pos_data:
+        PosDynamicPipeline(args).run()
+    else:
+        TopographyPipeline(args).run()
+
+
+if __name__ == "__main__":
     multiprocessing.freeze_support()
     try:
         multiprocessing.set_start_method('spawn', force=True)

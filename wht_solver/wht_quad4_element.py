@@ -137,7 +137,7 @@ def _element_K_mitc4_plus_np(c1, c2, c3, c4, t, E, nu):
     K_loc = np.zeros((24, 24))
     K_drill = np.zeros((24, 24))
     gp = [-1.0/np.sqrt(3), 1.0/np.sqrt(3)]
-    Ktt = 1.0 * G * t
+    Ktt = 1.0e-5 * G * t
 
     for xi_g in gp:
         for eta_g in gp:
@@ -374,7 +374,7 @@ def _element_K_mitc4_plus_nb(c1, c2, c3, c4, t, E, nu):
     Ds = np.zeros((2, 2))
     Ds[0, 0] = c_s;  Ds[1, 1] = c_s
 
-    Ktt = G * t
+    Ktt = 1.0e-5 * G * t
 
     # ── 가우스 적분 (2×2) ──────────────────────────────────────────────────
     gp0 = -1.0 / 1.7320508075688772   # -1/sqrt(3)
@@ -503,8 +503,13 @@ def M_quad4_lumped(wht_model, ndof: int, sorted_nids, nid_to_idx) -> np.ndarray:
     M_diag = np.zeros(ndof)
     for eid, elem in wht_model.elements.items():
         if elem.type not in ("QUAD4", "QUAD"): continue
-        pid = elem.pid; prop = wht_model.properties.get(pid); mat = wht_model.materials.get(prop.mid) if prop else None
-        if not prop: continue
+        pid = getattr(elem, "pid", None)
+        if pid is None or pid == 0:
+            raise ValueError(f"QUAD 요소 {eid}에 유효한 pid 속성이 누락되었습니다. 모달 해석 시 0 질량 에러의 원인이 됩니다.")
+        prop = wht_model.properties.get(pid)
+        if not prop:
+            raise ValueError(f"QUAD 요소 {eid}의 pid={pid}에 해당하는 속성(Property)을 찾을 수 없습니다.")
+        mat = wht_model.materials.get(prop.mid)
         t = prop.t; rho = mat.rho if mat else 7.85e-9
 
         p = [np.array([wht_model.nodes[nid].x, wht_model.nodes[nid].y, wht_model.nodes[nid].z]) for nid in elem.node_ids]
@@ -513,8 +518,8 @@ def M_quad4_lumped(wht_model, ndof: int, sorted_nids, nid_to_idx) -> np.ndarray:
         area = a1 + a2
 
         m_node = (area * t * rho) / 4.0
-        L_char = np.sqrt(area)
-        rot_inert = max(m_node * (L_char**2) / 12.0, 1e-8)
+        # 회전 관성에 1e-8 하한값을 고정으로 주면 고밀도 메쉬에서 회전 관성이 과대계상되어 벤딩 모드 형상을 심각하게 왜곡함.
+        rot_inert = m_node * (t**2 + area) / 12.0
         for nid in elem.node_ids:
             base = nid_to_idx[nid] * 6
             M_diag[base:base+3] += m_node

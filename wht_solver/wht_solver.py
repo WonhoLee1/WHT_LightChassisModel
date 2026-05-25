@@ -461,12 +461,11 @@ class WHTSolver:
             k_diag = K_out.diagonal()
             k_max = np.abs(k_diag).max()
             if k_max > 0:
-                # [WHT] Robust AUTOSPC: Higher threshold for shell stability (especially for thin plates)
                 threshold = max(k_max * 1e-8, 1e-3)
                 bad_dofs = (np.abs(k_diag) <= threshold)
                 if np.any(bad_dofs):
-                    # Add stronger spring stiffness to floating DOFs ONLY
-                    penalty_val = k_max * 1e-4
+                    # Add weaker spring stiffness to preserve rigid body modes
+                    penalty_val = k_max * 1e-12
                     K_out = K_out + diags([bad_dofs.astype(float) * penalty_val], [0])
         # [WHT] RBE3 Penalty Stiffness (Weighted Interpolation)
         # For partitioning solvers (JAX/Dynamic), RBE3 must be handled as penalty springs.

@@ -145,7 +145,7 @@ def _element_K_tria3_jax(c1, c2, c3, t, E, nu):
     K_loc = K_loc + Kbb - Kbi @ jnp.linalg.pinv(Kii) @ Kib
 
     # ── Drilling stabilization ──────────────────────────────────────────────
-    Ktt = 1.0e-2 * G * t
+    Ktt = 1.0e-5 * G * t
     Bd = jnp.zeros((1, 18))
     for i in range(3):
         Bd = Bd.at[0, 6*i  ].set(-0.5 * dN_dy[i])
