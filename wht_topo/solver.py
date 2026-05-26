@@ -1578,7 +1578,14 @@ class WHTopographySolver:
 
             # ── 고유진동수 해석 (--modal-modes로 모드 수 제어) ──
             try:
+                # [WHT] SPC 없이 완전 Free-Free 상태의 주파수를 구하기 위해 spc_conditions를 일시적으로 격리
+                orig_spcs = list(fea_solver.model.spc_conditions)
+                fea_solver.model.spc_conditions = []
+                
                 modal_results = fea_solver.solve_modal(num_modes=self.modal_modes, exclude_rigid_body=False)
+                
+                # [WHT] 모달 해석 이후 SPC 원상 복구
+                fea_solver.model.spc_conditions = orig_spcs
                 freqs = modal_results.frequencies  # Hz
                 
                 # 모드 해석 결과 터미널 출력 (주파수 및 질량 기여도)

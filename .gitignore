@@ -1,1 +1,29 @@
-__pycache__/\r\n*.pyc\r\n.venv/\r\n.idea/\r\n.vscode/
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+
+# Ignore results directories
+results/
+**/results/
+result/
+**/result/
+
+# Ignore Numba cache files
+*.nbc
+*.nbi
+
+# Ignore backups and logs
+*.bak
+*.bak_*
+*.py.bak
+wht_solver/wht_solver.py.bak_rbe3
+wht_modeler/wht_mesh_model.py.bak
+wht_topo/run_topo.py.bak
+test_jaxSSO/exam4_dynamic.py.bak
+
+# Ignore local temporary/run files
+lspost.cfile
+lspost.msg
+output.txt

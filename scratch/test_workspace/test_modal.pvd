@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">
+	<Collection>
+		<DataSet file="test_modal.1.vtu" timestep="0.0"/>
+		<DataSet file="test_modal.2.vtu" timestep="0.0"/>
+		<DataSet file="test_modal.3.vtu" timestep="0.00151681"/>
+		<DataSet file="test_modal.4.vtu" timestep="0.00239022"/>
+		<DataSet file="test_modal.5.vtu" timestep="0.00365564"/>
+	</Collection>
+</VTKFile>

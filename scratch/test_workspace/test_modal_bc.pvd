@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">
+	<Collection>
+		<DataSet file="test_modal_bc.01.vtu" timestep="0.0"/>
+		<DataSet file="test_modal_bc.02.vtu" timestep="0.0"/>
+		<DataSet file="test_modal_bc.03.vtu" timestep="0.0"/>
+		<DataSet file="test_modal_bc.04.vtu" timestep="0.00151681"/>
+		<DataSet file="test_modal_bc.05.vtu" timestep="0.00239022"/>
+		<DataSet file="test_modal_bc.06.vtu" timestep="0.00365564"/>
+		<DataSet file="test_modal_bc.07.vtu" timestep="66.4152701"/>
+		<DataSet file="test_modal_bc.08.vtu" timestep="121.0823816"/>
+		<DataSet file="test_modal_bc.09.vtu" timestep="1531.841635"/>
+		<DataSet file="test_modal_bc.10.vtu" timestep="5315.377282"/>
+	</Collection>
+</VTKFile>
