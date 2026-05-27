@@ -85,16 +85,16 @@ class TestVTKHDFExporter:
         data = make_data(T=3)
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "out.hdf")
-            VTKHDFExporter().export(data, path)
+            VTKHDFExporter(transient_geometry=False).export(data, path)
             assert os.path.exists(path)
 
-    def test_hdf5_schema(self):
+    def test_hdf5_schema_static(self):
         import h5py
         data = make_data(T=3, N=4, M=2)
         T, N, M = data.n_timesteps, data.n_nodes, data.n_cells
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "out.hdf")
-            VTKHDFExporter().export(data, path)
+            VTKHDFExporter(transient_geometry=False).export(data, path)
             with h5py.File(path, "r") as f:
                 grp = f["VTKHDF"]
                 # Static geometry
@@ -102,9 +102,13 @@ class TestVTKHDFExporter:
                 assert grp["Connectivity"].shape == (len(data.connectivity),)
                 assert grp["Offsets"].shape      == (M + 1,)
                 assert grp["Types"].shape        == (M,)
+                assert grp["NumberOfPoints"].shape          == (1,)
+                assert grp["NumberOfCells"].shape           == (1,)
+                assert grp["NumberOfConnectivityIds"].shape == (1,)
                 # Steps
                 assert grp["Steps/Values"].shape == (T,)
                 assert grp["Steps"].attrs["NSteps"] == T
+                assert "PointOffsets" not in grp["Steps"] # Omitted for static geometry
                 # PointData
                 assert "Displacement" in grp["PointData"]
                 assert grp["PointData/Displacement"].shape == (T * N, 3)
@@ -112,13 +116,40 @@ class TestVTKHDFExporter:
                 assert "Stress" in grp["CellData"]
                 assert grp["CellData/Stress"].shape == (T * M, 6)
 
+    def test_hdf5_schema_transient(self):
+        import h5py
+        data = make_data(T=3, N=4, M=2)
+        T, N, M = data.n_timesteps, data.n_nodes, data.n_cells
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "out_transient.hdf")
+            VTKHDFExporter(transient_geometry=True).export(data, path)
+            with h5py.File(path, "r") as f:
+                grp = f["VTKHDF"]
+                # Transient geometry with Static Topology Optimization
+                assert grp["Points"].shape       == (T * N, 3)
+                assert grp["Connectivity"].shape == (len(data.connectivity),)
+                assert grp["Offsets"].shape      == (M + 1,)
+                assert grp["Types"].shape        == (M,)
+                assert grp["NumberOfPoints"].shape          == (T,)
+                assert grp["NumberOfCells"].shape           == (T,)
+                assert grp["NumberOfConnectivityIds"].shape == (T,)
+                # Steps
+                assert grp["Steps/Values"].shape == (T,)
+                assert grp["Steps"].attrs["NSteps"] == T
+                assert grp["Steps/PointOffsets"].shape == (T,)
+                assert grp["Steps/CellOffsets"].shape  == (T,)
+                assert grp["Steps/ConnectivityIdOffsets"].shape == (T,)
+                # PointData
+                assert "Displacement" in grp["PointData"]
+                assert grp["PointData/Displacement"].shape == (T * N, 3)
+
     def test_values_roundtrip(self):
         import h5py
         data = make_data(T=2, N=4, M=2)
         disp_original = data.point_data["Displacement"]
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "out.hdf")
-            VTKHDFExporter().export(data, path)
+            VTKHDFExporter(transient_geometry=False).export(data, path)
             with h5py.File(path, "r") as f:
                 disp_read = f["VTKHDF/PointData/Displacement"][:]
                 # (T*N, 3) → (T, N, 3)
@@ -133,7 +164,7 @@ class TestVTKHDFExporter:
         data = make_data(T=2)
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "out_nocomp.hdf")
-            VTKHDFExporter(compression=None).export(data, path)
+            VTKHDFExporter(compression=None, transient_geometry=False).export(data, path)
             assert os.path.exists(path)
 
     def test_output_dir_created(self):
@@ -141,7 +172,7 @@ class TestVTKHDFExporter:
         data = make_data(T=1)
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "subdir", "out.hdf")
-            VTKHDFExporter().export(data, path)
+            VTKHDFExporter(transient_geometry=False).export(data, path)
             assert os.path.exists(path)
 
 

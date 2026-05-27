@@ -150,6 +150,18 @@ class _ReAnalysisWorker(QThread):
                 })
                 return
 
+            # ── 동해석 (과도응답) ─────────────────────────────────────────
+            if self.case_name.startswith("Dynamic: "):
+                scen_name = self.case_name[len("Dynamic: "):]
+                scenarios = init.get("dynamic_scenarios", [])
+                scen = next((s for s in scenarios if s["name"] == scen_name), None)
+                if scen is None:
+                    self.error.emit(f"동적 시나리오 '{scen_name}' 를 init.pkl 에서 찾을 수 없습니다.")
+                    return
+                self.progress.emit(f"동해석 준비 중: {scen_name} ...")
+                self._run_dynamic_analysis(model, scen)
+                return
+
             # ── 정적 해석 ──────────────────────────────────────────────────
             # 하중 케이스 탐색: iter 스냅샷 우선, 없으면 init 의 static_load_cases
             lc_obj = None
@@ -182,6 +194,80 @@ class _ReAnalysisWorker(QThread):
         except Exception:
             self.error.emit(traceback.format_exc())
 
+    def _run_dynamic_analysis(self, model, scen: dict) -> None:
+        """동적 과도응답 해석 실행 후 finished 시그널 발신."""
+        try:
+            import sys, os
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from wht_topo.run_topo import _load_csv, ZETA
+            from wht_solver.wht_dynamic_solver import WHTDynamicSolver
+            from wht_solver.wht_dynamic_common import DampingSpec
+
+            csv_path = scen["csv_path"]
+            t_start  = scen.get("t_start")
+            t_end    = scen.get("t_end")
+            n_modes  = int(scen.get("n_modes", 0))
+            zeta     = float(scen.get("zeta", 0.02))
+
+            self.progress.emit(f"CSV 로드 중: {Path(csv_path).name} ...")
+            df, time_arr, header = _load_csv(csv_path, t_start, t_end)
+            dt = float(time_arr[1] - time_arr[0]) if len(time_arr) > 1 else 1e-4
+            T  = float(time_arr[-1])
+
+            # 코너 노드 탐색 + 하중 그룹 생성 (ESLExtractor.prepare() 로직 재사용)
+            self.progress.emit("코너 노드 탐색 및 하중 그룹 생성 중...")
+            node_db = {nid: (nd.x, nd.y, nd.z)
+                       for nid, nd in model.nodes.items()}
+
+            from wht_topo.run_topo import (
+                ESLExtractor, _build_tray,
+                find_corner_nodes, find_nodes_for_corners,
+                CORNER_NAMES, TRAY_W, TRAY_L,
+                _apply_inertia_loads, parse_csv_header,
+            )
+            ext = ESLExtractor(
+                model        = model,
+                node_db      = node_db,
+                csv_path     = csv_path,
+                t_start      = t_start,
+                t_end        = t_end,
+                add_inertia  = bool(scen.get("add_inertia", True)),
+                use_global_z = bool(scen.get("use_global_z", False)),
+                n_modes      = n_modes,
+                modal_modes  = self.num_modal_modes,
+            )
+            ext.prepare()  # 코너 노드 탐색 + 하중 그룹 빌드
+
+            dyn_solver = WHTDynamicSolver(model)
+            damping    = DampingSpec(mode="zeta", zeta=zeta)
+
+            if n_modes > 0:
+                self.progress.emit(
+                    f"모달 중첩법 동해석 실행 중 (modes={n_modes}, T={T:.3f}s)...")
+                dyn_result = dyn_solver.solve_modal_dynamic(
+                    ext._load_groups, dt=dt, T=T,
+                    n_modes=n_modes, damping=damping,
+                )
+            else:
+                self.progress.emit(
+                    f"직접 Newmark-β 동해석 실행 중 (T={T:.3f}s, dt={dt:.2e}s)...")
+                dyn_result = dyn_solver.solve_direct_dynamic(
+                    ext._load_groups, dt=dt, T=T,
+                    damping=damping,
+                    label=scen["name"],
+                    modal_modes=self.num_modal_modes,
+                )
+
+            self.finished.emit({
+                "type":      "dynamic",
+                "lc_name":   self.case_name,
+                "result":    dyn_result,
+                "model":     model,
+                "scen_name": scen["name"],
+            })
+
+        except Exception:
+            self.error.emit(traceback.format_exc())
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -487,6 +573,32 @@ class _CalculixReAnalysisWorker(QThread):
             import traceback
             self.error.emit(traceback.format_exc())
 
+    def _print_calculix_dat_summary(self, dat_path):
+        try:
+            if not dat_path.exists():
+                return
+            print(f"\n--- CalculiX Modal Summary ({dat_path.name}) ---", flush=True)
+            with open(dat_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            
+            in_eigen = False
+            empty_count = 0
+            for line in lines:
+                if "E I G E N V A L U E" in line:
+                    in_eigen = True
+                
+                if in_eigen:
+                    print(line.rstrip(), flush=True)
+                    if not line.strip():
+                        empty_count += 1
+                    else:
+                        empty_count = 0
+                    
+                    if empty_count > 2 or "TOTAL TIME" in line:
+                        break
+        except Exception:
+            pass
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # OptiStruct .fem 내보내기
@@ -704,6 +816,74 @@ class WHTMonitorWindow(QMainWindow):
 
         self._init_ui()
         self._setup_shortcuts()
+        self._restore_history()
+
+    def _restore_history(self):
+        """재시작 시 기존 이터레이션 pkl 파일들을 읽어들여 그래프 히스토리를 자동 복원합니다."""
+        import glob
+        import pickle
+        import os
+
+        if not self.results_dir: return
+        snap_dir = Path(self.results_dir) / "snapshots"
+        if not snap_dir.exists(): return
+
+        self.snap_dir = str(snap_dir)
+        try:
+            self._register_dynamic_scenarios(self.snap_dir)
+        except Exception:
+            pass
+
+        # init.pkl 읽기 (mesh_edge_segs 복원)
+        init_file = snap_dir / "init.pkl"
+        if init_file.exists():
+            try:
+                with open(init_file, "rb") as f:
+                    init_data = pickle.load(f)
+                if "mesh_edge_segs" in init_data:
+                    self.mesh_edge_segs = init_data["mesh_edge_segs"]
+            except Exception as e:
+                print(f"[Monitor] init.pkl 로드 실패: {e}")
+
+        # iter_XXX.pkl 읽어서 히스토리 재구성 (주요 지표 추출)
+        iter_files = sorted(glob.glob(os.path.join(str(snap_dir), "iter_*.pkl")))
+        for pkl_path in iter_files:
+            try:
+                iter_str = Path(pkl_path).stem.split('_')[-1]
+                if not iter_str.isdigit(): continue
+                iter_num = int(iter_str)
+                
+                with open(pkl_path, "rb") as f:
+                    snap = pickle.load(f)
+
+                if iter_num not in self.history["iter"]:
+                    self.history["iter"].append(iter_num)
+                    # 파일에 저장된 지표들이 있으면 불러오고 없으면 0.0으로 초기화
+                    self.history["compliance"].append(snap.get("compliance", 0.0))
+                    self.history["avg_h"].append(snap.get("avg_h", 0.0))
+                    self.history["max_h"].append(snap.get("max_h", 0.0))
+                    self.history["dx"].append(snap.get("dx", 0.0))
+                    self.history["area_ratio"].append(snap.get("area_ratio", 0.0))
+                    self.history["min_width"].append(snap.get("min_width", 0.0))
+                    
+                    if "frequencies" in snap:
+                        self.history["frequencies"].append(snap["frequencies"])
+                    else:
+                        self.history["frequencies"].append([])
+                        
+                    if "load_cases" in snap:
+                        cases_dict = {lc.name: {"compliance": 0.0} for lc, w in snap["load_cases"]}
+                        self.history["cases"][iter_num] = cases_dict
+                    
+                    # 3D 뷰용 높이/좌표 스냅샷 복원
+                    self.height_snapshots.append({
+                        "iter": iter_num,
+                        "coords": snap.get("coords", []),
+                        "heights": snap.get("h_elem", [])
+                    })
+            except Exception as e:
+                print(f"[Monitor] {pkl_path} 로드 실패: {e}")
+
 
     # ────────────────────────────────────────────────────────────────────────
     # UI 구성
@@ -878,6 +1058,12 @@ class WHTMonitorWindow(QMainWindow):
         self.iter_export_btn.clicked.connect(self._on_export_optistruct)
         ctrl_action.addWidget(self.iter_export_btn)
 
+        ctrl_action.addWidget(QLabel("  뷰어:"))
+        self.viewer_combo = QComboBox()
+        self.viewer_combo.addItems(["WHTVisualizer", "ParaView"])
+        self.viewer_combo.setToolTip("해석 결과 표시 방식 선택\nWHTVisualizer: PyVista 내장 뷰어\nParaView: VTKHDF 내보내기 후 ParaView 실행")
+        ctrl_action.addWidget(self.viewer_combo)
+
         ctrl_action.addStretch()
         lay.addWidget(ctrl_widget)
 
@@ -1047,9 +1233,10 @@ class WHTMonitorWindow(QMainWindow):
         try:
             it = data["iter"]
 
-            # snap_dir 수신
-            if data.get("snap_dir"):
+            # snap_dir 수신 (최초 1회만 동적 시나리오 콤보 등록)
+            if data.get("snap_dir") and not self.snap_dir:
                 self.snap_dir = data["snap_dir"]
+                self._register_dynamic_scenarios(self.snap_dir)
 
             # ── 메시 엣지 수신 (최초 1회) ────────────────────────────────
             if "mesh_edge_segs" in data and self.mesh_edge_segs is None:
@@ -1209,6 +1396,26 @@ class WHTMonitorWindow(QMainWindow):
     # ────────────────────────────────────────────────────────────────────────
     # _clear_history
     # ────────────────────────────────────────────────────────────────────────
+
+    def _register_dynamic_scenarios(self, snap_dir: str) -> None:
+        """init.pkl 의 dynamic_scenarios 를 Load Case 콤보박스에 등록."""
+        if not self.iter_case_combo:
+            return
+        try:
+            init_path = Path(snap_dir) / "init.pkl"
+            if not init_path.exists():
+                return
+            with open(init_path, "rb") as f:
+                init = pickle.load(f)
+            scenarios = init.get("dynamic_scenarios", [])
+            existing = [self.iter_case_combo.itemText(i)
+                        for i in range(self.iter_case_combo.count())]
+            for scen in scenarios:
+                label = f"Dynamic: {scen['name']}"
+                if label not in existing:
+                    self.iter_case_combo.addItem(label)
+        except Exception:
+            pass  # 로드 실패 시 무시
 
     def _clear_history(self):
         self.history = {
@@ -1477,14 +1684,32 @@ class WHTMonitorWindow(QMainWindow):
         return int(snap["iter"])
 
     def _open_visualizer(self, wht_result_data, title: str = "WHT Visualizer"):
-        """WHTResultData를 WHTVisualizer 창으로 표시합니다 (BackgroundPlotter — 비차단)."""
+        """WHTResultData를 선택된 뷰어로 표시합니다."""
+        use_paraview = (hasattr(self, 'viewer_combo') and
+                        self.viewer_combo.currentText() == "ParaView")
         try:
-            from wht_visualizer.wht_visualizer import WHTVisualizer
-            vis = WHTVisualizer(title=title, show=True)
-            vis.show_result(wht_result_data)
-            self._vis_window = vis   # GC 방지
+            if use_paraview:
+                self._open_paraview(wht_result_data, title)
+            else:
+                from wht_visualizer.wht_visualizer import WHTVisualizer
+                vis = WHTVisualizer(title=title, show=True)
+                vis.show_result(wht_result_data)
+                self._vis_window = vis   # GC 방지
         except Exception:
             self._set_iter_status(f"Visualizer 실행 오류: {traceback.format_exc()[:120]}", "red")
+
+    def _open_paraview(self, wht_result_data, title: str = "result"):
+        """WHTResultData를 VTKHDF로 내보내고 ParaView를 실행합니다."""
+        import tempfile, re
+        from wht_converter.wht_exporters import VTKHDFExporter
+        from wht_visualizer.wht_visualizer import launch_paraview
+
+        safe = re.sub(r'[^\w\-]', '_', title)[:48]
+        tmp_dir = Path(tempfile.mkdtemp(prefix="wht_pv_"))
+        hdf_path = str(tmp_dir / f"{safe}.hdf")
+        VTKHDFExporter().export(wht_result_data, hdf_path)
+        self._set_iter_status(f"ParaView HDF: {hdf_path}", "#2a7a2a")
+        launch_paraview(hdf_path)
 
     def _on_mesh_view_clicked(self):
         """선택 이터레이션 메시(변형 좌표)를 WHTVisualizer로 표시합니다."""
@@ -1648,6 +1873,28 @@ class WHTMonitorWindow(QMainWindow):
 
         try:
             from wht_converter.wht_models import WHTMetadata
+
+            if rtype == "dynamic":
+                dyn       = solver_result   # DynamicResult
+                scen_name = result.get("scen_name", "Dynamic")
+                peak_idx  = dyn.peak_time_index()
+                t_peak    = float(dyn.t_saved[peak_idx])
+                u_peak    = dyn.u[peak_idx]   # (N, 6)
+                u_max     = float(np.max(np.abs(u_peak[:, :3])))
+
+                meta = WHTMetadata(
+                    solver_name="WHT-Topo", solver_version="1.0",
+                    analysis_type="dynamic", coordinate_system="cartesian",
+                    unit_length="mm", unit_force="N",
+                )
+                rd = dyn.to_wht_result_data(meta, model)
+                t_str = f"t={t_peak:.4f}s"
+                self._set_iter_status(
+                    f"{scen_name}  피크({t_str})  Max|U|={u_max:.4f} mm", "#2a7a2a")
+                title = f"Dynamic peak: {scen_name} ({t_str})"
+                self._open_visualizer(rd, title)
+                return
+
             meta = WHTMetadata(
                 solver_name="WHT-Topo", solver_version="1.0",
                 analysis_type=rtype, coordinate_system="cartesian",

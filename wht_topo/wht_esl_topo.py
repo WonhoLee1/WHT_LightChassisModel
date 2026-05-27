@@ -260,6 +260,7 @@ class ESLTopoOptimizer:
                     dt=dt, T=T,
                     damping=damping,
                     n_save=n_save,
+                    modal_modes=getattr(self, 'modal_modes', 20),
                 )
             last_dyn = dyn_result
 

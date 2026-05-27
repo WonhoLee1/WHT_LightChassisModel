@@ -229,6 +229,7 @@ class WHTDynamicSolver(WHTSolver):
         verbose: bool = True,
         method: str = 'scipy',
         label: str = '',
+        modal_modes: int = 20,
     ) -> DynamicResult:
         """
         직접 Newmark-β 암시적 동해석 (전체 DOF).
@@ -321,11 +322,28 @@ class WHTDynamicSolver(WHTSolver):
         M_f  = M_diag[free_id]
         M_mat_f = diags([M_f], [0], format="csr")
 
+        # ── 3b. 모달 사전 해석 (Rayleigh 기준 주파수 + 기여도 출력) ─────────
+        K_struct_ff = K_struct[free_id, :][:, free_id].tocsr()
+        _pre_omegas = None
+        if verbose and modal_modes > 0:
+            _pre_omegas = self._print_modal_pre_report(
+                K_struct_ff, M_f, free_id, modal_modes, damping
+            )
+
         # ── 4. 감쇠 ────────────────────────────────────────────────────────
         # RBE2 beam stiffness를 C와 K_eff_fs 계산에서 모두 배제
         # → beam K가 등가 힘을 수만 배 증폭하는 오류 방지
-        K_struct_ff = K_struct[free_id, :][:, free_id].tocsr()
-        alpha, beta_r = self._rayleigh_coeffs(damping, K_struct_ff, M_f)
+        if _pre_omegas is not None and len(_pre_omegas) >= 2:
+            # 사전 해석에서 구한 주파수 재활용 → eigsh 재실행 방지
+            nonzero = _pre_omegas[_pre_omegas > 2 * np.pi * 0.5]
+            if len(nonzero) >= 2:
+                alpha, beta_r = damping_from_zeta(damping.zeta, float(nonzero[0]), float(nonzero[-1]))
+            elif len(nonzero) == 1:
+                alpha, beta_r = 0.0, 2.0 * damping.zeta / float(nonzero[0])
+            else:
+                alpha, beta_r = 0.0, 1e-4
+        else:
+            alpha, beta_r = self._rayleigh_coeffs(damping, K_struct_ff, M_f)
         C_ff = assemble_rayleigh_C(alpha, beta_r, M_f, K_struct_ff)  # shell K만 사용
         print(f"    - Rayleigh damping: alpha={alpha:.4e}  beta={beta_r:.4e}", flush=True)
 
@@ -1098,6 +1116,146 @@ class WHTDynamicSolver(WHTSolver):
                 if g < ndof:
                     f[g] += force_val
         return f
+
+    def _print_modal_pre_report(
+        self,
+        K_struct_ff,
+        M_f: np.ndarray,
+        free_id: np.ndarray,
+        n_modes: int,
+        damping: DampingSpec,
+    ) -> np.ndarray:
+        """직접 동해석 전 모달 사전 해석 리포트 출력.
+
+        Returns
+        -------
+        omegas : ndarray  강체모드 제외 후 정렬된 ω [rad/s]
+        """
+        from scipy.sparse import diags as sp_diags
+        from scipy.sparse.linalg import eigsh
+
+        W = 62  # 출력 폭
+        print(f"\n {'─'*W}", flush=True)
+        print(f"  Modal Pre-Analysis  (n={n_modes})", flush=True)
+
+        k_actual = min(n_modes, M_f.size - 2)
+
+        # eigsh용 질량 행렬: 병진 DOF만 실제 질량 사용, 회전 DOF는 병진 최소값으로 억제.
+        # 이유: 회전 관성(m_node * area/12)이 병진 질량보다 크면 eigsh가 순수 회전 모드를
+        #       최저 고유치로 먼저 찾아 병진 참여계수가 0이 되는 문제 방지.
+        _dof_dirs_local = free_id % 6
+        _rot_mask = _dof_dirs_local >= 3
+        _trans_vals = M_f[~_rot_mask]
+        _M_f_eigsh = M_f.copy()
+        if len(_trans_vals) > 0:
+            _M_f_eigsh[_rot_mask] = _trans_vals.min() * 1e-4  # 회전 DOF 질량 억제
+        M_mat = sp_diags([_M_f_eigsh], [0], format="csc")
+
+        try:
+            vals, vecs = eigsh(
+                K_struct_ff.tocsc(), k=k_actual, M=M_mat,
+                which="LM", sigma=-1.0, tol=1e-4, maxiter=30000,
+            )
+        except Exception as e:
+            print(f"  [경고] eigsh 실패 ({e}) — 모달 리포트 생략", flush=True)
+            print(f" {'─'*W}", flush=True)
+            return np.array([])
+
+        # 정렬 및 강체모드(< 0.5 Hz) 필터
+        idx_sort = np.argsort(vals)
+        vals = np.maximum(vals[idx_sort], 0.0)
+        vecs = vecs[:, idx_sort]
+        omegas_all = np.sqrt(vals)
+        freqs_all  = omegas_all / (2.0 * np.pi)
+
+        elastic_mask = freqs_all > 0.5
+        n_rigid  = int(np.sum(~elastic_mask))
+        omegas   = omegas_all[elastic_mask]
+        freqs    = freqs_all[elastic_mask]
+        vecs_e   = vecs[:, elastic_mask]
+
+        if n_rigid:
+            print(f"  (강체 모드 {n_rigid}개 제외, 탄성 모드 {len(freqs)}개)", flush=True)
+
+        # ── 고유진동수 테이블 ────────────────────────────────────────────────
+        print(f"\n  {'Mode':>5}  {'Freq [Hz]':>10}  {'Period [s]':>10}  {'ω [rad/s]':>10}", flush=True)
+        print(f"  {'─'*5}  {'─'*10}  {'─'*10}  {'─'*10}", flush=True)
+        for r, (f, w) in enumerate(zip(freqs, omegas), 1):
+            period = 1.0 / f if f > 0 else float('inf')
+            print(f"  {r:>5}  {f:>10.4f}  {period:>10.5f}  {w:>10.4f}", flush=True)
+
+        if len(freqs) == 0:
+            print(f" {'─'*W}", flush=True)
+            return omegas
+
+        # ── 참여계수 + 유효질량 계산 ─────────────────────────────────────────
+        # 모드 질량 m_r = φ_r^T M φ_r
+        m_r = np.einsum('ir,i,ir->r', vecs_e, M_f, vecs_e)  # (n_e,)
+        m_r = np.maximum(m_r, 1e-30)
+
+        # 병진 DOF 방향별 강체운동 벡터 R_i[d] = 1 if d%6 == i else 0
+        dof_dirs = free_id % 6  # 각 자유 DOF의 방향 인덱스 (0~5)
+        dir_labels = ['Tx', 'Ty', 'Tz', 'Rx', 'Ry', 'Rz']
+        show_dirs  = [0, 1, 2]  # 병진 3방향만 표시
+
+        # L_r^i = φ_r^T M R_i  (참여계수 분자)
+        L = np.zeros((len(freqs), len(show_dirs)))
+        for j, di in enumerate(show_dirs):
+            R = (dof_dirs == di).astype(np.float64)  # (n_free,)
+            L[:, j] = np.einsum('ir,i,i->r', vecs_e, M_f, R)
+
+        # 정규화 참여계수 Γ = L / sqrt(m_r)
+        gamma = L / np.sqrt(m_r)[:, None]
+
+        # 유효질량 m_eff = L^2 / m_r
+        m_eff = L**2 / m_r[:, None]
+
+        # 총 질량 (방향별)
+        total_m = np.array([np.sum(M_f[dof_dirs == di]) for di in show_dirs])
+        total_m = np.maximum(total_m, 1e-30)
+
+        # 누적 유효질량 비율 [%]
+        cum_eff = np.cumsum(m_eff, axis=0) / total_m[None, :] * 100.0
+
+        # ── 참여계수 테이블 ──────────────────────────────────────────────────
+        hdr = ''.join(f"  {dir_labels[di]:>10}" for di in show_dirs)
+        print(f"\n  Participation Factor (Γ = φᵀMR / √(φᵀMφ))", flush=True)
+        print(f"  {'Mode':>5}{hdr}", flush=True)
+        print(f"  {'─'*5}" + "  " + "  ".join(['─'*10]*len(show_dirs)), flush=True)
+        for r in range(len(freqs)):
+            vals_str = ''.join(f"  {gamma[r, j]:>10.4e}" for j in range(len(show_dirs)))
+            print(f"  {r+1:>5}{vals_str}", flush=True)
+
+        # ── 유효질량 + 누적 비율 테이블 ─────────────────────────────────────
+        cols = ''.join(f"  {'m_'+dir_labels[di]:>10}  {'cum%':>6}" for di in show_dirs)
+        print(f"\n  Effective Modal Mass [tonne] & Cumulative Ratio [%]", flush=True)
+        print(f"  {'Mode':>5}{cols}", flush=True)
+        sep = "  " + "  ".join(['─'*10 + "  " + '─'*6] * len(show_dirs))
+        print(f"  {'─'*5}{sep}", flush=True)
+        for r in range(len(freqs)):
+            row = ''.join(
+                f"  {m_eff[r, j]:>10.3e}  {cum_eff[r, j]:>5.1f}%"
+                for j in range(len(show_dirs))
+            )
+            print(f"  {r+1:>5}{row}", flush=True)
+
+        total_str = ''.join(
+            f"  {total_m[j]:>10.3e}  {'100.0':>5}%"
+            for j in range(len(show_dirs))
+        )
+        print(f"  {'Total':>5}{total_str}", flush=True)
+
+        # ── Rayleigh 기준 주파수 안내 ────────────────────────────────────────
+        nonzero = omegas[omegas > 2 * np.pi * 0.5]
+        if len(nonzero) >= 2:
+            w1, wn = float(nonzero[0]), float(nonzero[-1])
+            a, b = damping_from_zeta(damping.zeta, w1, wn)
+            print(f"\n  Rayleigh:  ζ={damping.zeta:.4f}  "
+                  f"ω₁={w1:.2f}  ω_N={wn:.2f} [rad/s]"
+                  f"  →  α={a:.4e}  β={b:.4e}", flush=True)
+
+        print(f" {'─'*W}\n", flush=True)
+        return omegas
 
     def _rayleigh_coeffs(
         self,

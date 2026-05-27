@@ -542,8 +542,9 @@ class StochasticLoadManager:
         solver = WHTDynamicSolver(self.model)
         damping = DampingSpec(mode="zeta", zeta=0.02)
         dyn_res = solver.solve_direct_dynamic(
-            load_groups=load_groups, dt=dt, T=t_total, 
-            damping=damping, n_save=100, method=solver_method
+            load_groups=load_groups, dt=dt, T=t_total,
+            damping=damping, n_save=100, method=solver_method,
+            modal_modes=getattr(self, 'modal_modes', 20),
         )
         
         # 3. ESL 추출 (Method A)

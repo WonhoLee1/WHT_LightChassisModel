@@ -711,6 +711,7 @@ class ESLExtractor:
         dt: Optional[float] = None,
         use_jax: bool = False,
         contact_threshold: float = 24516.6,
+        modal_modes: int = 20,
     ):
         self.model             = model
         self.node_db           = node_db
@@ -730,6 +731,7 @@ class ESLExtractor:
         self.n_modes      = n_modes    # 0: 직접 Newmark-β, >0: 모달 중첩법
         self.dt           = dt         # None → CSV 샘플링 간격 그대로 사용
         self.use_jax      = use_jax    # True → JAX 직접 적분 (method='jax')
+        self.modal_modes  = modal_modes  # 직접 동해석 모달 사전 해석 모드 수
 
         # 단계별 출력
         self._df          : Optional[pd.DataFrame]     = None
@@ -984,6 +986,7 @@ class ESLExtractor:
                 damping=DampingSpec(mode="zeta", zeta=ZETA),
                 label=csv_name,
                 method='jax' if self.use_jax else 'scipy',
+                modal_modes=self.modal_modes,
             )
         _endsec()
 
@@ -1548,8 +1551,12 @@ class PosDynamicPipeline:
             self._load_groups, dt=self._dt_val, T=self._T_total,
             damping=DampingSpec(mode="zeta", zeta=self.cfg.zeta),
             n_save=100,
+            modal_modes=getattr(self.cfg, 'modal_modes', 20),
         )
         print(f"\n     {self.dyn_res.summary()}")
+
+        print("\n [5-1] 응력/변형률 필드 복원 (Nodal Stress Recovery)...")
+        self.dyn_res = solver.recover_stress_history(self.dyn_res)
 
     def _export(self) -> None:
         meta = WHTMetadata(
@@ -1558,25 +1565,52 @@ class PosDynamicPipeline:
             unit_length="mm", unit_force="N", unit_mass="tonne",
         )
         self.wht_data = self.dyn_res.to_wht_result_data(meta, self.model)
+        
+        if self._kabsch is not None and "Displacement" in self.wht_data.point_data:
+            print(" [5-2] Kabsch 강체 변환 적용하여 VTKHDF용 Displacement 전역 복원...")
+            u_fem = self.wht_data.point_data["Displacement"]
+            nodes = self.wht_data.nodes
+            T_len = u_fem.shape[0]
+            kabsch_time = self._kabsch.time_arr
+            
+            disp_global = np.zeros_like(u_fem)
+            for ti in range(T_len):
+                t_val = self.dyn_res.t_saved[ti]
+                if kabsch_time is not None:
+                    k_idx = int(np.searchsorted(kabsch_time, t_val, side='left').clip(0, len(kabsch_time) - 1))
+                else:
+                    k_idx = 0
+                
+                pts = self._kabsch.apply_rigid_body(nodes, u_fem[ti], k_idx, scale=1.0)
+                disp_global[ti] = pts - nodes
+                
+            self.wht_data.point_data["Displacement"] = disp_global
+
         paraview_dir = self.out_dir / "paraview"
         paraview_dir.mkdir(parents=True, exist_ok=True)
-        hdf_path = str(paraview_dir / "dynamic_result.hdf")
-        VTKHDFExporter().export(self.wht_data, hdf_path)
+        self.hdf_path = str(paraview_dir / "dynamic_result.hdf")
+        VTKHDFExporter().export(self.wht_data, self.hdf_path)
         _section("결과 파일 저장", "6")
-        _row("ParaView HDF", hdf_path)
+        _row("ParaView HDF", self.hdf_path)
         _endsec()
 
     def _visualize(self) -> None:
-        if self.cfg.no_viz:
+        viz_mode = getattr(self.cfg, 'viz_mode', 'wht')
+        if viz_mode == 'none' or getattr(self.cfg, 'no_viz', False):
             return
-        print(" [7] WHTVisualizer 실행...")
-        viz = WHTVisualizer(title="CSV Position Data - Dynamic Response")
-        viz.show_result(self.wht_data, group_name="DynamicTray",
-                        kabsch=self._kabsch)
-        viz.plotter.view_isometric()
-        viz.plotter.reset_camera()
-        if hasattr(viz.plotter, 'app'):
-            viz.plotter.app.exec_()
+        if viz_mode == 'paraview':
+            print(" [7] ParaView 실행...")
+            from wht_visualizer.wht_visualizer import launch_paraview
+            launch_paraview(self.hdf_path)
+        else:
+            print(" [7] WHTVisualizer 실행...")
+            viz = WHTVisualizer(title="CSV Position Data - Dynamic Response")
+            viz.show_result(self.wht_data, group_name="DynamicTray",
+                            kabsch=self._kabsch)
+            viz.plotter.view_isometric()
+            viz.plotter.reset_camera()
+            if hasattr(viz.plotter, 'app'):
+                viz.plotter.app.exec_()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1765,6 +1799,7 @@ class TopographyPipeline:
                 dt                 = getattr(self.cfg, 'dt', None),
                 use_jax            = getattr(self.cfg, 'jax_dynamic', False),
                 contact_threshold  = getattr(self.cfg, 'contact_threshold', 24516.6),
+                modal_modes        = getattr(self.cfg, 'modal_modes', 20),
             )
 
         def _run_esl(iteration: int):
@@ -1894,23 +1929,81 @@ class TopographyPipeline:
             self.solver.diversity_sigma      = getattr(self.cfg, 'diversity_sigma',  0.3)
             self.solver.diversity_start_iter = _div_start
 
+        # 동적 시나리오 정보 주입 (monitor UI 재해석용)
+        _dyn_opts = getattr(self.cfg, 'dynamic_opts', None)
+        if _dyn_opts:
+            def _parse_entry(s):
+                parts = s.split(',')
+                csv_p  = parts[0].strip()
+                t_s    = float(parts[1]) if len(parts) > 1 else None
+                t_e    = float(parts[2]) if len(parts) > 2 else None
+                return csv_p, t_s, t_e
+            for i, opt in enumerate(_dyn_opts):
+                csv_p, t_s, t_e = _parse_entry(opt)
+                name = Path(csv_p).parent.name or Path(csv_p).stem
+                self.solver.dynamic_scenarios.append({
+                    "name":         name,
+                    "csv_path":     str(csv_p),
+                    "t_start":      t_s,
+                    "t_end":        t_e,
+                    "add_inertia":  bool(getattr(self.cfg, 'add_inertia', True)),
+                    "use_global_z": bool(getattr(self.cfg, 'use_global_z', False)),
+                    "n_modes":      int(getattr(self.cfg, 'n_modes', 0)),
+                    "zeta":         float(getattr(self.cfg, 'zeta', 0.02)),
+                })
+
     def _run_optimizer(self) -> None:
         """최적화를 실행합니다. GUI 지정 시 모니터링 프로세스를 병렬로 시작합니다."""
-        ui_process = None
+        import threading, time
+
         callback   = None
         stop_event = None
+        _queue_holder   = [None]
+        _process_holder = [None]
+        _watchdog_running = threading.Event()
 
         if not self.cfg.no_gui:
             from wht_topo.monitor_ui import start_monitor_ui
-            queue      = multiprocessing.Queue()
+
             stop_event = multiprocessing.Event()
-            ui_process = multiprocessing.Process(
-                target=start_monitor_ui,
-                args=(queue, stop_event, str(self.out_dir)),
-                kwargs={"num_modal_modes": self.cfg.modal_modes},
-            )
-            ui_process.start()
-            callback = queue.put
+
+            # 큐는 단 한 번만 생성하여 재사용 (재시작 간극 시 데이터 유실 방지)
+            q = multiprocessing.Queue()
+            _queue_holder   = [q]      # [current_queue]
+            _process_holder = [None]   # [current_ui_process]
+
+            def _launch_monitor():
+                p  = multiprocessing.Process(
+                    target=start_monitor_ui,
+                    args=(q, stop_event, str(self.out_dir)),
+                    kwargs={"num_modal_modes": self.cfg.modal_modes},
+                    daemon=False,  # 메인 프로세스 종료 시 창이 유지되도록 설정
+                )
+                p.start()
+                _process_holder[0] = p
+                return p
+
+            def _monitor_watchdog():
+                """모니터 프로세스가 종료되면 자동 재시작."""
+                while _watchdog_running.is_set():
+                    time.sleep(3)
+                    p = _process_holder[0]
+                    if p is not None and not p.is_alive() and not stop_event.is_set():
+                        print("\n[Monitor] 모니터 프로세스 종료 감지 — 재시작 중...", flush=True)
+                        _launch_monitor()
+                        print("[Monitor] 모니터 재시작 완료.", flush=True)
+
+            _launch_monitor()
+            _watchdog_running.set()
+            threading.Thread(target=_monitor_watchdog, daemon=True).start()
+
+            def callback(data):
+                q = _queue_holder[0]
+                if q is not None:
+                    try:
+                        q.put_nowait(data)
+                    except Exception:
+                        pass  # 큐가 종료된 경우 무시
 
         n_designs    = getattr(self.cfg, 'n_designs', 1)
         noise        = getattr(self.cfg, 'diversity_noise', 0.15)
@@ -1937,8 +2030,11 @@ class TopographyPipeline:
                     # 모델 좌표 원점 복원 후 다음 설계 준비
                     self.solver._restore_heights()
         finally:
-            if ui_process and ui_process.is_alive():
-                queue.put("STOP")
+            _watchdog_running.clear()
+            p = _process_holder[0] if not self.cfg.no_gui else None
+            q = _queue_holder[0]   if not self.cfg.no_gui else None
+            if p and p.is_alive() and q:
+                q.put("STOP")
 
     def _discretize(self) -> None:
         """height_steps >= 1 인 경우 비드 높이를 이산 레벨로 양자화합니다.
@@ -1972,7 +2068,8 @@ class TopographyPipeline:
         print(f" [7] LS-DYNA .k 저장: {export_path}")
 
     def _visualize(self) -> None:
-        if self.cfg.no_viz:
+        viz_mode = getattr(self.cfg, 'viz_mode', 'wht')
+        if viz_mode == 'none' or getattr(self.cfg, 'no_viz', False):
             return
         print(" [8] 시각화...")
         bead_steps   = self.cfg.height_steps
@@ -1982,11 +2079,19 @@ class TopographyPipeline:
         result_data.point_data["Bead_Height"] = (
             (heights_full / (self.solver.h_max + 1e-12)).reshape(1, -1, 1)
         )
-        viz = WHTVisualizer(title="Industrial Topography Result")
-        viz.load_results(result_data)
-        # discrete bead_steps 정보를 visualizer에 전달 → scalar bar 이산화
-        viz.set_bead_discrete_levels(bead_steps if discrete else 0)
-        viz.show()
+        if viz_mode == 'paraview':
+            paraview_dir = self.out_dir / "paraview"
+            paraview_dir.mkdir(parents=True, exist_ok=True)
+            hdf_path = str(paraview_dir / "topo_result.hdf")
+            VTKHDFExporter().export(result_data, hdf_path)
+            print(f"     ParaView HDF: {hdf_path}")
+            from wht_visualizer.wht_visualizer import launch_paraview
+            launch_paraview(hdf_path)
+        else:
+            viz = WHTVisualizer(title="Industrial Topography Result")
+            viz.load_results(result_data)
+            viz.set_bead_discrete_levels(bead_steps if discrete else 0)
+            viz.show()
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
 
@@ -2256,6 +2361,23 @@ def _resolve_input_dir(parser) -> list:
             final_argv += ["--dynamic-opts"] + csv_entries
 
     return final_argv
+
+
+def _float_unquote(s):
+    """Gooey가 음수값에 붙이는 따옴표를 제거 후 float 변환."""
+    return float(str(s).strip('"\''))
+
+
+def _wfn_type(s):
+    """'W F_N' 형식 문자열 → [float, float]. nargs 없이 단일 TextField로 사용."""
+    if isinstance(s, list):
+        return [float(x) for x in s]
+    # "[1.0, -10.0]" 형식 (use_cmd_args 직렬화) 처리
+    cleaned = str(s).strip().lstrip('[').rstrip(']').replace(',', ' ').replace('"', '').replace("'", '')
+    parts = cleaned.split()
+    if len(parts) != 2:
+        raise ValueError(f"W F_N 형식 오류: '{s}' (예: 1.0 -10.0)")
+    return [float(parts[0]), float(parts[1])]
 
 
 _WIZARD_PRESETS = {
@@ -2824,7 +2946,12 @@ def main():
   final.k / design_dNN.k       — LS-DYNA 최적 비드 패턴 (다중 설계 시 번호별)
 
 --no-gui   모니터링 GUI 비활성 (헤드리스 서버)
---no-viz   최종 3D 시각화 생략
+--viz-mode wht|paraview|none
+           최종 결과 뷰어 선택.
+             wht      : WHTVisualizer (PyVista 내장 뷰어, 기본값)
+             paraview : VTKHDF 파일 저장 후 ParaView 자동 실행
+             none     : 시각화 생략
+--no-viz   시각화 생략 (--viz-mode none 과 동일, 이전 버전 호환)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 추천 초기 설정
@@ -2931,15 +3058,15 @@ def main():
     )
     g3.add_argument("--iters",       type=int,   default=20,   help="최대 반복 횟수 (기본: 20)")
     g3.add_argument("--bead-height", type=float, default=15.0, help="최대 비드 높이 mm (기본: 15.0)")
-    g3.add_argument("--min-width",      type=float, default=80.0, help="최소 비드 폭 mm, 최종 목표값 (기본: 80.0)")
-    g3.add_argument("--min-width-init", type=float, default=-1.0, help="필터 연속화 초기 최소 비드 폭 mm (기본: -1=고정, 값 지정 시 ramp 활성, min-width보다 크게)")
-    g3.add_argument("--min-width-ramp", type=int,   default=10,   help="min-width-init → min-width 감소 이터레이션 수 (기본: 10)")
-    g3.add_argument("--bead-area",   type=float, default=0.40, help="비드 점유 면적 비율 0~1 (기본: 0.40)")
+    g3.add_argument("--min-width",      type=float, default=60.0,  help="최소 비드 폭 mm, 최종 목표값 (기본: 60.0)")
+    g3.add_argument("--min-width-init", type=float, default=150.0, help="필터 연속화 초기 최소 비드 폭 mm (기본: 150.0, -1=고정)")
+    g3.add_argument("--min-width-ramp", type=int,   default=5,     help="min-width-init → min-width 감소 이터레이션 수 (기본: 5)")
+    g3.add_argument("--bead-area",   type=float, default=0.30, help="비드 점유 면적 비율 0~1 (기본: 0.30)")
     g3.add_argument("--bead-bidirectional", action="store_true", default=False,
                     help="양방향 비드 허용: x=0.5 기준 + 방향(outward)·- 방향(inward) 동시 최적화. "
                          "--height-steps 1 → {-h_max, 0, +h_max} (3레벨). colorbar: coolwarm ±h_max.")
-    g3.add_argument("--bead-area-ramp", type=int, default=5,
-                    help="비드 면적 제약을 1.0→목표값까지 선형 감소시킬 이터레이션 수 (기본: 5). "
+    g3.add_argument("--bead-area-ramp", type=int, default=4,
+                    help="비드 면적 제약을 1.0→목표값까지 선형 감소시킬 이터레이션 수 (기본: 4). "
                          "초반 이터에서 형상 자유도를 높여 위상 패턴 형성을 돕습니다.")
     g3.add_argument("--tol",         type=float, default=1e-4,
                     help="설계변수 수렴 허용오차 (기본: 1e-4). "
@@ -2967,11 +3094,11 @@ def main():
     sym_group = g3.add_mutually_exclusive_group()
     sym_group.add_argument("--sym-x",          action="store_true", default=True,  help="좌우 대칭 활성화 (기본: 활성)")
     sym_group.add_argument("--no-sym-x",       action="store_false", dest="sym_x", help="좌우 대칭 해제")
-    g3.add_argument("--bead-connect",   type=float, default=120.0,
-                    help="비드 자동 연결 최대 갭 mm. 0=비활성, >0=해당 갭 이하 단절 비드 연결 (기본: 120.0)")
-    g3.add_argument("--bead-connect-alg", type=str, default="closing",
-                    choices=["closing", "mst", "geodesic", "hybrid"], help="비드 연결 알고리즘 (기본: closing)")
-    g3.add_argument("--height-steps",   type=int,   default=1,    help="비드 높이 이산화 단계 수 (기본: 1=이진 {0,h_max}).")
+    g3.add_argument("--bead-connect",   type=float, default=100.0,
+                    help="비드 자동 연결 최대 갭 mm. 0=비활성, >0=해당 갭 이하 단절 비드 연결 (기본: 100.0)")
+    g3.add_argument("--bead-connect-alg", type=str, default="geodesic",
+                    choices=["closing", "mst", "geodesic", "hybrid"], help="비드 연결 알고리즘 (기본: geodesic)")
+    g3.add_argument("--height-steps",   type=int,   default=2,    help="비드 높이 이산화 단계 수 (기본: 2=3단계 {0,h_max/2,h_max}).")
     g3.add_argument("--filter-type",    type=str,   default="linear", choices=["linear", "gaussian"],
                     help="공간 필터 커널. linear=hat(기본), gaussian=부드러운 덩어리 유도")
     g3.add_argument("--projection",     type=float, default=32.0,
@@ -2987,18 +3114,18 @@ def main():
         "하중 & 동적해석", 
         description="정적 굽힘/비틀림 하중 케이스와 동적 충격 가속도(CSV) 응답 해석 및 ESL 변환을 위한 파라미터입니다."
     )
-    g4.add_argument("--w-bending",       type=float, nargs=2, default=[1.0, -10.0],
-                    metavar="W F_N", help="중앙 굽힘        가중치·하중 (기본: 1.0 -10)")
-    g4.add_argument("--w-bending-xspan", type=float, nargs=2, default=[1.0, -10.0],
-                    metavar="W F_N", help="X스팬 굽힘       가중치·하중 (기본: 1.0 -10)")
-    g4.add_argument("--w-bending-yspan", type=float, nargs=2, default=[1.0, -10.0],
-                    metavar="W F_N", help="Y스팬 굽힘       가중치·하중 (기본: 1.0 -10)")
-    g4.add_argument("--w-twisting",      type=float, nargs=2, default=[1.0, -10.0],
-                    metavar="W F_N", help="대각 비틀림      가중치·하중 (기본: 1.0 -10)")
-    g4.add_argument("--w-twisting-alt",  type=float, nargs=2, default=[1.0, -10.0],
-                    metavar="W F_N", help="반전 대각 비틀림 가중치·하중 (기본: 1.0 -10)")
-    g4.add_argument("--w-lifting",       type=float, nargs=2, default=[1.0,  10.0],
-                    metavar="W F_N", help="4코너 리프팅     가중치·하중 (기본: 1.0 10)")
+    g4.add_argument("--w-bending",       type=_float_unquote, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="중앙 굽힘        가중치·하중 (기본: 1.0 -10.0)")
+    g4.add_argument("--w-bending-xspan", type=_float_unquote, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="X스팬 굽힘       가중치·하중 (기본: 1.0 -10.0)")
+    g4.add_argument("--w-bending-yspan", type=_float_unquote, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="Y스팬 굽힘       가중치·하중 (기본: 1.0 -10.0)")
+    g4.add_argument("--w-twisting",      type=_float_unquote, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="대각 비틀림      가중치·하중 (기본: 1.0 -10.0)")
+    g4.add_argument("--w-twisting-alt",  type=_float_unquote, nargs=2, default=[1.0, -10.0],
+                    metavar="W F_N", help="반전 대각 비틀림 가중치·하중 (기본: 1.0 -10.0)")
+    g4.add_argument("--w-lifting",       type=_float_unquote, nargs=2, default=[1.0,  10.0],
+                    metavar="W F_N", help="4코너 리프팅     가중치·하중 (기본: 1.0 10.0)")
     g4.add_argument("--w-basic-weight",  type=float, default=1.0,
                     metavar="SCALE", help="자중 기반 하중 스케일 (기본: 1.0).")
     g4.add_argument("--dynamic-opts", type=str, nargs='+', default=None,
@@ -3038,7 +3165,11 @@ def main():
     )
     g5.add_argument("--export",    type=str,  default="industrial_bead.k", widget='FileSaver', help="LS-DYNA .k 저장 경로")
     g5.add_argument("--no-gui",       action="store_true", help="모니터링 GUI 비활성화")
-    g5.add_argument("--no-viz",       action="store_true", help="최종 3D 시각화 생략")
+    g5.add_argument("--viz-mode",     type=str, default="wht",
+                    choices=["wht", "paraview", "none"],
+                    widget="Dropdown",
+                    help="최종 결과 뷰어: wht=WHTVisualizer(PyVista), paraview=ParaView VTKHDF 자동 실행, none=생략")
+    g5.add_argument("--no-viz",       action="store_true", help="시각화 생략 (--viz-mode none 과 동일, 이전 버전 호환)")
     g5.add_argument("--modal-modes",  type=int, default=20, help="모달 재해석 모드 수 (기본: 20).")
     g5.add_argument("--mesh-size", type=float, default=10.0, help="BC 탐색 기준 메시 크기 mm")
 

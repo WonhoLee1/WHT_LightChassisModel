@@ -73,7 +73,7 @@ class WHTRangeDialog(QtWidgets.QDialog):
         grp_mode = QtWidgets.QGroupBox("Range Mode")
         h_mode = QtWidgets.QHBoxLayout(grp_mode)
         self.radio_static  = QtWidgets.QRadioButton("Static  (Fixed Min/Max)")
-        self.radio_dynamic = QtWidgets.QRadioButton("Dynamic  (Auto / Robust)")
+        self.radio_dynamic = QtWidgets.QRadioButton("Dynamic  (Auto)")
         h_mode.addWidget(self.radio_static)
         h_mode.addWidget(self.radio_dynamic)
         is_static = (self.vis.current_range_mode == "Static (Fixed)")
@@ -204,7 +204,7 @@ class WHTRangeDialog(QtWidgets.QDialog):
                 pass
             self.vis.current_range_mode = "Static (Fixed)"
         else:
-            self.vis.current_range_mode = "Robust (Auto)"
+            self.vis.current_range_mode = "Dynamic (Auto)"
         self.vis._apply_colorbar_range(show_stats=True)
         self.accept()
 
@@ -526,7 +526,7 @@ class WHTVisualizer:
         # Internal state for manual ranges (Replacing UI widgets in main panel)
         self.range_min = 0.0
         self.range_max = 1.0
-        self.current_range_mode = "Robust (Auto)"
+        self.current_range_mode = "Dynamic (Auto)"
         self.robust_pct = 98.0
         # 프레임 이동 누적 전체-프레임 min/max 캐시 {field_name: (min, max)}
         self._field_allframe_range: dict = {}
@@ -1268,6 +1268,21 @@ class WHTVisualizer:
                 "vertical": True
             }
         )
+        
+        # [WHT CRITICAL FIX] Ensure initial lookup table is correctly built and not inverted
+        if hasattr(actor, 'mapper') and hasattr(actor.mapper, 'lookup_table'):
+            lut = actor.mapper.lookup_table
+            cmap_name = self.combo_cmap.currentText()
+            if hasattr(lut, 'cmap'):
+                try:
+                    temp_cmap = 'coolwarm' if cmap_name != 'coolwarm' else 'jet'
+                    lut.cmap = temp_cmap
+                    lut.cmap = cmap_name
+                except Exception:
+                    lut.cmap = cmap_name
+            if hasattr(lut, 'Build'):
+                lut.Build()
+
         # 3. Apply Auto-Color logic
         qual_cmap = plt.get_cmap('Set3')
         part_idx = len(self.parts)
@@ -1484,7 +1499,8 @@ class WHTVisualizer:
             if r_min == r_max: r_max = r_min + 1e-6
             rng = [r_min, r_max]
             
-        # [Numerical Safety]
+        # [Numerical Safety] — rng을 항상 mutable list로 유지
+        rng = list(rng)
         if rng[0] > rng[1]: rng = [rng[1], rng[0]]
         if rng[0] == rng[1]: rng[1] = rng[0] + 1e-6
             
@@ -1962,7 +1978,7 @@ class WHTVisualizer:
         # [User Request] Ensure user feels the change: 
         # Trigger a range reset if switching categories to a meaningful new field
         if category != "Body Color":
-            self.current_range_mode = "Robust (Auto)"
+            self.current_range_mode = "Dynamic (Auto)"
             print(f" -> [Visualizer] Category changed to '{category}'. Auto-resetting range for visibility.")
             
         self._update_active_result()
@@ -1983,8 +1999,8 @@ class WHTVisualizer:
         """Shell Layer(두께 방향 적분점) 변경 시 결과를 갱신합니다."""
         cat = self.combo_category.currentText()
         if cat and ("Stress" in cat or "Strain" in cat):
-            # Robust 모드로 자동 전환하여 새 레이어 범위를 즉시 반영
-            self.current_range_mode = "Robust (Auto)"
+            # Dynamic 모드로 자동 전환하여 새 레이어 범위를 즉시 반영
+            self.current_range_mode = "Dynamic (Auto)"
             print(f" -> [Visualizer] Shell layer changed to '{layer_text}'.")
             self._update_active_result()
 
@@ -2164,10 +2180,21 @@ class WHTVisualizer:
                     actor.mapper.SetInputData(mesh)
                     
                     # [Fix] 스칼라가 처음 활성화될 때 PyVista 기본값 덮어쓰기로 인해 Colormap이 반전되는 현상 방지
+                    # [WHT CRITICAL FIX] PyVista의 cmap 캐싱 바이패스 및 룩업테이블 강제 동기화
                     if hasattr(actor.mapper, 'lookup_table'):
-                        actor.mapper.lookup_table.cmap = self.combo_cmap.currentText()
-                        if hasattr(actor.mapper.lookup_table, 'Build'):
-                            actor.mapper.lookup_table.Build()
+                        lut = actor.mapper.lookup_table
+                        cmap_name = self.combo_cmap.currentText()
+                        if hasattr(lut, 'cmap'):
+                            try:
+                                temp_cmap = 'coolwarm' if cmap_name != 'coolwarm' else 'jet'
+                                lut.cmap = temp_cmap
+                                lut.cmap = cmap_name
+                            except Exception:
+                                lut.cmap = cmap_name
+                        else:
+                            lut.cmap = cmap_name
+                        if hasattr(lut, 'Build'):
+                            lut.Build()
                     
         self._apply_colorbar_range(show_stats=True)
         print(f" -> [Visualizer] Switched result to: {name}")
@@ -2322,10 +2349,19 @@ class WHTVisualizer:
         for part in self.parts.values():
             actor = part.get("actor")
             if actor and hasattr(actor, "mapper") and hasattr(actor.mapper, "lookup_table"):
-                actor.mapper.lookup_table.cmap = cmap
-                # Force rebuild of the LookupTable to apply the new colormap immediately
-                if hasattr(actor.mapper.lookup_table, "Build"):
-                    actor.mapper.lookup_table.Build()
+                lut = actor.mapper.lookup_table
+                # [WHT CRITICAL FIX] PyVista의 cmap 캐싱 바이패스 및 강제 리빌드
+                if hasattr(lut, 'cmap'):
+                    try:
+                        temp_cmap = 'coolwarm' if cmap != 'coolwarm' else 'jet'
+                        lut.cmap = temp_cmap
+                        lut.cmap = cmap
+                    except Exception:
+                        lut.cmap = cmap
+                else:
+                    lut.cmap = cmap
+                if hasattr(lut, 'Build'):
+                    lut.Build()
         self.plotter.render()
 
     def _on_fps_changed(self, value):
@@ -2595,3 +2631,82 @@ def visualize(result_data, block=True):
     vis.show_result(result_data)
     vis.show(block=block)
     return vis
+
+
+def launch_paraview(file_path: str) -> bool:
+    """
+    [WHT Premium UX] Automatically locates and launches ParaView, loading the specified file (.hdf / .pvd / .vtu).
+    Runs as a decoupled, non-blocking background subprocess.
+    """
+    import subprocess
+    import shutil
+    import glob
+    from pathlib import Path
+
+    abs_path = os.path.abspath(file_path)
+    if not os.path.exists(abs_path):
+        print(f" -> [ParaView Launcher Warning] Result file not found: {abs_path}")
+        return False
+
+    # 1. Search in system PATH
+    paraview_bin = shutil.which("paraview")
+    if paraview_bin:
+        print(f" -> [ParaView Launcher] Found paraview command in system PATH: {paraview_bin}")
+    else:
+        # 2. Search in standard Windows installations (C:\\Program Files\\ParaView*)
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        search_pattern = os.path.join(pf, "ParaView*", "bin", "paraview.exe")
+        candidates = glob.glob(search_pattern)
+        if candidates:
+            # Sort to pick the latest version candidate folder
+            candidates.sort(reverse=True)
+            paraview_bin = candidates[0]
+            print(f" -> [ParaView Launcher] Found standard installation: {paraview_bin}")
+
+    if not paraview_bin:
+        print("\n [ParaView Launcher Warning] ParaView installation not detected.")
+        print("   - Please add ParaView's bin/ directory to your Windows PATH environment variable, or")
+        print("   - Install ParaView into the standard 'C:\\Program Files\\ParaView-X.X.X' directory for auto-launching.")
+        return False
+
+    print(f" -> [ParaView Launcher] Launching ParaView non-blockingly... Loading: {abs_path}")
+    try:
+        creationflags = 0
+        if os.name == 'nt':
+            # CREATE_NEW_PROCESS_GROUP (0x00000200) to safely detach subprocess lifecycle from parent Python process
+            creationflags = 0x00000200
+
+        subprocess.Popen(
+            [paraview_bin, abs_path],
+            creationflags=creationflags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True
+        )
+        print(" -> [ParaView Launcher] ParaView successfully spawned in background!")
+        return True
+    except Exception as e:
+        print(f" -> [ParaView Launcher ERROR] Failed to spawn ParaView: {e}")
+        return False
+
+
+def visualize_in_paraview(result_data: "WHTResultData", temp_dir: Optional[str] = None) -> bool:
+    """
+    [WHT Premium UX] Exports WHTResultData IR to a temporary VTKHDF file and opens it in ParaView instantly.
+    """
+    import tempfile
+    from wht_converter.wht_exporters import VTKHDFExporter
+
+    if temp_dir is None:
+        temp_dir = tempfile.gettempdir()
+
+    hdf_path = os.path.join(temp_dir, "wht_transient_temp.hdf")
+    print(f" -> [ParaView Visualizer] Exporting temporary high-fidelity transient geometry VTKHDF file...")
+    try:
+        # Default to transient_geometry=True for smooth moving-mesh animation
+        VTKHDFExporter(transient_geometry=True).export(result_data, hdf_path)
+    except Exception as e:
+        print(f" -> [ParaView Visualizer ERROR] HDF export failed: {e}")
+        return False
+
+    return launch_paraview(hdf_path)

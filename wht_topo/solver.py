@@ -111,7 +111,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
 
-from wht_modeler.wht_mesh_model import WHTMeshModel
+from wht_modeler.wht_mesh_model import WHTMeshModel, WHTSPCEntry
 from wht_solver.wht_solver import WHTSolver
 from wht_topo.loads import StochasticLoadManager
 from wht_topo.mma import MMAOptimizer
@@ -299,6 +299,11 @@ class WHTopographySolver:
         self.diversity_sigma       = 0.3   # σ: 반발 범위 (설계 변수 공간)
         self.diversity_start_iter  = -1    # -1=수렴 후 등록 방식, >=0=해당 iter부터 적용
         self._reference_designs: List[np.ndarray] = []  # 반발 기준 설계들
+        # 동적 시나리오 정보 (monitor UI 재해석용) — run_topo.py에서 주입
+        # 형식: [{"name": str, "csv_path": str, "t_start": float|None,
+        #          "t_end": float|None, "add_inertia": bool,
+        #          "use_global_z": bool, "n_modes": int}]
+        self.dynamic_scenarios: List[dict] = []
         self.weights        = weights or {"bending": 1.0, "twisting": 1.5, "lifting": 1.2}
         self.load_cases_input    = load_cases
         self._load_case_provider = load_case_provider
@@ -1434,6 +1439,7 @@ class WHTopographySolver:
                                          self.model.nodes[nid].z)
                                    for nid in self._design_nids},
             "mesh_edge_segs":     mesh_edge_segs,
+            "dynamic_scenarios":  list(self.dynamic_scenarios),
         }
         try:
             with open(_snap_dir / "init.pkl", "wb") as _f:
@@ -1450,7 +1456,20 @@ class WHTopographySolver:
         # ── [Iter 0] 완전 평탄 초기 상태 평가 (UI/Monitor 요구사항) ─────────────
         h_phys_flat = np.zeros(self._n_design, dtype=np.float32)
         self._apply_heights(h_phys_flat)
-        C_total_0, C_responses_0, _, _ = self._compute_total_compliance(fea_solver, iter_num=-1)
+
+        # ESL provider가 등록된 경우 평탄 초기 상태로 케이스 선추출 (compliance 기준값 확보)
+        _dyn_cases_iter0: list = []
+        if self._load_case_provider is not None:
+            print("   [Iter 0] ESL 초기 케이스 추출 중 (평탄 상태 기준)...", flush=True)
+            try:
+                _dyn_cases_iter0 = self._load_case_provider(0, h_elem=h_phys_flat)
+                self._load_cases = list(self._static_load_cases) + list(_dyn_cases_iter0)
+                print(f"   [Iter 0] 하중 케이스: 정적 {len(self._static_load_cases)}개 "
+                      f"+ ESL {len(_dyn_cases_iter0)}개 = 총 {len(self._load_cases)}개", flush=True)
+            except Exception as _esl_err:
+                print(f"   [경고] Iter 0 ESL 추출 실패: {_esl_err}", flush=True)
+
+        C_total_0, C_responses_0, _, _ = self._compute_total_compliance(fea_solver, iter_num=0)
         
         if callback:
             coords = np.array([
@@ -1468,12 +1487,32 @@ class WHTopographySolver:
                     "max_stress": res["max_stress"]
                 }
             
+            # ── Iter 0 모달 해석 (Ref. 주파수) ──────────────────────────────
+            _ref_freqs = []
+            try:
+                _orig_spcs = list(fea_solver.model.spc_conditions)
+                _spcd_nids = [nid for nid in fea_solver.model.nodes if nid >= 900000]
+                _temp_spcs = [WHTSPCEntry(nid, (0,1,2,3,4,5), 0.0) for nid in _spcd_nids]
+                # SPCD 노드가 있으면 해당 노드만 고정(free-free + SPCD 고정),
+                # SPCD 노드가 없으면 원래 SPC 유지(강체 모드 방지)
+                fea_solver.model.spc_conditions = _temp_spcs if _spcd_nids else _orig_spcs
+                _ref_modal = fea_solver.solve_modal(
+                    num_modes=self.modal_modes, exclude_rigid_body=False
+                )
+                fea_solver.model.spc_conditions = _orig_spcs
+                _ref_freqs = _ref_modal.frequencies.tolist()
+                print(f"   [Iter 0] 초기 고유진동수: "
+                      f"{', '.join(f'{f:.2f}Hz' for f in _ref_freqs[:6])}"
+                      f"{'...' if len(_ref_freqs) > 6 else ''}")
+            except Exception as _e:
+                print(f"   [경고] Iter 0 모달 해석 실패: {_e}")
+
             data_0 = {
                 "iter": 0,
                 "compliance": float(C_total_0),
                 "area_ratio": 0.0,
                 "cases": case_data,
-                "frequencies": [],
+                "frequencies": _ref_freqs,
                 "avg_h": 0.0,
                 "max_h": 0.0,
                 "dx": 0.0,
@@ -1580,10 +1619,12 @@ class WHTopographySolver:
             try:
                 # [WHT] SPC 없이 완전 Free-Free 상태의 주파수를 구하기 위해 spc_conditions를 일시적으로 격리
                 orig_spcs = list(fea_solver.model.spc_conditions)
-                fea_solver.model.spc_conditions = []
-                
+                _spcd_nids = [nid for nid in fea_solver.model.nodes if nid >= 900000]
+                _temp_spcs = [WHTSPCEntry(nid, (0,1,2,3,4,5), 0.0) for nid in _spcd_nids]
+                fea_solver.model.spc_conditions = _temp_spcs if _spcd_nids else orig_spcs
+
                 modal_results = fea_solver.solve_modal(num_modes=self.modal_modes, exclude_rigid_body=False)
-                
+
                 # [WHT] 모달 해석 이후 SPC 원상 복구
                 fea_solver.model.spc_conditions = orig_spcs
                 freqs = modal_results.frequencies  # Hz
