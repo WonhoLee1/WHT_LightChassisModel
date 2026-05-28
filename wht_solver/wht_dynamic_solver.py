@@ -326,8 +326,10 @@ class WHTDynamicSolver(WHTSolver):
         K_struct_ff = K_struct[free_id, :][:, free_id].tocsr()
         _pre_omegas = None
         if verbose and modal_modes > 0:
+            # K_ff(beam/RBE3 포함 전체 강성)를 사용: K_struct_ff는 drilling Rz 강성이
+            # 부족해 eigsh가 순수 Rz 모드를 먼저 찾아 병진 참여계수가 0이 됨.
             _pre_omegas = self._print_modal_pre_report(
-                K_struct_ff, M_f, free_id, modal_modes, damping
+                K_ff, M_f, free_id, modal_modes, damping
             )
 
         # ── 4. 감쇠 ────────────────────────────────────────────────────────
@@ -381,7 +383,8 @@ class WHTDynamicSolver(WHTSolver):
             return u_s, ud_s, udd_s
 
         print(f"    - [Time Loop] Integrating {n_steps} steps...")
-        pbar = tqdm(total=n_steps, desc="      Dynamic Solve", unit="step", leave=True, ncols=100)
+        _pbar_unit = max(1, n_steps // 10)
+        pbar = tqdm(total=n_steps, desc="      Dynamic Solve", unit="step", leave=True, ncols=100, miniters=_pbar_unit, mininterval=0)
         
         for step in range(n_steps + 1):
             t_cur = step * dt
@@ -1140,16 +1143,9 @@ class WHTDynamicSolver(WHTSolver):
 
         k_actual = min(n_modes, M_f.size - 2)
 
-        # eigsh용 질량 행렬: 병진 DOF만 실제 질량 사용, 회전 DOF는 병진 최소값으로 억제.
-        # 이유: 회전 관성(m_node * area/12)이 병진 질량보다 크면 eigsh가 순수 회전 모드를
-        #       최저 고유치로 먼저 찾아 병진 참여계수가 0이 되는 문제 방지.
-        _dof_dirs_local = free_id % 6
-        _rot_mask = _dof_dirs_local >= 3
-        _trans_vals = M_f[~_rot_mask]
-        _M_f_eigsh = M_f.copy()
-        if len(_trans_vals) > 0:
-            _M_f_eigsh[_rot_mask] = _trans_vals.min() * 1e-4  # 회전 DOF 질량 억제
-        M_mat = sp_diags([_M_f_eigsh], [0], format="csc")
+        # 물리적 K, M 그대로 사용. K_ff(beam/RBE3 포함)가 전달되므로
+        # drilling Rz 강성이 충분히 확보되어 eigsh가 구조적 모드를 찾는다.
+        M_mat = sp_diags([M_f], [0], format="csc")
 
         try:
             vals, vecs = eigsh(
@@ -1161,21 +1157,27 @@ class WHTDynamicSolver(WHTSolver):
             print(f" {'─'*W}", flush=True)
             return np.array([])
 
-        # 정렬 및 강체모드(< 0.5 Hz) 필터
+        # 정렬 및 강체모드(< 0.5 Hz) + 순수 회전 모드(trans_frac < 0.05) 필터
         idx_sort = np.argsort(vals)
         vals = np.maximum(vals[idx_sort], 0.0)
         vecs = vecs[:, idx_sort]
         omegas_all = np.sqrt(vals)
         freqs_all  = omegas_all / (2.0 * np.pi)
 
-        elastic_mask = freqs_all > 0.5
-        n_rigid  = int(np.sum(~elastic_mask))
-        omegas   = omegas_all[elastic_mask]
-        freqs    = freqs_all[elastic_mask]
-        vecs_e   = vecs[:, elastic_mask]
+        _dof_d_all = free_id % 6
+        _trans_mask_dofs = (_dof_d_all < 3)
+        _phi_sq = vecs ** 2
+        _trans_frac_all = (_phi_sq * _trans_mask_dofs[:, None]).sum(axis=0) / (_phi_sq.sum(axis=0) + 1e-30)
 
-        if n_rigid:
-            print(f"  (강체 모드 {n_rigid}개 제외, 탄성 모드 {len(freqs)}개)", flush=True)
+        elastic_mask = (freqs_all > 0.5) & (_trans_frac_all > 0.05)
+        n_rigid   = int(np.sum(freqs_all <= 0.5))
+        n_rot_rej = int(np.sum((freqs_all > 0.5) & (_trans_frac_all <= 0.05)))
+        omegas = omegas_all[elastic_mask]
+        freqs  = freqs_all[elastic_mask]
+        vecs_e = vecs[:, elastic_mask]
+
+        if n_rigid or n_rot_rej:
+            print(f"  (강체모드 {n_rigid}개 + 순수회전모드 {n_rot_rej}개 제외, 탄성모드 {len(freqs)}개)", flush=True)
 
         # ── 고유진동수 테이블 ────────────────────────────────────────────────
         print(f"\n  {'Mode':>5}  {'Freq [Hz]':>10}  {'Period [s]':>10}  {'ω [rad/s]':>10}", flush=True)
@@ -1218,12 +1220,13 @@ class WHTDynamicSolver(WHTSolver):
         cum_eff = np.cumsum(m_eff, axis=0) / total_m[None, :] * 100.0
 
         # ── 참여계수 테이블 ──────────────────────────────────────────────────
-        hdr = ''.join(f"  {dir_labels[di]:>10}" for di in show_dirs)
+        _CW = 13  # 열 너비: 부호+숫자+소수점+4자리+e+부호+2자리 = 12 → 13으로 여유
+        hdr = ''.join(f"  {dir_labels[di]:>{_CW}}" for di in show_dirs)
         print(f"\n  Participation Factor (Γ = φᵀMR / √(φᵀMφ))", flush=True)
         print(f"  {'Mode':>5}{hdr}", flush=True)
-        print(f"  {'─'*5}" + "  " + "  ".join(['─'*10]*len(show_dirs)), flush=True)
+        print(f"  {'─'*5}" + "  " + "  ".join(['─'*_CW]*len(show_dirs)), flush=True)
         for r in range(len(freqs)):
-            vals_str = ''.join(f"  {gamma[r, j]:>10.4e}" for j in range(len(show_dirs)))
+            vals_str = ''.join(f"  {gamma[r, j]:>{_CW}.4e}" for j in range(len(show_dirs)))
             print(f"  {r+1:>5}{vals_str}", flush=True)
 
         # ── 유효질량 + 누적 비율 테이블 ─────────────────────────────────────

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QComboBox, QLabel, QPushButton, QSlider, QFileDialog,
     QMessageBox, QSizePolicy,
     QMenu, QDialog, QFormLayout, QDialogButtonBox,
+    QSplitter, QTextEdit,
 )
 from PySide6.QtCore import Signal, QObject, QThread, Qt
 from PySide6.QtGui import QPixmap, QAction
@@ -1015,15 +1016,26 @@ class WHTMonitorWindow(QMainWindow):
         ctrl_iter.addStretch()
         lay.addWidget(ctrl_iter_w)
 
-        # ── 높이 분포 캔버스 ─────────────────────────────────────────────
+        # ── 캔버스 + 하단 패널을 QSplitter로 분리 (드래그로 크기 조절) ──
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        lay.addWidget(splitter, stretch=1)
+
+        # 상단: 높이 분포 캔버스
         self.height_canvas = PlotCanvas(tab)
-        lay.addWidget(self.height_canvas, stretch=1)
+        splitter.addWidget(self.height_canvas)
+
+        # 하단: 버튼 + 상태창
+        bottom_widget = QWidget()
+        bottom_lay = QVBoxLayout(bottom_widget)
+        bottom_lay.setContentsMargins(0, 0, 0, 0)
+        bottom_lay.setSpacing(2)
+        splitter.addWidget(bottom_widget)
+        splitter.setSizes([400, 120])  # 초기 비율 (캔버스:하단)
 
         # ── 액션 행: Mesh View / Run Analysis / Export ───────────────────
         ctrl_widget = QWidget()
-        ctrl_widget.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
+        ctrl_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         ctrl_action = QHBoxLayout(ctrl_widget)
         ctrl_action.setContentsMargins(0, 4, 0, 4)
         ctrl_action.setSpacing(6)
@@ -1065,12 +1077,19 @@ class WHTMonitorWindow(QMainWindow):
         ctrl_action.addWidget(self.viewer_combo)
 
         ctrl_action.addStretch()
-        lay.addWidget(ctrl_widget)
+        bottom_lay.addWidget(ctrl_widget)
 
-        # ── 상태 표시줄 ──────────────────────────────────────────────────
-        self.iter_status_label = QLabel("")
-        self.iter_status_label.setStyleSheet("color:#555;font-size:11px;")
-        lay.addWidget(self.iter_status_label)
+        # ── 상태 표시창 (스크롤 가능, 기본 2-3줄) ───────────────────────
+        self.iter_status_label = QTextEdit()
+        self.iter_status_label.setReadOnly(True)
+        self.iter_status_label.setStyleSheet(
+            "color:#555; font-size:11px; background:#1e1e1e; border:none;"
+        )
+        fm = self.iter_status_label.fontMetrics()
+        line_h = fm.lineSpacing()
+        self.iter_status_label.setMinimumHeight(line_h * 2 + 8)
+        self.iter_status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        bottom_lay.addWidget(self.iter_status_label, stretch=1)
 
         self.tabs.addTab(tab, "Iteration Results")
 
@@ -1671,8 +1690,14 @@ class WHTMonitorWindow(QMainWindow):
 
     def _set_iter_status(self, msg: str, color: str = "#555"):
         if self.iter_status_label:
-            self.iter_status_label.setText(msg)
-            self.iter_status_label.setStyleSheet(f"color:{color};font-size:11px;")
+            self.iter_status_label.setStyleSheet(
+                f"color:{color}; font-size:11px; background:#1e1e1e; border:none;"
+            )
+            self.iter_status_label.setPlainText(msg)
+            # 최신 내용이 보이도록 스크롤
+            self.iter_status_label.verticalScrollBar().setValue(
+                self.iter_status_label.verticalScrollBar().maximum()
+            )
 
     def _get_selected_iter_num(self) -> int:
         """height_iter_combo 현재 선택 이터레이션 번호 반환 (Latest → 최신 snap의 iter)."""
@@ -1801,7 +1826,7 @@ class WHTMonitorWindow(QMainWindow):
 
         self._re_worker = _CalculixReAnalysisWorker(self.snap_dir, iter_num, case_name,
                                                    num_modal_modes=self.num_modal_modes)
-        self._re_worker.progress.connect(lambda msg: self._set_iter_status(msg, "blue"))
+        self._re_worker.progress.connect(lambda msg: self._set_iter_status(msg, "white"))
         self._re_worker.finished.connect(self._on_calculix_analysis_finished)
         self._re_worker.error.connect(self._on_calculix_analysis_error)
         self._re_worker.start()
@@ -1810,10 +1835,10 @@ class WHTMonitorWindow(QMainWindow):
         if self.iter_ccx_btn:
             self.iter_ccx_btn.setEnabled(True)
 
-        rtype = result.get("type")
-        rd    = result["wht_result_data"]
-
         try:
+            rtype = result.get("type")
+            rd    = result["wht_result_data"]
+
             if rtype == "modal":
                 freqs = [float(f) for f in rd.time_values]
                 freq_str = "  ".join(f"f{i+1}={f:.2f}Hz" for i, f in enumerate(freqs))
@@ -1821,7 +1846,7 @@ class WHTMonitorWindow(QMainWindow):
                 title = f"CalculiX Modal Analysis — Iter {self._get_selected_iter_num()}"
             else:
                 lc_name = result.get("lc_name", "Static")
-                disp = rd.point_data["Displacement"][0] # shape (N, 3)
+                disp = rd.point_data["Displacement"][0]
                 u_max = float(np.max(np.abs(disp[:, :3])))
                 self._set_iter_status(f"CCX {lc_name}  Max|U|={u_max:.4f} mm", "#2a7a2a")
                 title = f"CalculiX Static: {lc_name} — Iter {self._get_selected_iter_num()}"
@@ -1829,7 +1854,9 @@ class WHTMonitorWindow(QMainWindow):
             self._open_visualizer(rd, title)
 
         except Exception:
-            self._set_iter_status(f"CCX 결과 변환 오류: {traceback.format_exc()[:120]}", "red")
+            tb = traceback.format_exc()
+            print(f"\n[Monitor] _on_calculix_analysis_finished 오류:\n{tb}", flush=True)
+            self._set_iter_status(f"CCX 결과 변환 오류: {tb.splitlines()[-1][:160]}", "red")
 
     def _on_calculix_analysis_error(self, msg: str):
         if self.iter_ccx_btn:
@@ -1884,7 +1911,7 @@ class WHTMonitorWindow(QMainWindow):
 
                 meta = WHTMetadata(
                     solver_name="WHT-Topo", solver_version="1.0",
-                    analysis_type="dynamic", coordinate_system="cartesian",
+                    analysis_type="transient", coordinate_system="cartesian",
                     unit_length="mm", unit_force="N",
                 )
                 rd = dyn.to_wht_result_data(meta, model)
@@ -1917,7 +1944,9 @@ class WHTMonitorWindow(QMainWindow):
             self._open_visualizer(rd, title)
 
         except Exception:
-            self._set_iter_status(f"결과 변환 오류: {traceback.format_exc()[:120]}", "red")
+            tb = traceback.format_exc()
+            print(f"\n[Monitor] _on_analysis_finished 오류:\n{tb}", flush=True)
+            self._set_iter_status(f"결과 변환 오류: {tb.splitlines()[-1][:160]}", "red")
 
     def _on_analysis_error(self, msg: str):
         if self.iter_run_btn:
@@ -1979,6 +2008,31 @@ class MonitorDataHandler(QObject):
     data_received = Signal(dict)
 
 
+class _TeeStream:
+    """stdout/stderr를 콘솔과 파일에 동시에 출력하는 스트림 래퍼."""
+    def __init__(self, original, file_handle):
+        self._orig = original
+        self._file = file_handle
+
+    def write(self, data):
+        self._orig.write(data)
+        try:
+            self._file.write(data)
+            self._file.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        self._orig.flush()
+        try:
+            self._file.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, attr):
+        return getattr(self._orig, attr)
+
+
 def start_monitor_ui(queue, stop_event=None, results_dir: str = "",
                      num_modal_modes: int = 20):
     """
@@ -1991,6 +2045,21 @@ def start_monitor_ui(queue, stop_event=None, results_dir: str = "",
     results_dir      : str                    — out_dir 경로 (OptiStruct 저장 기본 경로)
     num_modal_modes  : int                    — 모달 해석 모드 수 (기본: 10)
     """
+    # ── 로그 파일 설정 (콘솔 + 파일 동시 출력) ─────────────────────────────
+    _log_handle = None
+    if results_dir:
+        import datetime
+        log_path = Path(results_dir) / "topopt_log.txt"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            _log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
+            _log_handle.write(f"\n{'='*60}\n[LOG START] {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n{'='*60}\n")
+            sys.stdout = _TeeStream(sys.stdout, _log_handle)
+            sys.stderr = _TeeStream(sys.stderr, _log_handle)
+            print(f"[Monitor] 로그 파일: {log_path}", flush=True)
+        except Exception as _e:
+            print(f"[Monitor] 로그 파일 열기 실패: {_e}", flush=True)
+
     app    = QApplication.instance() or QApplication(sys.argv)
     window = WHTMonitorWindow(stop_event=stop_event, results_dir=results_dir,
                               num_modal_modes=num_modal_modes)
@@ -2019,4 +2088,14 @@ def start_monitor_ui(queue, stop_event=None, results_dir: str = "",
     receiver = Receiver(queue)
     receiver.handler.data_received.connect(window.update_data)
     receiver.start()
-    sys.exit(app.exec())
+    _exit_code = app.exec()
+    if _log_handle:
+        try:
+            import datetime
+            sys.stdout = sys.stdout._orig if isinstance(sys.stdout, _TeeStream) else sys.stdout
+            sys.stderr = sys.stderr._orig if isinstance(sys.stderr, _TeeStream) else sys.stderr
+            _log_handle.write(f"[LOG END] {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+            _log_handle.close()
+        except Exception:
+            pass
+    sys.exit(_exit_code)

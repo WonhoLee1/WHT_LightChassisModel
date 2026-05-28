@@ -3074,7 +3074,7 @@ def main():
                          "정체 감지(stagnation): 연속 5회 dx<tol*5 이어도 수렴. "
                          "엄격: 1e-5 (오래 걸림) / 표준: 1e-4 / 느슨: 1e-3 (빠르게 종료)")
     g3.add_argument("--normalize-obj",    type=float, default=1.0,
-                    help="목적함수 정규화 (기본 1.0)")
+                    help="목적함수 정규화 (기본 1.0, 0=비활성)")
     g3.add_argument("--obj-type",    choices=["sum", "max", "sum+max"], default="sum+max",
                     help="목적함수 유형: sum=가중합(기본), max=softmax 최악케이스, sum+max=0.5·sum+0.5·softmax")
     g3.add_argument("--obj-alpha",   type=float, default=10.0,

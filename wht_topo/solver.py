@@ -1649,7 +1649,7 @@ class WHTopographySolver:
                 print(f"    [경고] 고유진동수 해석 실패 (Iter {i}): {e}")
                 modal_results = None
                 freqs = np.zeros(10)
-            elastic_freqs = [f for f in freqs if f > 0.1]
+            elastic_freqs = [f for f in freqs if f > 0.01]
 
             # ── 이터레이션 결과 저장 (ParaView 호환 VTKHDF) ──
             try:
