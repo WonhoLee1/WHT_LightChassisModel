@@ -1921,6 +1921,8 @@ class TopographyPipeline:
             bidirectional        = getattr(self.cfg, 'bead_bidirectional', False),
             min_width_init       = getattr(self.cfg, 'min_width_init', -1.0),
             min_width_ramp_iters = getattr(self.cfg, 'min_width_ramp', 10),
+            max_width            = getattr(self.cfg, 'max_width', -1.0),
+            max_width_weight     = getattr(self.cfg, 'max_width_weight', 1.0),
         )
         n_designs = getattr(self.cfg, 'n_designs', 1)
         _div_start = getattr(self.cfg, 'diversity_start_iter', -1)
@@ -3058,9 +3060,11 @@ def main():
     )
     g3.add_argument("--iters",       type=int,   default=20,   help="최대 반복 횟수 (기본: 20)")
     g3.add_argument("--bead-height", type=float, default=15.0, help="최대 비드 높이 mm (기본: 15.0)")
-    g3.add_argument("--min-width",      type=float, default=60.0,  help="최소 비드 폭 mm, 최종 목표값 (기본: 60.0)")
-    g3.add_argument("--min-width-init", type=float, default=150.0, help="필터 연속화 초기 최소 비드 폭 mm (기본: 150.0, -1=고정)")
-    g3.add_argument("--min-width-ramp", type=int,   default=5,     help="min-width-init → min-width 감소 이터레이션 수 (기본: 5)")
+    g3.add_argument("--min-width",        type=float, default=60.0,  help="최소 비드 폭 mm, 최종 목표값 (기본: 60.0)")
+    g3.add_argument("--min-width-init",   type=float, default=150.0, help="필터 연속화 초기 최소 비드 폭 mm (기본: 150.0, -1=고정)")
+    g3.add_argument("--min-width-ramp",   type=int,   default=5,     help="min-width-init → min-width 감소 이터레이션 수 (기본: 5)")
+    g3.add_argument("--max-width",        type=float, default=-1.0,  help="최대 비드 폭 mm (-1=비활성, 기본: -1.0). --min-width의 2~4배 권장")
+    g3.add_argument("--max-width-weight", type=float, default=1.0,   help="max-width 패널티 강도 (C_0 대비 배율, 기본: 1.0)")
     g3.add_argument("--bead-area",   type=float, default=0.30, help="비드 점유 면적 비율 0~1 (기본: 0.30)")
     g3.add_argument("--bead-bidirectional", action="store_true", default=False,
                     help="양방향 비드 허용: x=0.5 기준 + 방향(outward)·- 방향(inward) 동시 최적화. "

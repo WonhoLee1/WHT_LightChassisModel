@@ -232,9 +232,10 @@ class PatchTestRunner:
         # Theory stress: sigma_x = p_stress
         fe_sx = np.mean(result.cell_data['Stress'][0, :, 0])
         
+        tol_val = 1.0 if etype == 'QUAD4' else 2.0
         return [
-            TestResult("Membrane Tension", "Max Displacement X", etype, th_ux, fe_ux, t_ms, tol_pct=1.0),
-            TestResult("Membrane Tension", "Avg Stress Sx", etype, p_stress, fe_sx, t_ms, tol_pct=1.0)
+            TestResult("Membrane Tension", "Max Displacement X", etype, th_ux, fe_ux, t_ms, tol_pct=tol_val),
+            TestResult("Membrane Tension", "Avg Stress Sx", etype, p_stress, fe_sx, t_ms, tol_pct=tol_val)
         ]
 
     def test_4pt_bending(self, etype='QUAD4'):

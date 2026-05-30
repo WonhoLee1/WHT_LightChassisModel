@@ -119,9 +119,11 @@ from wht_topo.mma import MMAOptimizer
 # JAX 민감도 함수 사전 정의 — QUAD4 (MITC4+)
 from wht_solver.wht_quad4_element_jax import _element_K_mitc4_plus_jax
 
+_DEFAULT_BETA = jnp.full((4,), 1e-4)
+
 @jax.jit
 def element_energy_jax(c1, c2, c3, c4, u_e, t, E, nu):
-    K_e = _element_K_mitc4_plus_jax(c1, c2, c3, c4, t, E, nu)
+    K_e = _element_K_mitc4_plus_jax(c1, c2, c3, c4, t, E, nu, _DEFAULT_BETA)
     return jnp.dot(u_e, jnp.dot(K_e, u_e))
 
 element_grad_jax      = jax.grad(element_energy_jax, argnums=(0, 1, 2, 3))
@@ -269,6 +271,8 @@ class WHTopographySolver:
         bidirectional: bool = False,
         min_width_init: float = -1.0,
         min_width_ramp_iters: int = 0,
+        max_width: float = -1.0,
+        max_width_weight: float = 1.0,
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -376,6 +380,11 @@ class WHTopographySolver:
 
         # 공간 필터 행렬 (최소 비드 폭 제어)
         self._H = self._build_filter()
+
+        # 최대 비드 폭 필터 (max_width > 0 시 활성)
+        self.max_width        = max_width
+        self.max_width_weight = max_width_weight
+        self._H_max = self._build_filter_r(max_width) if max_width > 0 else None
 
         # 정적 하중 케이스 초기화 (이터레이션 간 고정)
         # load_cases_input is not None: 외부에서 명시적으로 주입 (빈 리스트 포함 — --no-static)
@@ -1011,6 +1020,26 @@ class WHTopographySolver:
 
         return grad
 
+    def _build_filter_r(self, radius: float) -> np.ndarray:
+        """반경 radius mm 가우시안/선형 필터 행렬 조립."""
+        n = self._n_design
+        coords = self._elem_centroids()
+        W = np.zeros((n, n))
+        if self.filter_type == "gaussian":
+            sigma = radius / 3.0
+            for i in range(n):
+                dists = np.linalg.norm(coords - coords[i], axis=1)
+                mask  = dists < radius
+                w     = np.exp(-dists[mask] ** 2 / (2.0 * sigma ** 2))
+                W[i, mask] = w / (np.sum(w) + 1e-10)
+        else:
+            for i in range(n):
+                dists = np.linalg.norm(coords - coords[i], axis=1)
+                mask  = dists < radius
+                w     = radius - dists[mask]
+                W[i, mask] = w / (np.sum(w) + 1e-10)
+        return W
+
     def _build_filter(self) -> np.ndarray:
         """
         공간 필터 행렬 H 조립 (최소 비드 폭 제어).
@@ -1020,23 +1049,7 @@ class WHTopographySolver:
           → 경계가 부드럽고 큼직한 덩어리 형태 유도에 유리
         """
         print(f" -> [Solver] 공간 필터 행렬 ({self.rmin}mm, {self.filter_type}) 조립 중...")
-        n = self._n_design
-        coords = self._elem_centroids()
-        W = np.zeros((n, n))
-        if self.filter_type == "gaussian":
-            sigma = self.rmin / 3.0
-            for i in range(n):
-                dists = np.linalg.norm(coords - coords[i], axis=1)
-                mask  = dists < self.rmin
-                w     = np.exp(-dists[mask] ** 2 / (2.0 * sigma ** 2))
-                W[i, mask] = w / (np.sum(w) + 1e-10)
-        else:  # linear (기본)
-            for i in range(n):
-                dists = np.linalg.norm(coords - coords[i], axis=1)
-                mask  = dists < self.rmin
-                w     = self.rmin - dists[mask]
-                W[i, mask] = w / (np.sum(w) + 1e-10)
-        return W
+        return self._build_filter_r(self.rmin)
 
     # ─────────────── 노드 좌표 조작 ───────────────
 
@@ -1891,7 +1904,21 @@ class WHTopographySolver:
             else:
                 dC_dx_filt = dC_dx_proj_in
 
-            # 4. 공간 필터 역전파 (맨 마지막)
+            # 4a. max-width 패널티 그래디언트 (활성 시)
+            # P = 0.5 * w_eff * ||H_max @ x_filt||²
+            # dP/dx_filt = w_eff * H_max^T @ (H_max @ x_filt)
+            # rmin_current >= max_width 구간(min-width-init 램프 중)에서는 비활성
+            if self._H_max is not None and C_0 is not None and self._rmin_current < self.max_width:
+                x_wide     = self._H_max @ x_filt          # rmax 반경 평균 밀도
+                w_eff      = self.max_width_weight * C_0   # C_0 기준 자동 스케일
+                dP_dx_filt = w_eff * (self._H_max.T @ x_wide)
+                dC_dx_filt = dC_dx_filt + dP_dx_filt
+                if i % 5 == 0:
+                    print(f"   [max-width] rmax={self.max_width}mm  "
+                          f"mean_wide={float(x_wide.mean()):.3f}  "
+                          f"|dP|={float(np.linalg.norm(dP_dx_filt)):.3e}")
+
+            # 4b. 공간 필터 역전파 (맨 마지막)
             dC_dx = self._H.T @ dC_dx_filt
 
             df0dx = (dC_dx / C_0).flatten()

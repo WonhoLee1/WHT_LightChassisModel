@@ -33,7 +33,7 @@ except Exception:
     _JAX_VMAP_OK = False
 
 
-def _arpack_subprocess_worker(K, M_diag, k, sigma, maxiter, result_queue):
+def _arpack_subprocess_worker(K, M_diag, k, sigma, maxiter, result_queue, tol=1e-5):
     """Isolated worker to run ARPACK and report results or errors back to parent.
     Optimized for Windows stability by forcing single-threading and array-M.
     """
@@ -53,7 +53,7 @@ def _arpack_subprocess_worker(K, M_diag, k, sigma, maxiter, result_queue):
         # M as 1D array is often more stable in certain ARPACK builds
         M_op = diags([M_diag], [0], format='csc')
         
-        vals, vecs = eigsh(K, k=k, M=M_op, which="LM", sigma=sigma, tol=1e-5, maxiter=maxiter)
+        vals, vecs = eigsh(K, k=k, M=M_op, which="LM", sigma=sigma, tol=tol, maxiter=maxiter)
         result_queue.put((vals, vecs))
     except Exception as ex:
         result_queue.put(ex)
@@ -83,7 +83,8 @@ class WHTSolver:
 
     def solve_modal(self, num_modes: int = 10, method: str = 'auto', 
                     exclude_rigid_body: Union[bool, str] = False,
-                    shift_hz: Optional[float] = None) -> WHTSolverResult:
+                    shift_hz: Optional[float] = None,
+                    tol: float = 1e-5) -> WHTSolverResult:
         """
         Solve generalized eigenvalue problem: K x = lambda M x
         
@@ -98,6 +99,7 @@ class WHTSolver:
                 - 'mass:0.8': Advanced Participation filtering. Removes modes with near-zero 
                               frequency and high global mass participation factors.
             shift_hz (float): Optional frequency shift (Hz) to solve for modes near a target value.
+            tol (float): Convergence tolerance for the eigenvalue solver (default: 1e-5 for strict and standard precision).
         """
         import time
         from scipy.sparse.linalg import eigsh
@@ -166,7 +168,7 @@ class WHTSolver:
             q = multiprocessing.Queue()
             p = multiprocessing.Process(
                 target=_arpack_subprocess_worker,
-                args=(K_free_rcm, M_free_rcm, actual_modes, sigma_val, ndof_free*20, q)
+                args=(K_free_rcm, M_free_rcm, actual_modes, sigma_val, ndof_free*20, q, tol)
             )
             p.start()
             try:
@@ -233,7 +235,7 @@ class WHTSolver:
         if method == 'sparse' or method == 'arpack':
             # ... kept for backward compatibility or direct calls ...
             vals, vecs_rcm = eigsh(K_free_rcm, k=actual_modes, M=diags([M_free_rcm], [0], format='csc'),
-                                   which="LM", sigma=sigma_val, tol=1e-5, maxiter=ndof_free*20)
+                                   which="LM", sigma=sigma_val, tol=tol, maxiter=ndof_free*20)
         elif method == 'dense':
             import scipy.linalg as la
             vals_all, vecs_all = la.eigh(K_free_rcm.toarray(), np.diag(M_free_rcm))
@@ -446,10 +448,13 @@ class WHTSolver:
         else:
             K_out = csr_matrix((ndof, ndof))
 
+        # 꺾임각 연동 드릴링 강성 조율을 위한 노드별 beta 계산 및 전달
+        node_beta = self._compute_folding_angles(sorted_nids, nid_to_idx)
+
         if _JAX_VMAP_OK:
-            K_q = _K_quad4_jax(self.model, sorted_nids, nid_to_idx)
+            K_q = _K_quad4_jax(self.model, sorted_nids, nid_to_idx, node_beta)
         else:
-            K_q = K_quad4_scipy(self.model, sorted_nids, nid_to_idx)
+            K_q = K_quad4_scipy(self.model, sorted_nids, nid_to_idx, node_beta)
         K_t = K_tria3_scipy(self.model, sorted_nids, nid_to_idx)
         K_out = K_out + K_q + K_t
         print(f"    - [Assembly] Stiffness Audit: {K_q.nnz} non-zeros from shells.")
@@ -818,3 +823,84 @@ class WHTSolver:
         M_diag = M_quad4_lumped(self.model, ndof, sorted_nids, nid_to_idx)
         M_diag += M_tria3_lumped(self.model, ndof, sorted_nids, nid_to_idx)
         return M_diag
+
+    def _compute_folding_angles(self, sorted_nids: List[int], nid_to_idx: Dict[int, int]) -> np.ndarray:
+        """
+        Computes folding angles at each node based on adjacent shell elements' normal vectors
+        to scale drilling penalty stiffness parameters.
+        Returns a (N,) node-wise beta scaling factors.
+        """
+        n_nodes = len(sorted_nids)
+        nodes_arr = self.model.nodes_array()  # (N, 3) sorted nodes
+        
+        # 1. Extract and pre-build coordinate slices for elements
+        quad_elements = [
+            elem for elem in self.model.elements.values()
+            if elem.type.upper() in ('QUAD4', 'QUAD')
+        ]
+        quad_conn = np.array([[nid_to_idx[nid] for nid in elem.node_ids] for elem in quad_elements], dtype=np.int32)
+        
+        tria_elements = [
+            elem for elem in self.model.elements.values()
+            if elem.type.upper() in ('TRIA3', 'TRIA')
+        ]
+        tria_conn = np.array([[nid_to_idx[nid] for nid in elem.node_ids] for elem in tria_elements], dtype=np.int32)
+        
+        node_normals = [[] for _ in range(n_nodes)]
+        
+        # 2. Vectorized QUAD4 normal calculations
+        if len(quad_conn) > 0:
+            quad_coords = nodes_arr[quad_conn]  # (n_quad, 4, 3)
+            v1 = quad_coords[:, 2] - quad_coords[:, 0]
+            v2 = quad_coords[:, 3] - quad_coords[:, 1]
+            quad_normals = np.cross(v1, v2)
+            quad_norms = np.linalg.norm(quad_normals, axis=1, keepdims=True)
+            mask = quad_norms[:, 0] > 1e-12
+            quad_normals_normed = np.zeros_like(quad_normals)
+            quad_normals_normed[mask] = quad_normals[mask] / quad_norms[mask]
+            
+            for i in range(len(quad_conn)):
+                n = quad_normals_normed[i]
+                if mask[i]:
+                    for idx in quad_conn[i]:
+                        node_normals[idx].append(n)
+                        
+        # 3. Vectorized TRIA3 normal calculations
+        if len(tria_conn) > 0:
+            tria_coords = nodes_arr[tria_conn]  # (n_tria, 3, 3)
+            v1 = tria_coords[:, 1] - tria_coords[:, 0]
+            v2 = tria_coords[:, 2] - tria_coords[:, 0]
+            tria_normals = np.cross(v1, v2)
+            tria_norms = np.linalg.norm(tria_normals, axis=1, keepdims=True)
+            mask = tria_norms[:, 0] > 1e-12
+            tria_normals_normed = np.zeros_like(tria_normals)
+            tria_normals_normed[mask] = tria_normals[mask] / tria_norms[mask]
+            
+            for i in range(len(tria_conn)):
+                n = tria_normals_normed[i]
+                if mask[i]:
+                    for idx in tria_conn[i]:
+                        node_normals[idx].append(n)
+        
+        # 4. Compute folding angle factors with highly optimized loops
+        beta = np.ones(n_nodes) * 1e-4
+        for idx in range(n_nodes):
+            normals = node_normals[idx]
+            if len(normals) < 2:
+                continue
+            
+            min_dot = 1.0
+            n_len = len(normals)
+            for i in range(n_len):
+                for j in range(i + 1, n_len):
+                    dot = np.dot(normals[i], normals[j])
+                    if dot < min_dot:
+                        min_dot = dot
+                        
+            min_dot = max(-1.0, min(1.0, min_dot))
+            sin_val = np.sqrt(max(0.0, 1.0 - min_dot**2))
+            amplified_factor = np.tanh(15.0 * sin_val)
+            beta[idx] = 1e-4 + (1.0 - 1e-4) * amplified_factor
+            
+        return beta
+

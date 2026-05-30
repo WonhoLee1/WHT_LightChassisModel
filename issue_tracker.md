@@ -4,6 +4,8 @@
 
 ## 🛠️ 진행 중인 이슈 (Ongoing Issues)
 
+- [x] **[최적화]** JAX 강성 행렬 어셈블리 파이썬 요소 루프 완전 제거 및 fancy indexing 일괄 변환 가속 (2026-05-30)
+- [x] **[최적화]** 꺾임각(`_compute_folding_angles`) 노드별 법선 벡터 계산 및 수치 구속 penalty 계수 연산의 하이브리드 고속화 (**175ms -> 62ms**) 완료 (2026-05-30)
 - [x] **[시각화]** `wht_visualizer.py`의 기본 메시지 에지 색상을 'dark gray'로 통일 (완료)
 - [x] **[코드 가독성]** `exam2_shell_jaxSSO_load.py`의 Docstring 상세화 및 한글화 (완료)
 - [x] **[솔버]** RBE3 보간 요소(Interpolation Element) 구현 및 응력 집중 문제 완화 (2026-05-03)

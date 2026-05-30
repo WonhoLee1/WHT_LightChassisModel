@@ -324,6 +324,15 @@ class WHTVisualizer:
         self._setup_toolbar()         # Connects to list_parts
         self._setup_menubar()         # Creates pull-down menus
         
+        # Setup Mouse Query Interaction (Surgical hook)
+        self._query_label_names = []
+        if hasattr(self.plotter, "interactor") and self.plotter.interactor is not None:
+            self._orig_double_click = self.plotter.interactor.mouseDoubleClickEvent
+            self.plotter.interactor.mouseDoubleClickEvent = self._on_mouse_double_click
+            
+            self._orig_mouse_move = self.plotter.interactor.mouseMoveEvent
+            self.plotter.interactor.mouseMoveEvent = self._on_qt_mouse_move
+        
         self._is_ready = True
 
     def set_bead_discrete_levels(self, bead_steps: int) -> None:
@@ -600,8 +609,38 @@ class WHTVisualizer:
         
         group_contour.setLayout(vbox_contour)
         
+        # --- Query Tools Group (New Requirement) ---
+        group_query = QtWidgets.QGroupBox("Query Tools")
+        vbox_query = QtWidgets.QVBoxLayout()
+        vbox_query.setSpacing(2)
+        
+        self.chk_query = QtWidgets.QCheckBox("Enable Query")
+        self.chk_query.setChecked(False)
+        self.chk_query.stateChanged.connect(self._on_query_toggled)
+        self.chk_query.setToolTip("Enable cursor hover query on node/element scalars.")
+        vbox_query.addWidget(self.chk_query)
+        
+        hbox_query_target = QtWidgets.QHBoxLayout()
+        self.rad_query_node = QtWidgets.QRadioButton("Node Value")
+        self.rad_query_elem = QtWidgets.QRadioButton("Element Value")
+        self.rad_query_node.setChecked(True)
+        self.rad_query_node.toggled.connect(self._on_query_target_changed)
+        self.rad_query_elem.toggled.connect(self._on_query_target_changed)
+        hbox_query_target.addWidget(self.rad_query_node)
+        hbox_query_target.addWidget(self.rad_query_elem)
+        vbox_query.addLayout(hbox_query_target)
+        
+        self.btn_clear_labels = QtWidgets.QPushButton("Clear Labels")
+        self.btn_clear_labels.clicked.connect(self._clear_query_labels)
+        self.btn_clear_labels.setToolTip("Clear all query text labels on screen.")
+        vbox_query.addWidget(self.btn_clear_labels)
+        
+        group_query.setLayout(vbox_query)
+        # --------------------------------------------
+        
         prop_layout.addWidget(group_deform)
         prop_layout.addWidget(group_contour)
+        prop_layout.addWidget(group_query)
 
         # UI Theme Group (Disabled - Using Native Dark Mode)
         prop_layout.addStretch()
@@ -961,6 +1000,28 @@ class WHTVisualizer:
         
         theme_menu.addAction(dark_action)
         theme_menu.addAction(light_action)
+
+        # --- 메뉴바 우측 끝 WHT 프리미엄 로고 아이콘 표시 ---
+        logo_lbl = QtWidgets.QLabel()
+        logo_paths = [
+            os.path.join(os.path.dirname(__file__), "..", "resources", "logo_icon_32x32.png"),
+            os.path.join(os.path.dirname(__file__), "..", "wht_topo", "resources", "logo_icon_32x32.png"),
+            os.path.join(os.path.dirname(__file__), "resources", "logo_icon_32x32.png"),
+            os.path.join(os.path.dirname(__file__), "..", "wht_visualizer", "resources", "logo_icon_32x32.png"),
+        ]
+        logo_path = None
+        for path in logo_paths:
+            norm_p = os.path.normpath(path)
+            if os.path.exists(norm_p):
+                logo_path = norm_p
+                break
+                
+        if logo_path:
+            pix = QtGui.QPixmap(logo_path)
+            if not pix.isNull():
+                logo_lbl.setPixmap(pix.scaled(32, 32, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                logo_lbl.setContentsMargins(0, 0, 10, 0) # 우측 10px 마진 부여로 레이아웃 정합성 유지
+                menubar.setCornerWidget(logo_lbl, QtCore.Qt.TopRightCorner)
 
     # --- Toolbar Event Handlers ---
     def _on_projection_toggle(self, checked):
@@ -1863,7 +1924,7 @@ class WHTVisualizer:
         scale = self.spin_scale.value()
 
         warp_field = self.combo_warp_vec.currentText()
-        if not warp_field or warp_field not in self.result_data.point_data:
+        if not warp_field or (warp_field not in self.result_data.point_data and warp_field != "Bead_Height"):
             for name, part in self.parts.items():
                 part["mesh"].points = part["orig_pts"]
                 active_mesh = part.get("active_mesh", part["mesh"])
@@ -1879,13 +1940,52 @@ class WHTVisualizer:
             orig_ids = mesh.point_data.get('vtkOriginalPointIds')
 
             if chk:
-                disp_all = self.result_data.point_data[warp_field]
-                if self.current_timestep < len(disp_all):
-                    disp = np.nan_to_num(disp_all[self.current_timestep])
-                    mesh.points = self._warp_pts(orig_pts, disp, orig_ids, scale)
-                elif use_rigid:
-                    mesh.points = self._warp_pts(orig_pts,
-                                                 np.zeros_like(orig_pts), orig_ids, scale)
+                if warp_field == "Bead_Height":
+                    # Bead_Height에 따른 가상 변위 오프셋 계산 (스칼라 -> draw-dir [0, 0, -1] 가상 3D 변위)
+                    bh_val = None
+                    if "Bead_Height" in mesh.point_data:
+                        bh_val = mesh.point_data["Bead_Height"]
+                    elif "Bead_Height" in mesh.cell_data:
+                        try:
+                            converted = mesh.cell_data_to_point_data()
+                            if "Bead_Height" in converted.point_data:
+                                bh_val = converted.point_data["Bead_Height"]
+                        except Exception:
+                            pass
+                            
+                    if bh_val is None:
+                        # Fallback: result_data 직접 참조
+                        if self.current_timestep < len(self.result_data.point_data.get("Bead_Height", [])):
+                            raw_bh = self.result_data.point_data["Bead_Height"][self.current_timestep]
+                            if orig_ids is not None:
+                                bh_val = raw_bh[orig_ids]
+                            else:
+                                bh_val = raw_bh
+                        elif self.current_timestep < len(self.result_data.cell_data.get("Bead_Height", [])):
+                            raw_bh = self.result_data.cell_data["Bead_Height"][self.current_timestep]
+                            try:
+                                temp_mesh = mesh.copy()
+                                temp_mesh.cell_data["Bead_Height"] = raw_bh[orig_ids] if orig_ids is not None else raw_bh
+                                converted = temp_mesh.cell_data_to_point_data()
+                                bh_val = converted.point_data["Bead_Height"]
+                            except:
+                                bh_val = np.zeros(mesh.n_points)
+                        else:
+                            bh_val = np.zeros(mesh.n_points)
+                            
+                    bh_val = np.nan_to_num(bh_val)
+                    # draw-dir [0, 0, -1] 방향으로 가상 변위 벡터 생성: [0, 0, -bh]
+                    disp = np.zeros((mesh.n_points, 3))
+                    disp[:, 2] = -bh_val
+                    mesh.points = self._warp_pts(orig_pts, disp, None, scale)
+                else:
+                    disp_all = self.result_data.point_data[warp_field]
+                    if self.current_timestep < len(disp_all):
+                        disp = np.nan_to_num(disp_all[self.current_timestep])
+                        mesh.points = self._warp_pts(orig_pts, disp, orig_ids, scale)
+                    elif use_rigid:
+                        mesh.points = self._warp_pts(orig_pts,
+                                                     np.zeros_like(orig_pts), orig_ids, scale)
             elif use_rigid:
                 # Use Deform off이지만 Rigid Body on → 변형 없이 강체 변환만 적용
                 mesh.points = self._warp_pts(orig_pts,
@@ -2548,7 +2648,7 @@ class WHTVisualizer:
             
         self.combo_category.blockSignals(False)
         
-        # Populate Warp Field Selector (Discovery: All 3D point-data vectors)
+        # Populate Warp Field Selector (Discovery: All 3D point-data vectors + Bead_Height exception)
         self.combo_warp_vec.blockSignals(True)
         self.combo_warp_vec.clear()
         warp_candidates = []
@@ -2557,6 +2657,16 @@ class WHTVisualizer:
             # We filter for fields that can provide a coordinate offset.
             if data.ndim == 3 and data.shape[2] >= 3:
                 warp_candidates.append(name)
+                
+        # 만약 Bead_Height 가 point_data 나 cell_data 에 있다면 강제 후보 추가
+        has_bead = False
+        if "Bead_Height" in self.result_data.point_data:
+            has_bead = True
+        elif "Bead_Height" in self.result_data.cell_data:
+            has_bead = True
+            
+        if has_bead and "Bead_Height" not in warp_candidates:
+            warp_candidates.append("Bead_Height")
                 
         self.combo_warp_vec.addItems(sorted(warp_candidates))
         self.combo_warp_vec.blockSignals(False)
@@ -2601,6 +2711,244 @@ class WHTVisualizer:
         self.anim_timer.stop()
         if self.plotter:
             self.plotter.close()
+
+    def _on_query_toggled(self, state):
+        """Query 기능 체크/언체크 이벤트 핸들러."""
+        enabled = (state == QtCore.Qt.Checked)
+        print(f" -> [Visualizer] Query mode toggled: {enabled}")
+        if not enabled:
+            if hasattr(self.plotter, "app_window") and self.plotter.app_window:
+                sb = self.plotter.app_window.statusBar()
+                if sb:
+                    sb.clearMessage()
+
+    def _on_query_target_changed(self, toggled):
+        """Query 대상(Node / Element) 변경 이벤트 핸들러."""
+        if not self._is_ready: return
+
+    def _clear_query_labels(self):
+        """화면 상에 생성된 모든 Query 라벨 소거."""
+        if not hasattr(self, "_query_label_names") or not self._query_label_names:
+            self._query_label_names = []
+            return
+        for name in list(self._query_label_names):
+            try:
+                self.plotter.remove_actor(name)
+            except Exception:
+                pass
+        self._query_label_names.clear()
+        self.plotter.render()
+        print(" -> [Visualizer] Cleared all query labels.")
+
+    def _get_picker_result(self, pos: QtCore.QPoint):
+        """마우스 Qt 좌표를 기반으로 vtkCellPicker를 통해 3D 충돌 결과를 가져옵니다."""
+        import vtk
+        picker = vtk.vtkCellPicker()
+        picker.SetTolerance(0.005)
+        
+        interactor = self.plotter.interactor
+        if not interactor:
+            return None
+            
+        size = interactor.GetRenderWindow().GetSize()
+        x = pos.x()
+        y = size[1] - pos.y()
+        
+        renderer = self.plotter.renderer
+        picker.Pick(x, y, 0.0, renderer)
+        
+        actor = picker.GetActor()
+        if not actor:
+            return None
+            
+        return picker
+
+    def _on_qt_mouse_move(self, event):
+        """마우스 hover 시 실시간 값을 상태바에 출력하기 위한 QVTK interactor 몽키패치 핸들러."""
+        if hasattr(self, "_orig_mouse_move") and self._orig_mouse_move:
+            try:
+                self._orig_mouse_move(event)
+            except Exception:
+                pass
+            
+        if hasattr(self, "chk_query") and self.chk_query.isChecked():
+            try:
+                self._process_hover_pick(event.pos())
+            except Exception as e:
+                print(f" -> [Visualizer Query Move Error] {e}")
+
+    def _process_hover_pick(self, pos: QtCore.QPoint):
+        """Hover 쿼리 비즈니스 로직 처리."""
+        if not self._is_ready or not self.parts: return
+        picker = self._get_picker_result(pos)
+        sb = self.plotter.app_window.statusBar()
+        if not sb: return
+        
+        if not picker:
+            sb.clearMessage()
+            return
+            
+        actor = picker.GetActor()
+        found_name = None
+        found_part = None
+        for name, p in self.parts.items():
+            if p["actor"] == actor:
+                found_name = name
+                found_part = p
+                break
+                
+        if not found_part:
+            sb.clearMessage()
+            return
+            
+        mesh = found_part["mesh"]
+        field = self._get_active_field_name()
+        if not field or field == "Body Color":
+            sb.showMessage(f"[Part: {found_name}] Query active but active scalar is 'Body Color'")
+            return
+            
+        if self.rad_query_node.isChecked():
+            p_idx = picker.GetPointId()
+            if p_idx < 0 or p_idx >= mesh.n_points:
+                sb.clearMessage()
+                return
+            
+            val = 0.0
+            if field in mesh.point_data:
+                val = mesh.point_data[field][p_idx]
+            elif field in mesh.cell_data:
+                # Node Value 모드인데 필드가 cell_data에만 있는 경우: 인접 셀들의 평균 계산
+                import vtk
+                cell_ids = vtk.vtkIdList()
+                mesh.GetPointCells(p_idx, cell_ids)
+                n_cells = cell_ids.GetNumberOfIds()
+                if n_cells > 0:
+                    vals = [mesh.cell_data[field][cell_ids.GetId(i)] for i in range(n_cells) if cell_ids.GetId(i) < mesh.n_cells]
+                    val = np.mean(vals) if vals else 0.0
+            
+            orig_nids = mesh.point_data.get("vtkOriginalPointIds")
+            global_node_id = orig_nids[p_idx] if orig_nids is not None else p_idx
+            coords = mesh.points[p_idx]
+            
+            sb.showMessage(f"[Part: {found_name}] Node: {global_node_id} | Coord: ({coords[0]:.2f}, {coords[1]:.2f}, {coords[2]:.2f}) | Value: {val:.4e}")
+            
+        else:
+            c_idx = picker.GetCellId()
+            if c_idx < 0 or c_idx >= mesh.n_cells:
+                sb.clearMessage()
+                return
+                
+            val = 0.0
+            if field in mesh.cell_data:
+                val = mesh.cell_data[field][c_idx]
+            elif field in mesh.point_data:
+                cell = mesh.GetCell(c_idx)
+                pts_ids = cell.GetPointIds()
+                n_ids = pts_ids.GetNumberOfIds()
+                val = np.mean([mesh.point_data[field][pts_ids.GetId(i)] for i in range(n_ids)])
+                
+            orig_cids = mesh.cell_data.get("vtkOriginalCellIds")
+            global_cell_id = orig_cids[c_idx] if orig_cids is not None else c_idx
+            
+            sb.showMessage(f"[Part: {found_name}] Element: {global_cell_id} | Value: {val:.4e}")
+
+    def _on_mouse_double_click(self, event):
+        """마우스 더블클릭 시 3D 공간 상에 8pt 값 라벨을 생성하기 위한 QVTK interactor 몽키패치 핸들러."""
+        if hasattr(self, "_orig_double_click") and self._orig_double_click:
+            try:
+                self._orig_double_click(event)
+            except Exception:
+                pass
+            
+        if hasattr(self, "chk_query") and self.chk_query.isChecked():
+            try:
+                self._process_double_click_pick(event.pos())
+            except Exception as e:
+                print(f" -> [Visualizer Query DoubleClick Error] {e}")
+
+    def _process_double_click_pick(self, pos: QtCore.QPoint):
+        """더블클릭 쿼리 및 라벨 생성 비즈니스 로직 처리."""
+        if not self._is_ready or not self.parts: return
+        picker = self._get_picker_result(pos)
+        if not picker: return
+        
+        actor = picker.GetActor()
+        found_name = None
+        found_part = None
+        for name, p in self.parts.items():
+            if p["actor"] == actor:
+                found_name = name
+                found_part = p
+                break
+                
+        if not found_part: return
+        
+        mesh = found_part["mesh"]
+        field = self._get_active_field_name()
+        if not field or field == "Body Color": return
+        
+        pick_pos = picker.GetPickPosition()
+        
+        label_text = ""
+        unique_id = 0
+        if self.rad_query_node.isChecked():
+            p_idx = picker.GetPointId()
+            if p_idx < 0 or p_idx >= mesh.n_points: return
+            
+            val = 0.0
+            if field in mesh.point_data:
+                val = mesh.point_data[field][p_idx]
+            elif field in mesh.cell_data:
+                # Node Value 모드인데 필드가 cell_data에만 있는 경우: 인접 셀들의 평균 계산
+                import vtk
+                cell_ids = vtk.vtkIdList()
+                mesh.GetPointCells(p_idx, cell_ids)
+                n_cells = cell_ids.GetNumberOfIds()
+                if n_cells > 0:
+                    vals = [mesh.cell_data[field][cell_ids.GetId(i)] for i in range(n_cells) if cell_ids.GetId(i) < mesh.n_cells]
+                    val = np.mean(vals) if vals else 0.0
+            
+            orig_nids = mesh.point_data.get("vtkOriginalPointIds")
+            global_node_id = orig_nids[p_idx] if orig_nids is not None else p_idx
+            label_text = f"N{global_node_id}: {val:.3e}"
+            unique_id = global_node_id
+            
+        else:
+            c_idx = picker.GetCellId()
+            if c_idx < 0 or c_idx >= mesh.n_cells: return
+            
+            val = 0.0
+            if field in mesh.cell_data:
+                val = mesh.cell_data[field][c_idx]
+            elif field in mesh.point_data:
+                cell = mesh.GetCell(c_idx)
+                pts_ids = cell.GetPointIds()
+                n_ids = pts_ids.GetNumberOfIds()
+                val = np.mean([mesh.point_data[field][pts_ids.GetId(i)] for i in range(n_ids)])
+                
+            orig_cids = mesh.cell_data.get("vtkOriginalCellIds")
+            global_cell_id = orig_cids[c_idx] if orig_cids is not None else c_idx
+            label_text = f"E{global_cell_id}: {val:.3e}"
+            unique_id = global_cell_id
+            
+        if not hasattr(self, "_query_label_names") or self._query_label_names is None:
+            self._query_label_names = []
+            
+        lbl_name = f"_query_lbl_{len(self._query_label_names)}_{unique_id}"
+        
+        self.plotter.add_point_labels(
+            [pick_pos], [label_text],
+            font_size=8,
+            font_family='courier',
+            show_points=True,
+            point_color='magenta',
+            point_size=5,
+            text_color='cyan',
+            name=lbl_name
+        )
+        
+        self._query_label_names.append(lbl_name)
+        self.plotter.render()
 
 
 def export_to_wht_result(model, result):

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QSizePolicy,
     QMenu, QDialog, QFormLayout, QDialogButtonBox,
     QSplitter, QTextEdit,
+    QCheckBox, QListWidget, QDoubleSpinBox,
 )
 from PySide6.QtCore import Signal, QObject, QThread, Qt
 from PySide6.QtGui import QPixmap, QAction
@@ -52,6 +53,7 @@ except ImportError:
     # 예외 처리: 경로가 아직 유효하지 않거나 오타가 난 경우에 대비
     run_calculix_analysis = None
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
 
 plt.rcParams['font.size'] = 9
 plt.rcParams['font.family'] = 'Segoe UI'
@@ -311,23 +313,29 @@ class _CalculixReAnalysisWorker(QThread):
             aggr_dst    = init["aggr_dst"]
             orig_coords = init["orig_coords"]
 
-            # 원본 좌표 복원
-            for nid, (x, y, z) in orig_coords.items():
-                nd = model.nodes[nid]
-                nd.x, nd.y, nd.z = x, y, z
-
-            # 이터레이션 비드 높이 적용
-            if self.iter_num == 0:
+            # iter_num == -1: 이미 좌표가 외부에서 적용된 상태 (컨셉 평가 등)
+            if self.iter_num == -1:
                 h_elem = np.zeros(len(init["design_elems"]))
                 load_cases_raw = init.get("static_load_cases", [])
-                load_cases     = [(lc.name, w, lc) for lc, w in load_cases_raw]
+                load_cases = [(lc.name, w, lc) for lc, w in load_cases_raw]
             else:
-                iter_file = snap_dir / f"iter_{self.iter_num:03d}.pkl"
-                self.progress.emit(f"iter_{self.iter_num:03d}.pkl 로드 중...")
-                with open(iter_file, "rb") as f:
-                    snap = pickle.load(f)
-                h_elem = snap["h_elem"]
-                load_cases = snap.get("load_cases", [])
+                # 원본 좌표 복원
+                for nid, (x, y, z) in orig_coords.items():
+                    nd = model.nodes[nid]
+                    nd.x, nd.y, nd.z = x, y, z
+
+                # 이터레이션 비드 높이 적용
+                if self.iter_num == 0:
+                    h_elem = np.zeros(len(init["design_elems"]))
+                    load_cases_raw = init.get("static_load_cases", [])
+                    load_cases     = [(lc.name, w, lc) for lc, w in load_cases_raw]
+                else:
+                    iter_file = snap_dir / f"iter_{self.iter_num:03d}.pkl"
+                    self.progress.emit(f"iter_{self.iter_num:03d}.pkl 로드 중...")
+                    with open(iter_file, "rb") as f:
+                        snap = pickle.load(f)
+                    h_elem = snap["h_elem"]
+                    load_cases = snap.get("load_cases", [])
 
             # h_elem -> h_node
             n_int      = len(design_nids)
@@ -605,7 +613,8 @@ class _CalculixReAnalysisWorker(QThread):
 # OptiStruct .fem 내보내기
 # ────────────────────────────────────────────────────────────────────────────
 
-def _write_optistruct_fem(out_path: str, snap_dir: str, iter_num: int) -> str:
+def _write_optistruct_fem(out_path: str, snap_dir: str, iter_num: int,
+                          h_elem_override=None) -> str:
     """
     선택 이터레이션의 변형 메시 + 모든 하중 케이스를 OptiStruct .fem 파일로 저장합니다.
 
@@ -628,7 +637,11 @@ def _write_optistruct_fem(out_path: str, snap_dir: str, iter_num: int) -> str:
         nd = model.nodes[nid]
         nd.x, nd.y, nd.z = x, y, z
 
-    if iter_num == 0:
+    if h_elem_override is not None:
+        h_elem = np.asarray(h_elem_override, dtype=float)
+        load_cases_raw = init.get("static_load_cases", [])
+        load_cases     = [(lc.name, w, lc) for lc, w in load_cases_raw]
+    elif iter_num == 0:
         h_elem = np.zeros(len(init["design_elems"]))
         load_cases_raw = init.get("static_load_cases", [])
         load_cases     = [(lc.name, w, lc) for lc, w in load_cases_raw]
@@ -806,10 +819,15 @@ class WHTMonitorWindow(QMainWindow):
         self._height_colorbar = None
         self.status_label = self.stop_btn = self.top_btn = self.reset_btn = None
         self.height_slider = self.btn_prev_h = self.btn_next_h = None
+        self.height_interp_combo: "QComboBox | None" = None
+        self.height_contour_check: "QCheckBox | None" = None
+        self.height_toolbar = None
+        self.concept_tool_btn = None
         self.iter_case_combo = None   # Load Case 콤보 (Iteration Results 탭)
         self.iter_run_btn = None      # Run Analysis 버튼
         self.iter_ccx_btn = None      # Run CalculiX 버튼
-        self.iter_export_btn = None   # Export OptiStruct 버튼
+        self.iter_export_btn     = None   # Export OptiStruct 버튼
+        self.iter_export_ccx_btn = None   # Export CalculiX 버튼
         self.iter_mesh_btn = None     # Mesh View 버튼
         self.iter_status_label = None # 해석 상태 텍스트
         self._re_worker = None        # Optional[_ReAnalysisWorker]
@@ -1013,6 +1031,21 @@ class WHTMonitorWindow(QMainWindow):
                   self.height_iter_combo, self.btn_next_h,
                   QLabel("  Slider:"), self.height_slider]:
             ctrl_iter.addWidget(w)
+
+        # 보간 방식 선택
+        ctrl_iter.addWidget(QLabel("  Interp:"))
+        self.height_interp_combo = QComboBox()
+        self.height_interp_combo.addItems(["linear", "nearest"])
+        self.height_interp_combo.setFixedWidth(80)
+        self.height_interp_combo.currentIndexChanged.connect(self._update_height_plot)
+        ctrl_iter.addWidget(self.height_interp_combo)
+
+        # 등고선 표시 여부
+        self.height_contour_check = QCheckBox("Contour")
+        self.height_contour_check.setChecked(False)
+        self.height_contour_check.stateChanged.connect(self._update_height_plot)
+        ctrl_iter.addWidget(self.height_contour_check)
+
         ctrl_iter.addStretch()
         lay.addWidget(ctrl_iter_w)
 
@@ -1021,9 +1054,19 @@ class WHTMonitorWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         lay.addWidget(splitter, stretch=1)
 
-        # 상단: 높이 분포 캔버스
+        # 상단: 높이 분포 캔버스 + matplotlib toolbar
+        canvas_container = QWidget()
+        canvas_vlay = QVBoxLayout(canvas_container)
+        canvas_vlay.setContentsMargins(0, 0, 0, 0)
+        canvas_vlay.setSpacing(0)
         self.height_canvas = PlotCanvas(tab)
-        splitter.addWidget(self.height_canvas)
+        self.height_toolbar = NavigationToolbar(self.height_canvas, canvas_container)
+        from PySide6.QtCore import QSize
+        _sz = self.height_toolbar.iconSize()
+        self.height_toolbar.setIconSize(QSize(int(_sz.width() * 0.6), int(_sz.height() * 0.6)))
+        canvas_vlay.addWidget(self.height_toolbar)
+        canvas_vlay.addWidget(self.height_canvas)
+        splitter.addWidget(canvas_container)
 
         # 하단: 버튼 + 상태창
         bottom_widget = QWidget()
@@ -1064,17 +1107,30 @@ class WHTMonitorWindow(QMainWindow):
         self.iter_ccx_btn.clicked.connect(self._on_run_calculix)
         ctrl_action.addWidget(self.iter_ccx_btn)
 
-        self.iter_export_btn = QPushButton("Export OptiStruct .fem")
+        self.iter_export_btn = QPushButton("Export OptiStruct")
         self.iter_export_btn.setStyleSheet("font-weight:bold;")
         self.iter_export_btn.setToolTip("선택 이터레이션의 변형 메시 + 하중 케이스를 .fem 파일로 저장")
         self.iter_export_btn.clicked.connect(self._on_export_optistruct)
         ctrl_action.addWidget(self.iter_export_btn)
+
+        self.iter_export_ccx_btn = QPushButton("Export CalculiX")
+        self.iter_export_ccx_btn.setStyleSheet("font-weight:bold;")
+        self.iter_export_ccx_btn.setToolTip("선택 이터레이션의 변형 메시를 CalculiX .inp 파일로 저장")
+        self.iter_export_ccx_btn.clicked.connect(self._on_export_calculix)
+        ctrl_action.addWidget(self.iter_export_ccx_btn)
 
         ctrl_action.addWidget(QLabel("  뷰어:"))
         self.viewer_combo = QComboBox()
         self.viewer_combo.addItems(["WHTVisualizer", "ParaView"])
         self.viewer_combo.setToolTip("해석 결과 표시 방식 선택\nWHTVisualizer: PyVista 내장 뷰어\nParaView: VTKHDF 내보내기 후 ParaView 실행")
         ctrl_action.addWidget(self.viewer_combo)
+
+        self.concept_tool_btn = QPushButton("Concept Tool")
+        self.concept_tool_btn.setStyleSheet(
+            "font-weight:bold; background:#4a235a; color:white;")
+        self.concept_tool_btn.setToolTip("현재 비드 상태 위에 직접 비드를 그려 FEA 평가")
+        self.concept_tool_btn.clicked.connect(self._on_concept_tool)
+        ctrl_action.addWidget(self.concept_tool_btn)
 
         ctrl_action.addStretch()
         bottom_lay.addWidget(ctrl_widget)
@@ -1636,12 +1692,16 @@ class WHTMonitorWindow(QMainWindow):
         from scipy.interpolate import griddata
         from matplotlib.colors import BoundaryNorm
         from matplotlib import cm
+        interp_method = (self.height_interp_combo.currentText()
+                         if self.height_interp_combo else "linear")
+        show_contour  = (self.height_contour_check.isChecked()
+                         if self.height_contour_check else False)
         # 격자 해상도: 요소 수에 비례, 최소 64 — 흐릿함 방지
         n_grid = max(64, int(len(x) ** 0.5) * 3)
         xi = np.linspace(x.min(), x.max(), n_grid)
         yi = np.linspace(y.min(), y.max(), n_grid)
         Xi, Yi = np.meshgrid(xi, yi)
-        Zi = griddata((x, y), heights, (Xi, Yi), method='linear')
+        Zi = griddata((x, y), heights, (Xi, Yi), method=interp_method)
         Zi_near = griddata((x, y), heights, (Xi, Yi), method='nearest')
         Zi = np.where(np.isnan(Zi), Zi_near, Zi)
         Zi = np.clip(Zi, -h_max, h_max)   # 보간 아티팩트가 범위 밖으로 나가지 않도록
@@ -1665,6 +1725,10 @@ class WHTMonitorWindow(QMainWindow):
             cmap=cmap_disc, norm=norm,
             interpolation='nearest',
         )
+
+        if show_contour:
+            ax.contour(Xi, Yi, Zi, levels=full_levels,
+                       colors='k', linewidths=0.5, alpha=0.6)
 
         _cb_label = "Bead Height (mm)  [+: outward / −: inward]"
 
@@ -1698,6 +1762,22 @@ class WHTMonitorWindow(QMainWindow):
             self.iter_status_label.verticalScrollBar().setValue(
                 self.iter_status_label.verticalScrollBar().maximum()
             )
+
+    def _update_iter_status_white(self, msg: str):
+        self._set_iter_status(msg, "white")
+        
+    def _update_iter_status_blue(self, msg: str):
+        self._set_iter_status(msg, "blue")
+
+    def _on_mesh_worker_finished(self, rd):
+        iter_num = self._get_selected_iter_num()
+        self._set_iter_status(f"Iter {iter_num} 메시 표시 중...", "blue")
+        self._open_visualizer(rd, f"Mesh View — Iter {iter_num}")
+        self._set_iter_status(f"Iter {iter_num} 메시 표시 완료", "#2a7a2a")
+
+    def _on_mesh_worker_error(self, msg: str):
+        self._set_iter_status(f"오류: {msg[:80]}", "red")
+        QMessageBox.critical(self, "Mesh View 오류", msg[:400])
 
     def _get_selected_iter_num(self) -> int:
         """height_iter_combo 현재 선택 이터레이션 번호 반환 (Latest → 최신 snap의 iter)."""
@@ -1797,15 +1877,8 @@ class WHTMonitorWindow(QMainWindow):
                     self.error.emit(traceback.format_exc())
 
         worker = _MeshWorker(self.snap_dir, iter_num)
-        worker.finished.connect(lambda rd: (
-            self._set_iter_status(f"Iter {iter_num} 메시 표시 중...", "blue"),
-            self._open_visualizer(rd, f"Mesh View — Iter {iter_num}"),
-            self._set_iter_status(f"Iter {iter_num} 메시 표시 완료", "#2a7a2a"),
-        ))
-        worker.error.connect(lambda msg: (
-            self._set_iter_status(f"오류: {msg[:80]}", "red"),
-            QMessageBox.critical(self, "Mesh View 오류", msg[:400]),
-        ))
+        worker.finished.connect(self._on_mesh_worker_finished)
+        worker.error.connect(self._on_mesh_worker_error)
         worker.start()
         self._re_worker = worker   # GC 방지
 
@@ -1826,7 +1899,7 @@ class WHTMonitorWindow(QMainWindow):
 
         self._re_worker = _CalculixReAnalysisWorker(self.snap_dir, iter_num, case_name,
                                                    num_modal_modes=self.num_modal_modes)
-        self._re_worker.progress.connect(lambda msg: self._set_iter_status(msg, "white"))
+        self._re_worker.progress.connect(self._update_iter_status_white)
         self._re_worker.finished.connect(self._on_calculix_analysis_finished)
         self._re_worker.error.connect(self._on_calculix_analysis_error)
         self._re_worker.start()
@@ -1864,6 +1937,19 @@ class WHTMonitorWindow(QMainWindow):
         self._set_iter_status(f"CCX 오류: {msg[:120]}", "red")
         QMessageBox.critical(self, "CalculiX 해석 오류", msg[:400])
 
+    def _on_concept_tool(self):
+        if not self.height_snapshots:
+            QMessageBox.information(self, "Concept Tool",
+                                    "먼저 최적화를 실행하여 비드 결과가 생성된 후 사용 가능합니다.")
+            return
+        snap = self._get_snap(self.height_iter_combo)
+        if snap is None:
+            return
+        cases = [self.iter_case_combo.itemText(i)
+                 for i in range(self.iter_case_combo.count())]
+        dlg = BeadConceptDialog(snap, self.snap_dir, cases, parent=self)
+        dlg.show()
+
     def _on_run_analysis(self):
         if not self.snap_dir:
             QMessageBox.warning(self, "경고", "스냅샷 디렉토리가 아직 수신되지 않았습니다.\n최적화가 시작되면 재시도하세요.")
@@ -1883,7 +1969,7 @@ class WHTMonitorWindow(QMainWindow):
 
         self._re_worker = _ReAnalysisWorker(self.snap_dir, iter_num, case_name,
                                              num_modal_modes=self.num_modal_modes)
-        self._re_worker.progress.connect(lambda msg: self._set_iter_status(msg, "blue"))
+        self._re_worker.progress.connect(self._update_iter_status_blue)
         self._re_worker.finished.connect(self._on_analysis_finished)
         self._re_worker.error.connect(self._on_analysis_error)
         self._re_worker.start()
@@ -1981,6 +2067,31 @@ class WHTMonitorWindow(QMainWindow):
             self._set_iter_status(f"저장 오류: {str(e)[:80]}", "red")
             QMessageBox.critical(self, "내보내기 오류", err[:400])
 
+    def _on_export_calculix(self):
+        """선택 이터레이션 → CalculiX .inp 내보내기 (Run CalculiX 재활용)."""
+        if not self.snap_dir:
+            QMessageBox.warning(self, "경고", "스냅샷 디렉토리가 아직 수신되지 않았습니다.")
+            return
+        if self._re_worker and self._re_worker.isRunning():
+            QMessageBox.information(self, "실행 중", "이전 해석이 아직 실행 중입니다.")
+            return
+        iter_num  = self._get_selected_iter_num()
+        case_name = self.iter_case_combo.currentText() if self.iter_case_combo else "Modal Analysis"
+        self._set_iter_status(
+            f"CalculiX Export [Iter {iter_num} / {case_name}] 실행 중...", "blue")
+        if self.iter_export_ccx_btn:
+            self.iter_export_ccx_btn.setEnabled(False)
+        self._re_worker = _CalculixReAnalysisWorker(
+            self.snap_dir, iter_num, case_name,
+            num_modal_modes=self.num_modal_modes)
+        self._re_worker.progress.connect(self._update_iter_status_white)
+        self._re_worker.finished.connect(self._on_calculix_analysis_finished)
+        self._re_worker.error.connect(self._on_calculix_analysis_error)
+        self._re_worker.finished.connect(
+            lambda _: (self.iter_export_ccx_btn.setEnabled(True)
+                       if self.iter_export_ccx_btn else None))
+        self._re_worker.start()
+
     # ────────────────────────────────────────────────────────────────────────
     # 헬퍼
     # ────────────────────────────────────────────────────────────────────────
@@ -2006,6 +2117,779 @@ class WHTMonitorWindow(QMainWindow):
 
 class MonitorDataHandler(QObject):
     data_received = Signal(dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bead Concept Evaluation Tool — 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _seg_dist_arr(xs, ys, ax, ay, bx, by):
+    """(N,) 점 배열과 선분 (ax,ay)-(bx,by) 사이 최소 거리."""
+    dx, dy = bx - ax, by - ay
+    l2 = dx*dx + dy*dy
+    if l2 < 1e-12:
+        return np.hypot(xs - ax, ys - ay)
+    t = np.clip(((xs - ax)*dx + (ys - ay)*dy) / l2, 0.0, 1.0)
+    return np.hypot(xs - ax - t*dx, ys - ay - t*dy)
+
+
+def _shape_mask(coords2d, shape):
+    """도형 안에 드는 요소 도심 Boolean 마스크 반환."""
+    xs, ys = coords2d[:, 0], coords2d[:, 1]
+    pts = shape["pts"]; w = shape["width"]; t = shape["type"]
+    x1, y1 = pts[0]; x2, y2 = pts[1]
+
+    if t == "Line":
+        return _seg_dist_arr(xs, ys, x1, y1, x2, y2) < w / 2.0
+
+    elif t in ("Filled Rect", "Outline Rect"):
+        xlo, xhi = min(x1, x2), max(x1, x2)
+        ylo, yhi = min(y1, y2), max(y1, y2)
+        outer = (xs >= xlo) & (xs <= xhi) & (ys >= ylo) & (ys <= yhi)
+        if t == "Filled Rect":
+            return outer
+        xlo_i, xhi_i, ylo_i, yhi_i = xlo+w, xhi-w, ylo+w, yhi-w
+        if xlo_i >= xhi_i or ylo_i >= yhi_i:
+            return outer
+        inner = (xs >= xlo_i) & (xs <= xhi_i) & (ys >= ylo_i) & (ys <= yhi_i)
+        return outer & ~inner
+
+    elif t in ("Filled Circle", "Outline Circle"):
+        r = np.hypot(x2 - x1, y2 - y1)
+        d = np.hypot(xs - x1, ys - y1)
+        if t == "Filled Circle":
+            return d < r
+        return (d >= r - w/2) & (d < r + w/2)
+
+    return np.zeros(len(xs), dtype=bool)
+
+
+def _add_shape_artist(ax, shape_type, p1, p2, width, color, alpha=0.6):
+    """ax에 도형 아티스트를 추가하고 반환."""
+    import matplotlib.patches as mp
+    x1, y1 = p1; x2, y2 = p2
+    if shape_type == "Line":
+        lw = max(1.0, width / 8.0)
+        art, = ax.plot([x1, x2], [y1, y2], '-', color=color, alpha=alpha, linewidth=lw)
+        return art
+    elif shape_type == "Filled Rect":
+        xlo, xhi = min(x1,x2), max(x1,x2); ylo, yhi = min(y1,y2), max(y1,y2)
+        art = mp.Rectangle((xlo,ylo), xhi-xlo, yhi-ylo,
+                            linewidth=0, edgecolor='none', facecolor=color, alpha=alpha)
+        ax.add_patch(art); return art
+    elif shape_type == "Outline Rect":
+        xlo, xhi = min(x1,x2), max(x1,x2); ylo, yhi = min(y1,y2), max(y1,y2)
+        lw = max(1.5, width / 5.0)
+        art = mp.Rectangle((xlo,ylo), xhi-xlo, yhi-ylo,
+                            linewidth=lw, edgecolor=color, facecolor='none', alpha=alpha)
+        ax.add_patch(art); return art
+    elif shape_type == "Filled Circle":
+        r = np.hypot(x2-x1, y2-y1)
+        art = mp.Circle((x1,y1), r, linewidth=0, edgecolor='none', facecolor=color, alpha=alpha)
+        ax.add_patch(art); return art
+    elif shape_type == "Outline Circle":
+        r = np.hypot(x2-x1, y2-y1); lw = max(1.5, width/5.0)
+        art = mp.Circle((x1,y1), r, linewidth=lw, edgecolor=color, facecolor='none', alpha=alpha)
+        ax.add_patch(art); return art
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BeadConceptEvalWorker
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BeadConceptEvalWorker(QThread):
+    """개념 비드 높이 배열을 받아 FEA 해석 후 iter 0 대비 % 결과를 반환."""
+    finished = Signal(list)
+    error    = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, snap_dir: str, h_concept, case_names: list, parent=None):
+        super().__init__(parent)
+        self.snap_dir  = snap_dir
+        self.h_concept = h_concept
+        self.cases     = case_names
+
+    def run(self):
+        try:
+            import numpy as np
+            from pathlib import Path
+            snap_dir = Path(self.snap_dir)
+
+            self.progress.emit("init.pkl 로드 중...")
+            with open(snap_dir / "init.pkl", "rb") as f:
+                init = pickle.load(f)
+
+            model       = init["model"]
+            bead_dir    = np.array(init["bead_dir"])
+            design_nids = init["design_nids"]
+            aggr_src    = init["aggr_src"]
+            aggr_dst    = init["aggr_dst"]
+            orig_coords = init["orig_coords"]
+            static_lcs  = init.get("static_load_cases", [])
+
+            def _apply(h_elem):
+                for nid, (x, y, z) in orig_coords.items():
+                    nd = model.nodes[nid]; nd.x, nd.y, nd.z = x, y, z
+                n_int = len(design_nids)
+                hs = np.zeros(n_int)
+                np.add.at(hs, aggr_src, h_elem[aggr_dst])
+                adj = np.bincount(aggr_src, minlength=n_int)
+                hn = hs / (adj + 1e-12)
+                for i, nid in enumerate(design_nids):
+                    ox, oy, oz = orig_coords[nid]; nd = model.nodes[nid]
+                    nd.x = ox + float(hn[i])*bead_dir[0]
+                    nd.y = oy + float(hn[i])*bead_dir[1]
+                    nd.z = oz + float(hn[i])*bead_dir[2]
+
+            from wht_solver.wht_solver import WHTSolver
+
+            # iter 0 기준 해석
+            self.progress.emit("기준(iter 0) 해석 중...")
+            _apply(np.zeros(len(self.h_concept)))
+            fea0 = WHTSolver(model)
+            baselines = {}
+            for case in self.cases:
+                if case == "Modal Analysis":
+                    r0 = fea0.solve_modal(num_modes=20)
+                    baselines[case] = ("modal", r0.frequencies[0] if len(r0.frequencies) > 0 else 1e-6)
+                else:
+                    lc0 = next((lc for lc, _ in static_lcs if lc.name == case), None)
+                    if lc0:
+                        r0 = fea0.solve_static(lc0)
+                        u0 = np.max(np.abs(np.array(r0.node_displacements)[:, :3]))
+                        baselines[case] = ("static", float(u0))
+
+            # 개념 비드 해석
+            self.progress.emit("개념 비드 해석 중...")
+            _apply(self.h_concept)
+            fea = WHTSolver(model)
+            results = []
+            for case in self.cases:
+                self.progress.emit(f"해석: {case}")
+                try:
+                    if case == "Modal Analysis":
+                        r  = fea.solve_modal(num_modes=20)
+                        freqs = list(r.frequencies) if len(r.frequencies) > 0 else []
+                        f1 = freqs[0] if freqs else 0.0
+                        b_entry = baselines.get(case)
+                        if b_entry is None:
+                            results.append({"type":"error","case":case,"msg":"iter0 기준값 계산 실패"}); continue
+                        b = b_entry[1]
+                        # effective mass
+                        eff_mass_data = None
+                        try:
+                            eff_mass, total_mass = r.calculate_effective_mass()
+                            if eff_mass is not None:
+                                eff_mass_data = {"eff_mass": eff_mass, "total_mass": total_mass}
+                        except Exception:
+                            pass
+                        # WHTResultData for visualizer
+                        rd = None
+                        try:
+                            from wht_converter.wht_adapters import JaxSSOAdapter
+                            from wht_converter.wht_exporters import WHTMetadata
+                            meta = WHTMetadata(solver_name="WHT-Concept", solver_version="1.0",
+                                              analysis_type="modal", coordinate_system="cartesian",
+                                              unit_length="mm", unit_force="N")
+                            rd = r.to_wht_result_data(meta, model)
+                        except Exception:
+                            pass
+                        results.append({"type":"modal","case":case,"f1":f1,"freqs":freqs,
+                                        "base":b,"delta_pct":(f1/(b+1e-12)-1)*100,
+                                        "eff_mass_data":eff_mass_data,"wht_result_data":rd})
+                    else:
+                        lc = next((l for l, _ in static_lcs if l.name == case), None)
+                        if lc is None:
+                            results.append({"type":"error","case":case,"msg":"하중케이스 없음"}); continue
+                        r    = fea.solve_static(lc)
+                        umax = float(np.max(np.abs(np.array(r.node_displacements)[:, :3])))
+                        b_entry = baselines.get(case)
+                        if b_entry is None:
+                            results.append({"type":"error","case":case,"msg":"iter0 기준값 계산 실패"}); continue
+                        b = b_entry[1]
+                        rd = None
+                        try:
+                            from wht_converter.wht_exporters import WHTMetadata
+                            meta = WHTMetadata(solver_name="WHT-Concept", solver_version="1.0",
+                                              analysis_type="static", coordinate_system="cartesian",
+                                              unit_length="mm", unit_force="N")
+                            rd = r.to_wht_result_data(meta, model)
+                        except Exception:
+                            pass
+                        results.append({"type":"static","case":case,"u_max":umax,"base":b,
+                                        "delta_pct":(umax/(b+1e-12)-1)*100,
+                                        "wht_result_data":rd})
+                except Exception as e:
+                    results.append({"type":"error","case":case,"msg":str(e)})
+
+            self.finished.emit(results)
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _ConceptCcxWorker — CalculiX 해석 (컨셉 비드 높이 적용)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ConceptCcxWorker(QThread):
+    """컨셉 비드 높이를 적용한 후 CalculiX 해석을 실행합니다."""
+    finished = Signal(dict)
+    error    = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, snap_dir: str, h_concept, case_name: str, parent=None):
+        super().__init__(parent)
+        self.snap_dir  = snap_dir
+        self.h_concept = h_concept
+        self.case_name = case_name
+
+    def run(self):
+        try:
+            import numpy as np
+            from pathlib import Path
+            snap_dir = Path(self.snap_dir)
+
+            self.progress.emit("init.pkl 로드 중...")
+            with open(snap_dir / "init.pkl", "rb") as f:
+                init = pickle.load(f)
+
+            model       = init["model"]
+            bead_dir    = np.array(init["bead_dir"])
+            design_nids = init["design_nids"]
+            aggr_src    = init["aggr_src"]
+            aggr_dst    = init["aggr_dst"]
+            orig_coords = init["orig_coords"]
+
+            # 원본 좌표 복원 + 컨셉 비드 높이 적용
+            for nid, (x, y, z) in orig_coords.items():
+                nd = model.nodes[nid]; nd.x, nd.y, nd.z = x, y, z
+            n_int = len(design_nids)
+            hs = np.zeros(n_int)
+            np.add.at(hs, aggr_src, self.h_concept[aggr_dst])
+            adj = np.bincount(aggr_src, minlength=n_int)
+            hn = hs / (adj + 1e-12)
+            for i, nid in enumerate(design_nids):
+                ox, oy, oz = orig_coords[nid]; nd = model.nodes[nid]
+                nd.x = ox + float(hn[i]) * bead_dir[0]
+                nd.y = oy + float(hn[i]) * bead_dir[1]
+                nd.z = oz + float(hn[i]) * bead_dir[2]
+
+            # _CalculixReAnalysisWorker 의 내부 run() 로직을 직접 호출
+            ccx_worker = _CalculixReAnalysisWorker(
+                str(snap_dir), 0, self.case_name)
+            ccx_worker._model_override = model   # 이미 좌표 적용된 모델 주입
+
+            # _CalculixReAnalysisWorker 의 run 을 직접 실행 (모델은 이미 변형됨)
+            # iter_num=0 → h_elem=0 경로로 진입하지만 model은 이미 mutated 상태
+            # → 좌표 복원/재적용 대신 현재 좌표를 그대로 사용
+            ccx_worker.snap_dir  = str(snap_dir)
+            ccx_worker.iter_num  = -1           # 특수값: 좌표 복원 스킵
+
+            # 시그널 연결 후 동기 실행
+            _result_holder = []
+            _error_holder  = []
+            ccx_worker.finished.connect(lambda r: _result_holder.append(r))
+            ccx_worker.error.connect(lambda e: _error_holder.append(e))
+            ccx_worker.progress.connect(self.progress.emit)
+            ccx_worker.run()   # 동기 실행 (이미 별도 QThread 내)
+
+            if _error_holder:
+                self.error.emit(_error_holder[0]); return
+            if _result_holder:
+                self.finished.emit(_result_holder[0])
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bead Concept Dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BeadConceptDialog(QDialog):
+    """비드 컨셉 평가 도구 — 비드를 직접 그려 FEA 평가."""
+
+    _SHAPE_TYPES = ["Line", "Filled Rect", "Outline Rect", "Filled Circle", "Outline Circle"]
+
+    def __init__(self, snap: dict, snap_dir: str, load_cases: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bead Concept Evaluation Tool")
+        self.resize(1100, 720)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
+
+        self.snap       = snap
+        self.snap_dir   = snap_dir
+        self.load_cases = load_cases if load_cases else ["Modal Analysis"]
+
+        self._shapes: list   = []       # 그려진 도형 목록
+        self._pts_buf: list  = []       # 현재 진행 중 점 버퍼
+        self._preview: list  = []       # preview matplotlib 아티스트
+        self._cid_press = self._cid_move = None
+        self._worker: "BeadConceptEvalWorker | None" = None
+        self._shape_id_counter = 0
+
+        self._build_ui()
+        self._refresh_canvas()
+
+    # ── UI 구성 ─────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        from PySide6.QtCore import QSize as _QS
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6); root.setSpacing(4)
+
+        # ── 상단: 도형 컨트롤 행 ──────────────────────────────────────────
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Shape:"))
+        self._shape_combo = QComboBox()
+        self._shape_combo.addItems(self._SHAPE_TYPES)
+        self._shape_combo.setFixedWidth(130)
+        top.addWidget(self._shape_combo)
+
+        top.addWidget(QLabel("  Width(mm):"))
+        self._width_spin = QDoubleSpinBox()
+        self._width_spin.setRange(1.0, 1000.0); self._width_spin.setValue(30.0)
+        self._width_spin.setDecimals(1); self._width_spin.setFixedWidth(72)
+        top.addWidget(self._width_spin)
+
+        top.addWidget(QLabel("  Bead H(mm):"))
+        self._bead_h_spin = QDoubleSpinBox()
+        self._bead_h_spin.setRange(-200.0, 200.0); self._bead_h_spin.setValue(-10.0)
+        self._bead_h_spin.setDecimals(1); self._bead_h_spin.setFixedWidth(72)
+        top.addWidget(self._bead_h_spin)
+
+        self._draw_btn = QPushButton("Draw Mode: OFF")
+        self._draw_btn.setCheckable(True)
+        self._draw_btn.setStyleSheet("font-weight:bold; padding:3px 10px;")
+        self._draw_btn.toggled.connect(self._on_draw_toggled)
+        top.addWidget(self._draw_btn)
+
+        top.addWidget(QLabel("  [1st click → start  /  2nd click → commit]"))
+        top.addStretch()
+        root.addLayout(top)
+
+        # ── 메인 영역 + 메시지 패널 (QSplitter) ─────────────────────────
+        self._outer_splitter = QSplitter(Qt.Vertical)
+        self._outer_splitter.setChildrenCollapsible(False)
+        root.addWidget(self._outer_splitter, stretch=1)
+
+        # 메인 컨텐츠 위젯
+        main_w = QWidget()
+        main_lay = QVBoxLayout(main_w)
+        main_lay.setContentsMargins(0, 0, 0, 0); main_lay.setSpacing(4)
+
+        # 중앙: 도형 리스트(좌) + 캔버스(우)
+        center = QHBoxLayout(); center.setSpacing(6)
+
+        left = QVBoxLayout(); left.setSpacing(4)
+        left.addWidget(QLabel("Shapes:"))
+        self._shape_list = QListWidget()
+        self._shape_list.setFixedWidth(210)
+        self._shape_list.setToolTip("클릭으로 선택 → 캔버스에 하이라이트 / Delete 버튼으로 제거")
+        self._shape_list.currentRowChanged.connect(lambda _: self._refresh_canvas())
+        left.addWidget(self._shape_list, stretch=1)
+        btn_row = QHBoxLayout()
+        del_btn = QPushButton("Delete"); del_btn.clicked.connect(self._on_delete)
+        clr_btn = QPushButton("Clear All"); clr_btn.clicked.connect(self._on_clear)
+        btn_row.addWidget(del_btn); btn_row.addWidget(clr_btn)
+        left.addLayout(btn_row)
+        center.addLayout(left)
+
+        cw = QWidget(); cv = QVBoxLayout(cw); cv.setContentsMargins(0,0,0,0); cv.setSpacing(0)
+        self._canvas = PlotCanvas(cw, width=8, height=5)
+        tb = NavigationToolbar(self._canvas, cw)
+        _s = tb.iconSize()
+        tb.setIconSize(_QS(int(_s.width()*0.6), int(_s.height()*0.6)))
+        cv.addWidget(tb); cv.addWidget(self._canvas)
+        center.addWidget(cw, stretch=1)
+        main_lay.addLayout(center, stretch=1)
+
+        # 하단 버튼 행
+        bot = QHBoxLayout(); bot.setSpacing(6)
+
+        bot.addWidget(QLabel("Case:"))
+        self._case_combo = QComboBox()
+        self._case_combo.addItems(self.load_cases)
+        self._case_combo.setMinimumWidth(150)
+        bot.addWidget(self._case_combo)
+
+        ev_btn = QPushButton("Evaluate")
+        ev_btn.setStyleSheet("font-weight:bold; background:#1e5f2f; color:white;")
+        ev_btn.clicked.connect(self._on_eval_one)
+        bot.addWidget(ev_btn)
+
+        ev_all_btn = QPushButton("Evaluate All")
+        ev_all_btn.setStyleSheet("font-weight:bold; background:#1e3d59; color:white;")
+        ev_all_btn.clicked.connect(self._on_eval_all)
+        bot.addWidget(ev_all_btn)
+
+        bot.addWidget(QLabel("  Viewer:"))
+        self._viewer_combo = QComboBox()
+        self._viewer_combo.addItems(["WHTVisualizer", "ParaView"])
+        self._viewer_combo.setFixedWidth(110)
+        bot.addWidget(self._viewer_combo)
+
+        exp_os_btn = QPushButton("Export OptiStruct")
+        exp_os_btn.setStyleSheet("font-weight:bold;")
+        exp_os_btn.setToolTip("현재 컨셉 비드 형상을 OptiStruct .fem으로 내보내기")
+        exp_os_btn.clicked.connect(self._on_export_optistruct)
+        bot.addWidget(exp_os_btn)
+
+        exp_ccx_btn = QPushButton("Run CalculiX")
+        exp_ccx_btn.setStyleSheet("font-weight:bold; background:#1e3d59; color:white;")
+        exp_ccx_btn.setToolTip("현재 컨셉 비드 형상으로 CalculiX 해석 실행")
+        exp_ccx_btn.clicked.connect(self._on_run_ccx)
+        bot.addWidget(exp_ccx_btn)
+
+        self._status_lbl = QLabel("준비")
+        self._status_lbl.setStyleSheet("color:#aaa; font-size:10px;")
+        bot.addWidget(self._status_lbl)
+        bot.addStretch()
+
+        # 패널 방향 전환 버튼
+        dock_btn = QPushButton("⇔")
+        dock_btn.setFixedWidth(28)
+        dock_btn.setToolTip("메시지 패널을 우측/하단으로 전환")
+        dock_btn.clicked.connect(self._toggle_panel_orientation)
+        bot.addWidget(dock_btn)
+
+        close_btn = QPushButton("Close"); close_btn.clicked.connect(self.close)
+        bot.addWidget(close_btn)
+
+        bot_w = QWidget(); bot_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        bot_w.setLayout(bot)
+        main_lay.addWidget(bot_w)
+        self._outer_splitter.addWidget(main_w)
+
+        # 메시지 패널
+        self._msg_panel = QTextEdit()
+        self._msg_panel.setReadOnly(True)
+        self._msg_panel.setStyleSheet(
+            "font-family:'Consolas',monospace; font-size:10px;"
+            "background:#111; color:#ccc; border:none;")
+        self._msg_panel.setMinimumHeight(60)
+        self._outer_splitter.addWidget(self._msg_panel)
+        self._outer_splitter.setSizes([580, 120])
+
+    # ── 메시지 패널 ──────────────────────────────────────────────────────────
+
+    def _log(self, msg: str, color: str = "#ccc"):
+        html = f'<span style="color:{color};">{msg}</span>'
+        self._msg_panel.append(html)
+        self._msg_panel.verticalScrollBar().setValue(
+            self._msg_panel.verticalScrollBar().maximum())
+        self._status_lbl.setText(msg[:80])
+
+    def _toggle_panel_orientation(self):
+        cur = self._outer_splitter.orientation()
+        new_o = Qt.Horizontal if cur == Qt.Vertical else Qt.Vertical
+        self._outer_splitter.setOrientation(new_o)
+
+    # ── Visualizer 호출 ──────────────────────────────────────────────────────
+
+    def _open_result_in_viewer(self, rd, title: str):
+        use_pv = self._viewer_combo.currentText() == "ParaView"
+        try:
+            if use_pv:
+                import tempfile, re as _re
+                from wht_converter.wht_exporters import VTKHDFExporter
+                from wht_visualizer.wht_visualizer import launch_paraview
+                safe = _re.sub(r'[^\w\-]', '_', title)[:48]
+                tmp = Path(tempfile.mkdtemp(prefix="wht_pv_")) / f"{safe}.hdf"
+                VTKHDFExporter().export(rd, str(tmp))
+                launch_paraview(str(tmp))
+                self._log(f"ParaView 실행: {tmp}", "#2a7a2a")
+            else:
+                from wht_visualizer.wht_visualizer import WHTVisualizer
+                vis = WHTVisualizer(title=title, show=True)
+                vis.show_result(rd)
+                self._vis_ref = vis
+                self._log(f"WHTVisualizer: {title}", "#2a7a2a")
+        except Exception:
+            self._log(f"Visualizer 오류: {traceback.format_exc().splitlines()[-1]}", "#f55")
+
+    # ── Export / CCX ─────────────────────────────────────────────────────────
+
+    def _on_export_optistruct(self):
+        if not self.snap_dir:
+            QMessageBox.warning(self, "오류", "snap_dir가 설정되지 않았습니다."); return
+        h_concept = self._compute_heights()
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "OptiStruct .fem 저장", "concept_bead.fem",
+            "OptiStruct FEM (*.fem);;All Files (*)")
+        if not out_path:
+            return
+        try:
+            result = _write_optistruct_fem(out_path, self.snap_dir, 0,
+                                           h_elem_override=h_concept)
+            self._log(f"OptiStruct 저장: {result}", "#2a7a2a")
+        except Exception:
+            self._log(f"저장 오류: {traceback.format_exc().splitlines()[-1]}", "#f55")
+
+    def _on_run_ccx(self):
+        if not self.snap_dir:
+            QMessageBox.warning(self, "오류", "snap_dir가 설정되지 않았습니다."); return
+        if hasattr(self, '_ccx_worker') and self._ccx_worker and self._ccx_worker.isRunning():
+            QMessageBox.information(self, "실행 중", "CalculiX 해석이 진행 중입니다."); return
+        case = self._case_combo.currentText()
+        h_concept = self._compute_heights()
+        self._log(f"CalculiX 해석 시작: {case}", "#6af")
+        self._ccx_worker = _ConceptCcxWorker(
+            self.snap_dir, h_concept, case, parent=self)
+        self._ccx_worker.progress.connect(lambda m: self._log(m, "#aaa"))
+        self._ccx_worker.finished.connect(self._on_ccx_done)
+        self._ccx_worker.error.connect(lambda e: self._log(f"CCX 오류: {e[:200]}", "#f55"))
+        self._ccx_worker.start()
+
+    def _on_ccx_done(self, result: dict):
+        rd  = result.get("wht_result_data")
+        rtype = result.get("type", "")
+        if rtype == "modal":
+            freqs = [float(f) for f in rd.time_values]
+            self._log("CCX 모달: " + "  ".join(f"f{i+1}={f:.2f}Hz"
+                                               for i, f in enumerate(freqs[:10])), "#2a7a2a")
+        else:
+            disp = rd.point_data.get("Displacement", [None])[0]
+            if disp is not None:
+                umax = float(np.max(np.abs(np.array(disp)[:, :3])))
+                self._log(f"CCX {result.get('lc_name','')}: Max|U|={umax:.4f} mm", "#2a7a2a")
+        if rd:
+            self._open_result_in_viewer(rd, f"CCX Concept — {result.get('lc_name','Modal')}")
+
+    # ── 도형 그리기 ─────────────────────────────────────────────────────────
+
+
+    def _on_draw_toggled(self, on):
+        self._draw_btn.setText(f"Draw Mode: {'ON' if on else 'OFF'}")
+        self._pts_buf.clear(); self._clear_preview()
+        if on:
+            self._cid_press = self._canvas.mpl_connect('button_press_event', self._on_press)
+            self._cid_move  = self._canvas.mpl_connect('motion_notify_event', self._on_move)
+        else:
+            if self._cid_press: self._canvas.mpl_disconnect(self._cid_press); self._cid_press = None
+            if self._cid_move:  self._canvas.mpl_disconnect(self._cid_move);  self._cid_move  = None
+        self._canvas.draw()
+
+    def _on_press(self, ev):
+        if ev.button != 1 or not ev.inaxes or ev.xdata is None: return
+        self._pts_buf.append((ev.xdata, ev.ydata))
+        if len(self._pts_buf) == 2:
+            self._commit()
+
+    def _on_move(self, ev):
+        if not self._pts_buf or not ev.inaxes or ev.xdata is None: return
+        self._clear_preview()
+        ax = self._canvas.ax
+        p1 = self._pts_buf[0]; p2 = (ev.xdata, ev.ydata)
+        art = _add_shape_artist(ax, self._shape_combo.currentText(),
+                                p1, p2, self._width_spin.value(), 'yellow', alpha=0.45)
+        m, = ax.plot(*p1, 'yo', markersize=6)
+        if art: self._preview.append(art)
+        self._preview.append(m)
+        self._canvas.draw_idle()
+
+    def _commit(self):
+        pts = self._pts_buf.copy(); self._pts_buf.clear(); self._clear_preview()
+        self._shape_id_counter += 1
+        shape = {"id":    self._shape_id_counter,
+                 "type":  self._shape_combo.currentText(),
+                 "pts":   pts,
+                 "width": self._width_spin.value(),
+                 "bead_h": self._bead_h_spin.value()}
+        self._shapes.append(shape)
+        h = shape["bead_h"]
+        self._shape_list.addItem(
+            f"#{shape['id']}  {shape['type']}  w={shape['width']:.0f}  h={h:+.1f}mm")
+        self._shape_list.setCurrentRow(self._shape_list.count() - 1)
+        self._refresh_canvas()
+
+    def _clear_preview(self):
+        for a in self._preview:
+            try: a.remove()
+            except Exception: pass
+        self._preview.clear()
+
+    # ── 리스트 조작 ─────────────────────────────────────────────────────────
+
+    def _on_delete(self):
+        idx = self._shape_list.currentRow()
+        if 0 <= idx < len(self._shapes):
+            del self._shapes[idx]
+            self._shape_list.takeItem(idx)
+            self._refresh_canvas()
+
+    def _on_clear(self):
+        self._shapes.clear(); self._shape_list.clear(); self._refresh_canvas()
+
+    # ── 캔버스 렌더링 ───────────────────────────────────────────────────────
+
+    def _compute_heights(self):
+        """기본 높이 + 그려진 도형 (절대값 큰 것 우선)."""
+        coords  = np.array(self.snap["coords"])
+        result  = np.array(self.snap["heights"], dtype=float)
+        for shape in self._shapes:
+            mask = _shape_mask(coords[:, :2], shape)
+            bh = shape["bead_h"]
+            # bh=0: 기존 비드 제거 (무조건 덮어쓰기), 아니면 절대값 큰 것 우선
+            if bh == 0.0:
+                result[mask] = 0.0
+            else:
+                improve = mask & (np.abs(bh) > np.abs(result))
+                result[improve] = bh
+        return result
+
+    def _refresh_canvas(self):
+        from scipy.interpolate import griddata
+        from matplotlib.colors import BoundaryNorm
+        from matplotlib import cm
+
+        ax = self._canvas.ax; fig = self._canvas.fig
+        ax.clear()
+
+        coords  = np.array(self.snap["coords"])
+        heights = self._compute_heights()
+        x, y   = coords[:, 0], coords[:, 1]
+        h_max   = float(self.snap.get("h_max", 15.0))
+        bsteps  = int(self.snap.get("bead_steps", 0))
+
+        n_grid = max(64, int(len(x)**0.5) * 3)
+        Xi, Yi = np.meshgrid(np.linspace(x.min(), x.max(), n_grid),
+                             np.linspace(y.min(), y.max(), n_grid))
+        Zi = griddata((x,y), heights, (Xi,Yi), method='nearest')
+        Zi = np.clip(Zi, -h_max, h_max)
+
+        n_steps    = max(bsteps, 5)
+        pos_levels = np.linspace(0, h_max, n_steps + 1)
+        full_lev   = np.concatenate([-pos_levels[::-1], pos_levels[1:]])
+        bounds     = np.concatenate([[-h_max - 1e-6],
+                                     (full_lev[:-1]+full_lev[1:])*0.5,
+                                     [h_max + 1e-6]])
+        cmap  = cm.get_cmap('coolwarm', len(full_lev))
+        norm  = BoundaryNorm(bounds, ncolors=cmap.N, clip=True)
+        ax.imshow(Zi, origin='lower', aspect='equal',
+                  extent=[x.min(), x.max(), y.min(), y.max()],
+                  cmap=cmap, norm=norm, interpolation='nearest')
+
+        # 그려진 도형 오버레이
+        sel_idx = self._shape_list.currentRow()
+        for i, shape in enumerate(self._shapes):
+            selected = (i == sel_idx)
+            color = '#00e5ff' if selected else 'white'
+            alpha = 0.85 if selected else 0.65
+            _add_shape_artist(ax, shape["type"],
+                              shape["pts"][0], shape["pts"][1],
+                              shape["width"], color, alpha=alpha)
+            cx = (shape["pts"][0][0] + shape["pts"][1][0]) / 2
+            cy = (shape["pts"][0][1] + shape["pts"][1][1]) / 2
+            label = f"#{shape['id']} {shape['bead_h']:+.1f}"
+            ax.text(cx, cy, label,
+                    color='white' if not selected else '#00e5ff',
+                    fontsize=7, ha='center', va='center', fontweight='bold' if selected else 'normal',
+                    bbox=dict(facecolor='black', alpha=0.6 if selected else 0.5,
+                              pad=1, edgecolor='#00e5ff' if selected else 'none'))
+
+        # 레전드
+        if self._shapes:
+            import matplotlib.patches as _mp
+            handles = []
+            for shape in self._shapes:
+                patch = _mp.Patch(color='white', alpha=0.65,
+                                  label=f"#{shape['id']} {shape['type']} h={shape['bead_h']:+.1f}")
+                handles.append(patch)
+            ax.legend(handles=handles, loc='upper right', fontsize=7,
+                      facecolor='#1e1e1e', edgecolor='#555', labelcolor='white',
+                      framealpha=0.85)
+
+        ax.set_title(f"Concept Bead Preview  (iter {self.snap.get('iter','?')})")
+        ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
+        fig.tight_layout(); self._canvas.draw()
+
+    # ── 평가 ────────────────────────────────────────────────────────────────
+
+    def _on_eval_one(self):
+        self._run_eval([self._case_combo.currentText()])
+
+    def _on_eval_all(self):
+        self._run_eval(list(self.load_cases))
+
+    def _run_eval(self, cases):
+        if not self.snap_dir:
+            QMessageBox.warning(self, "오류", "snap_dir가 설정되지 않았습니다."); return
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(self, "실행 중", "이전 해석이 진행 중입니다."); return
+        h_concept = self._compute_heights()
+        self._status_lbl.setText("해석 중...")
+        self._worker = BeadConceptEvalWorker(self.snap_dir, h_concept, cases, parent=self)
+        self._worker.progress.connect(self._status_lbl.setText)
+        self._worker.finished.connect(self._on_eval_done)
+        self._worker.error.connect(
+            lambda e: (self._status_lbl.setText("오류"),
+                       QMessageBox.critical(self, "해석 오류", e[:500])))
+        self._worker.start()
+
+    def _on_eval_done(self, results: list):
+        self._log(f"── Concept Evaluation 완료 [iter {self.snap.get('iter','?')}] ──", "#ff0")
+        result_lines = [f"== Bead Concept Evaluation  [iter {self.snap.get('iter','?')}] ==", ""]
+        for r in results:
+            case = r["case"]
+            if r["type"] == "modal":
+                freqs = r.get("freqs", [r["f1"]])
+                b, d  = r["base"], r["delta_pct"]
+                sign  = "▲" if d >= 0 else "▼"
+                # 메시지 패널 출력
+                self._log(f"[{case}]", "#6cf")
+                self._log(f"  f1={freqs[0]:.2f} Hz  (iter0: {b:.2f} Hz)  {sign} {d:+.1f}%", "#2a7a2a")
+                for i, f in enumerate(freqs[:10], 1):
+                    self._log(f"    Mode {i}: {f:.2f} Hz")
+                # effective mass
+                em = r.get("eff_mass_data")
+                if em is not None:
+                    try:
+                        eff = em["eff_mass"]; tot = em["total_mass"]
+                        for i, row in enumerate(eff[:6], 1):
+                            ratio = float(np.sum(np.abs(row))) / (float(tot) + 1e-12) * 100
+                            self._log(f"    Mode {i} eff.mass ratio: {ratio:.1f}%")
+                    except Exception:
+                        pass
+                # result dialog line
+                result_lines += [f"[{case}]",
+                                  f"  f1={freqs[0]:.2f} Hz  (iter0: {b:.2f} Hz)  {sign} {d:+.1f}%"]
+                for i, f in enumerate(freqs[:10], 1):
+                    result_lines.append(f"    Mode {i}: {f:.2f} Hz")
+                # visualizer
+                rd = r.get("wht_result_data")
+                if rd:
+                    self._open_result_in_viewer(rd, f"Concept Modal — iter {self.snap.get('iter','?')}")
+            elif r["type"] == "static":
+                u, b, d = r["u_max"], r["base"], r["delta_pct"]
+                sign = "▲" if d >= 0 else "▼"
+                self._log(f"[{case}]", "#6cf")
+                self._log(f"  Max|U|={u:.4f} mm  (iter0: {b:.4f} mm)  {sign} {d:+.1f}%", "#2a7a2a")
+                result_lines += [f"[{case}]",
+                                  f"  Max|U|={u:.4f} mm  (iter0: {b:.4f} mm)  {sign} {d:+.1f}%"]
+                rd = r.get("wht_result_data")
+                if rd:
+                    self._open_result_in_viewer(rd, f"Concept {case} — iter {self.snap.get('iter','?')}")
+            else:
+                msg = r.get("msg", "")
+                self._log(f"[{case}]  ERROR: {msg}", "#f55")
+                result_lines.append(f"[{case}]  ERROR: {msg}")
+        dlg = _ConceptResultDialog("\n".join(result_lines), self)
+        dlg.exec()
+
+
+class _ConceptResultDialog(QDialog):
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Concept Evaluation Results")
+        self.resize(560, 320)
+        lay = QVBoxLayout(self)
+        te = QTextEdit(); te.setReadOnly(True); te.setPlainText(text)
+        te.setStyleSheet("font-family:'Consolas',monospace; font-size:11px;"
+                         "background:#1e1e1e; color:#d4d4d4; border:none;")
+        lay.addWidget(te)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok)
+        bb.accepted.connect(self.accept); lay.addWidget(bb)
 
 
 class _TeeStream:
