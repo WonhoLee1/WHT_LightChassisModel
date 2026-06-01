@@ -1923,6 +1923,7 @@ class TopographyPipeline:
             min_width_ramp_iters = getattr(self.cfg, 'min_width_ramp', 10),
             max_width            = getattr(self.cfg, 'max_width', -1.0),
             max_width_weight     = getattr(self.cfg, 'max_width_weight', 1.0),
+            bead_connect_start_iter  = getattr(self.cfg, 'bead_connect_start_iter', -1),
         )
         n_designs = getattr(self.cfg, 'n_designs', 1)
         _div_start = getattr(self.cfg, 'diversity_start_iter', -1)
@@ -2506,7 +2507,7 @@ def _inject_topo_arg_for_gooey() -> None:
 _inject_topo_arg_for_gooey()
 
 
-@Gooey(program_name="WHTOOLs FEM TV Chassis Topography Optimizer Tool", default_size=(1024, 768), navigation='TABBED', tabbed_groups=True, clear_before_run=True, language='korean', image_dir=os.path.join(os.path.dirname(__file__), 'resources'), terminal_font_family='D2Coding', terminal_font_size=8, use_cmd_args=True, encoding='utf-8')
+@Gooey(program_name="WHTOOLs FEM TV Chassis Topography Optimizer Tool", default_size=(1024, 768), navigation='TABBED', tabbed_groups=True, clear_before_run=True, language='korean', image_dir=os.path.join(os.path.dirname(__file__), 'resources'), program_icon=os.path.join(os.path.dirname(__file__), 'resources', 'logo_icon.ico'), terminal_font_family='D2Coding', terminal_font_size=8, use_cmd_args=True, encoding='utf-8')
 def main():
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -3058,55 +3059,98 @@ def main():
         "최적화 & 제약", 
         description="위상최적화 수렴 조건, 비드의 폭/높이 제한, 목적함수 가중치 및 설계 다양성 탐색 제약 조건입니다."
     )
-    g3.add_argument("--iters",       type=int,   default=20,   help="최대 반복 횟수 (기본: 20)")
-    g3.add_argument("--bead-height", type=float, default=15.0, help="최대 비드 높이 mm (기본: 15.0)")
-    g3.add_argument("--min-width",        type=float, default=60.0,  help="최소 비드 폭 mm, 최종 목표값 (기본: 60.0)")
-    g3.add_argument("--min-width-init",   type=float, default=150.0, help="필터 연속화 초기 최소 비드 폭 mm (기본: 150.0, -1=고정)")
-    g3.add_argument("--min-width-ramp",   type=int,   default=5,     help="min-width-init → min-width 감소 이터레이션 수 (기본: 5)")
-    g3.add_argument("--max-width",        type=float, default=-1.0,  help="최대 비드 폭 mm (-1=비활성, 기본: -1.0). --min-width의 2~4배 권장")
-    g3.add_argument("--max-width-weight", type=float, default=1.0,   help="max-width 패널티 강도 (C_0 대비 배율, 기본: 1.0)")
-    g3.add_argument("--bead-area",   type=float, default=0.30, help="비드 점유 면적 비율 0~1 (기본: 0.30)")
-    g3.add_argument("--bead-bidirectional", action="store_true", default=False,
-                    help="양방향 비드 허용: x=0.5 기준 + 방향(outward)·- 방향(inward) 동시 최적화. "
-                         "--height-steps 1 → {-h_max, 0, +h_max} (3레벨). colorbar: coolwarm ±h_max.")
-    g3.add_argument("--bead-area-ramp", type=int, default=4,
-                    help="비드 면적 제약을 1.0→목표값까지 선형 감소시킬 이터레이션 수 (기본: 4). "
-                         "초반 이터에서 형상 자유도를 높여 위상 패턴 형성을 돕습니다.")
-    g3.add_argument("--tol",         type=float, default=1e-4,
-                    help="설계변수 수렴 허용오차 (기본: 1e-4). "
-                         "이터레이션 간 max|x_new - x_old| < tol 이면 수렴 처리. "
-                         "정체 감지(stagnation): 연속 5회 dx<tol*5 이어도 수렴. "
-                         "엄격: 1e-5 (오래 걸림) / 표준: 1e-4 / 느슨: 1e-3 (빠르게 종료)")
-    g3.add_argument("--normalize-obj",    type=float, default=1.0,
-                    help="목적함수 정규화 (기본 1.0, 0=비활성)")
-    g3.add_argument("--obj-type",    choices=["sum", "max", "sum+max"], default="sum+max",
-                    help="목적함수 유형: sum=가중합(기본), max=softmax 최악케이스, sum+max=0.5·sum+0.5·softmax")
-    g3.add_argument("--obj-alpha",   type=float, default=10.0,
-                    help="softmax 온도 (--obj-type max/sum+max 시). (기본: 10.0)")
+    g3.add_argument("--iters",        type=int,   default=20,   help="최대 반복 횟수 (기본: 20)")
+    g3.add_argument("--bead-height",  type=float, default=15.0, help="최대 비드 높이 mm (기본: 15.0)")
+    g3.add_argument("--tol",          type=float, default=1e-4,
+                    help="설계변수 수렴 허용오차 (기본: 1e-4). 엄격: 1e-5 / 표준: 1e-4 / 느슨: 1e-3")
+    g3.add_argument("--normalize-obj", type=float, default=1.0,  help="목적함수 정규화 (기본 1.0, 0=비활성)")
+    g3.add_argument("--obj-type",     choices=["sum", "max", "sum+max"], default="sum+max",
+                    help="목적함수 유형: sum / max(softmax 최악케이스) / sum+max(기본)")
+    g3.add_argument("--obj-alpha",    type=float, default=10.0,  help="softmax 온도 (기본: 10.0)")
     g3.add_argument("--freq-penalty", type=float, nargs=2, default=[0.0, 0.0],
                     metavar="W F0_HZ", help="고유진동수 패널티: W·(max(0,F0-f1)/F0)².")
-    g3.add_argument("--n-designs",        type=int,   default=1,
-                    help="생성할 설계 수 (기본: 1). >1이면 수렴 후 반발 패널티로 다른 설계 탐색")
-    g3.add_argument("--diversity-weight",     type=float, default=0.3,
-                    help="반발 패널티 강도 λ (기본: 0.3). 클수록 이전 설계에서 멀리 떨어짐")
-    g3.add_argument("--diversity-sigma",      type=float, default=0.3, help="반발 범위 σ (기본: 0.3).")
-    g3.add_argument("--diversity-noise",      type=float, default=0.15, help="설계 재시작 시 노이즈 강도 (기본: 0.15)")
-    g3.add_argument("--diversity-start-iter", type=int, default=-1,
-                    dest="diversity_start_iter",
-                    help="지정 iter부터 반발 패널티 적용 (-1=수렴 후 재시작 방식, 기본: -1). "
-                         "예) --diversity-start-iter 20: iter 20에 현재 x를 기준으로 스냅샷 등록 후 패널티 ramp-in.")
+
+    # ── Continuation 전략 ── 면적 → 폭 → 이산화 → 연결 순으로 조여듦 ──────────
+    # [타임라인 예: iters=20]
+    # Iter  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20
+    #       ├──── [1] 면적 램프 (6) ────┤  이후 고정
+    #       ├──── [2] 폭 램프   (6) ────┤  이후 고정
+    #                                   └─ [3] β 상승 시작 ────────────→ 50
+    #                                               └─ [4] 비드 연결 시작 (≈13)
+    #
+    # [1] 면적 제약 ──────────────────────────────────────────────────────────
+    g3.add_argument("--bead-area",        type=float, default=0.50,
+                    help="비드 점유 면적 비율 0~1 (기본: 0.50). 클수록 비드를 더 많이 남김 "
+                         "→ 다중 하중(twisting/lifting) 유리. 작을수록 집중된 소수 비드.")
+    g3.add_argument("--bead-bidirectional", action="store_true", default=False,
+                    help="양방향 비드 (±방향 동시 최적화). colorbar: coolwarm ±h_max.")
+    g3.add_argument("--bead-area-ramp",   type=int,   default=6,
+                    help="[타임라인 1단계] 면적 비율을 1.0 → bead-area까지 줄이는 이터 수 (기본: 6).\n"
+                         "권장: iters × 0.3  (iters=20이면 6, iters=30이면 9)\n"
+                         "너무 짧으면: 면적이 빨리 잠겨 β 상승 시 비드가 사라짐 (살두께 소멸)\n"
+                         "너무 길면:  형상이 자유도 높은 상태에서 수렴 → 특징 없는 균일 패턴")
+    # [2] 폭 제약 ────────────────────────────────────────────────────────────
+    g3.add_argument("--min-width",        type=float, default=60.0,
+                    help="최소 비드 폭 mm, 최종 목표값 (기본: 60.0)")
+    g3.add_argument("--min-width-init",   type=float, default=100.0,
+                    help="초기 최소 비드 폭 mm. 크게 시작 → 넓은 패턴 형성 후 점점 세밀해짐 (기본: 100.0, -1=고정).\n"
+                         "너무 크면(>150) 초기 필터가 대비 시드를 평활화해 패턴 형성 지연.")
+    g3.add_argument("--min-width-ramp",   type=int,   default=6,
+                    help="[타임라인 2단계] min-width-init → min-width 감소 이터 수 (기본: 6).\n"
+                         "권장: bead-area-ramp 이하  (면적보다 먼저 또는 동시에 완료)\n"
+                         "폭 먼저 완료 → 넓은 비드 소수  /  면적 먼저 완료 → 분산된 비드 다수")
+    g3.add_argument("--max-width",        type=float, default=180.0,
+                    help="최대 비드 폭 mm (-1=비활성, 기본: 180.0 = min-width×3).\n"
+                         "넓은 비드 중앙을 비워 테두리 비드 패턴을 유도. min-width의 2~4배 권장.")
+    g3.add_argument("--max-width-weight", type=float, default=2.0,
+                    help="max-width 패널티 강도 (C_0 대비 배율, 기본: 2.0)")
+    # [3] 이산화 제약 (β continuation) ───────────────────────────────────────
+    g3.add_argument("--height-steps",     type=int,   default=1,
+                    help="비드 높이 이산화 단계 수 (기본: 1 → {0, h} 2단계, 풀높이 비드).\n"
+                         "1=이진(평면/풀높이): min-width 비드도 최대 높이 도달 → 견고한 비드.\n"
+                         "2=3단계{0,h/2,h}: 최대높이는 x_filt>0.75 필요 → 필터에 눌려 절반높이 갇힘 주의.")
+    g3.add_argument("--beta-init",        type=float, default=4.0,
+                    help="이산화 β 시작값 (기본: 4.0). beta-start-iter까지 이 값으로 고정.\n"
+                         "작을수록 초기 패턴이 부드럽고 연속적. 0에 가까울수록 이산화 없음.")
+    g3.add_argument("--beta-max",         type=float, default=50.0,
+                    help="이산화 β 최대값 (기본: 50.0). 클수록 최종 비드 경계가 선명.")
+    g3.add_argument("--beta-start-iter",  type=int,   default=-1,
+                    help="[타임라인 3단계] β 증가 시작 이터 (기본: -1=bead-area-ramp 완료 후 자동).\n"
+                         "이 이터까지 β=beta-init 고정, 이후 beta-max까지 선형 상승.\n"
+                         "너무 이르면: 면적 안정 전에 이산화 → 비드 소멸 cascade\n"
+                         "너무 늦으면: 마지막에 급격한 이산화 → 패턴 불안정\n"
+                         "권장: bead-area-ramp 값과 동일하게 설정 (또는 -1 자동)")
+    g3.add_argument("--projection",       type=float, default=0.0,
+                    help="Heaviside projection β 최대값 (기본: 0=비활성).\n"
+                         "활성화 시(예: 32): height-steps 투사 후 경계를 추가로 선명화.\n"
+                         "주의: 초기 x가 임계값(η=0.5) 아래이므로 초반 비드가 회색으로 보일 수 있음.\n"
+                         "권장: 비활성(0) 또는 beta-start-iter 이후에만 적용 필요 시 사용.")
+    g3.add_argument("--filter-type",      type=str,   default="linear",
+                    choices=["linear", "gaussian"],
+                    help="공간 필터 커널. linear=hat(기본) / gaussian=부드러운 덩어리 유도")
+    # [4] 비드 연결 / 대칭 / 다양성 ─────────────────────────────────────────
     sym_group = g3.add_mutually_exclusive_group()
-    sym_group.add_argument("--sym-x",          action="store_true", default=True,  help="좌우 대칭 활성화 (기본: 활성)")
-    sym_group.add_argument("--no-sym-x",       action="store_false", dest="sym_x", help="좌우 대칭 해제")
-    g3.add_argument("--bead-connect",   type=float, default=100.0,
-                    help="비드 자동 연결 최대 갭 mm. 0=비활성, >0=해당 갭 이하 단절 비드 연결 (기본: 100.0)")
-    g3.add_argument("--bead-connect-alg", type=str, default="geodesic",
-                    choices=["closing", "mst", "geodesic", "hybrid"], help="비드 연결 알고리즘 (기본: geodesic)")
-    g3.add_argument("--height-steps",   type=int,   default=2,    help="비드 높이 이산화 단계 수 (기본: 2=3단계 {0,h_max/2,h_max}).")
-    g3.add_argument("--filter-type",    type=str,   default="linear", choices=["linear", "gaussian"],
-                    help="공간 필터 커널. linear=hat(기본), gaussian=부드러운 덩어리 유도")
-    g3.add_argument("--projection",     type=float, default=32.0,
-                    help="Heaviside projection beta 최대값. 0=비활성, >0=활성화 (기본: 0).")
+    sym_group.add_argument("--sym-x",    action="store_true",  default=True,  help="좌우 대칭 활성화 (기본)")
+    sym_group.add_argument("--no-sym-x", action="store_false", dest="sym_x",  help="좌우 대칭 해제")
+    g3.add_argument("--bead-connect",          type=float, default=100.0,
+                    help="비드 자동 연결 최대 갭 mm (기본: 100.0, 0=비활성).\n"
+                         "인접 비드 섬을 브릿지로 연결. 너무 크면 과도하게 연결되어 패턴 왜곡.")
+    g3.add_argument("--bead-connect-alg",      type=str,   default="geodesic",
+                    choices=["closing", "mst", "geodesic", "hybrid"],
+                    help="비드 연결 알고리즘 (기본: geodesic)")
+    g3.add_argument("--bead-connect-start-iter", type=int, default=-1,
+                    help="[타임라인 4단계] 비드 연결 시작 이터 (기본: -1=β 중간 지점 자동).\n"
+                         "너무 이르면: 비드가 아직 이동 중 → 연결이 area 제약에 의해 즉시 제거됨\n"
+                         "권장: beta-start-iter + (iters - beta-start-iter) × 0.5\n"
+                         "  또는 -1 자동 (β가 50% 이상 상승한 시점 = 패턴 안정 후)")
+    g3.add_argument("--n-designs",        type=int,   default=1,
+                    help="생성할 설계 수 (기본: 1). >1이면 수렴 후 반발 패널티로 다양성 탐색")
+    g3.add_argument("--diversity-weight",     type=float, default=0.3,  help="반발 패널티 강도 λ (기본: 0.3)")
+    g3.add_argument("--diversity-sigma",      type=float, default=0.3,  help="반발 범위 σ (기본: 0.3)")
+    g3.add_argument("--diversity-noise",      type=float, default=0.15, help="설계 재시작 노이즈 강도 (기본: 0.15)")
+    g3.add_argument("--diversity-start-iter", type=int,   default=-1,
+                    dest="diversity_start_iter",
+                    help="반발 패널티 시작 이터 (-1=수렴 후 자동, 기본: -1)")
     g3.add_argument("--draw-dir", type=str, default="0,0,-1", help="비드 돌출 방향 (기본: 0,0,-1 = 아래).")
     g3.add_argument("--exclude-rect", type=str, action='append', default=None,
                     metavar="CX,CY,W,H", help="비드 배제 사각형 영역 (중심 X,Y + 가로W 세로H, mm).")

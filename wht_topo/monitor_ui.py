@@ -63,6 +63,43 @@ plt.rcParams['font.family'] = 'Segoe UI'
 # Canvas helper
 # ────────────────────────────────────────────────────────────────────────────
 
+def _grid_res_from_elements(x, y):
+    """요소 중심 좌표로부터 1 cell ≈ 1 element 가 되는 격자 해상도(nx, ny) 산출.
+
+    요소 간 중앙 간격(median nearest spacing)을 셀 크기로 사용해, 30mm 요소를
+    30mm 격자로 표시 → 가짜 sub-element 보간 제거.
+    """
+    xs = np.unique(np.round(x, 3))
+    ys = np.unique(np.round(y, 3))
+    # 고유 좌표 간 중앙 간격 (요소 피치 추정)
+    dx = float(np.median(np.diff(xs))) if len(xs) > 1 else 1.0
+    dy = float(np.median(np.diff(ys))) if len(ys) > 1 else 1.0
+    dx = max(dx, 1e-6); dy = max(dy, 1e-6)
+    nx = int(round((x.max() - x.min()) / dx)) + 1
+    ny = int(round((y.max() - y.min()) / dy)) + 1
+    # 안전 클램프 (과도/과소 방지)
+    nx = max(16, min(nx, 400))
+    ny = max(16, min(ny, 400))
+    return nx, ny
+
+
+def _app_icon():
+    """resources/logo_icon_*.png 에서 가장 적합한 크기의 QIcon 반환."""
+    from PySide6.QtGui import QIcon
+    _base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resources")
+    # .ico는 모든 크기를 포함하므로 우선 사용
+    ico = os.path.join(_base, "logo_icon.ico")
+    if os.path.exists(ico):
+        return QIcon(ico)
+    # 없으면 크기별 PNG로 QIcon 구성
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        png = os.path.join(_base, f"logo_icon_{size}x{size}.png")
+        if os.path.exists(png):
+            icon.addFile(png)
+    return icon
+
+
 class PlotCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         self.fig, self.ax = plt.subplots(figsize=(width, height), dpi=dpi)
@@ -337,20 +374,21 @@ class _CalculixReAnalysisWorker(QThread):
                     h_elem = snap["h_elem"]
                     load_cases = snap.get("load_cases", [])
 
-            # h_elem -> h_node
-            n_int      = len(design_nids)
-            h_node_sum = np.zeros(n_int)
-            np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
-            node_adj   = np.bincount(aggr_src, minlength=n_int)
-            h_node     = h_node_sum / (node_adj + 1e-12)
-
-            for i, nid in enumerate(design_nids):
-                ox, oy, oz = orig_coords[nid]
-                nd = model.nodes[nid]
-                dh = float(h_node[i])
-                nd.x = ox + dh * bead_dir[0]
-                nd.y = oy + dh * bead_dir[1]
-                nd.z = oz + dh * bead_dir[2]
+            # h_elem -> h_node → 좌표 적용
+            # iter_num==-1: 외부에서 이미 좌표 적용 완료 → 덮어쓰기 금지
+            if self.iter_num != -1:
+                n_int      = len(design_nids)
+                h_node_sum = np.zeros(n_int)
+                np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+                node_adj   = np.bincount(aggr_src, minlength=n_int)
+                h_node     = h_node_sum / (node_adj + 1e-12)
+                for i, nid in enumerate(design_nids):
+                    ox, oy, oz = orig_coords[nid]
+                    nd = model.nodes[nid]
+                    dh = float(h_node[i])
+                    nd.x = ox + dh * bead_dir[0]
+                    nd.y = oy + dh * bead_dir[1]
+                    nd.z = oz + dh * bead_dir[2]
 
             # ── CalculiX 용 입력 매핑 ─────────────────────────────────────────
             nodes_dict = {nid: (nd.x, nd.y, nd.z) for nid, nd in model.nodes.items()}
@@ -796,6 +834,7 @@ class WHTMonitorWindow(QMainWindow):
     def __init__(self, stop_event=None, results_dir: str = "", num_modal_modes: int = 20):
         super().__init__()
         self.setWindowTitle("WHT Topography Optimization Monitor (V3.0)")
+        self.setWindowIcon(_app_icon())
         self.resize(1300, 900)
         self.stop_event       = stop_event
         self.results_dir      = results_dir
@@ -814,6 +853,7 @@ class WHTMonitorWindow(QMainWindow):
 
         # ── 위젯 참조 ──────────────────────────────────────────────────────
         self.height_canvas = self.curve_canvas = None
+        self._settings_table: "QTableWidget | None" = None
         self.table = self.modal_table = None
         self.metric_combo = self.height_iter_combo = None
         self._height_colorbar = None
@@ -824,8 +864,9 @@ class WHTMonitorWindow(QMainWindow):
         self.height_toolbar = None
         self.concept_tool_btn = None
         self.iter_case_combo = None   # Load Case 콤보 (Iteration Results 탭)
+        self.iter_solver_combo = None  # Solver 선택 콤보
         self.iter_run_btn = None      # Run Analysis 버튼
-        self.iter_ccx_btn = None      # Run CalculiX 버튼
+        self.iter_ccx_btn = None      # Run CalculiX (iter_run_btn alias)
         self.iter_export_btn     = None   # Export OptiStruct 버튼
         self.iter_export_ccx_btn = None   # Export CalculiX 버튼
         self.iter_mesh_btn = None     # Mesh View 버튼
@@ -972,12 +1013,133 @@ class WHTMonitorWindow(QMainWindow):
         self.tabs = QTabWidget()
         root_lay.addWidget(self.tabs)
 
+        self._build_tab_settings()
         self._build_tab_summary()
         self._build_tab_curve()
         self._build_tab_height()
         self._build_tab_modal()
 
     # ── 탭 빌더 ─────────────────────────────────────────────────────────────
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Settings 탭
+    # ────────────────────────────────────────────────────────────────────────
+
+    # 파라미터 메타 정보: (표시 이름, 단위, 설명)
+    _SETTINGS_META = {
+        "max_iter":               ("최대 이터레이션",    "iter", "최적화 반복 횟수 상한"),
+        "h_max":                  ("최대 비드 높이",      "mm",   "비드가 돌출 또는 함입될 수 있는 최대 높이"),
+        "bead_area":              ("비드 면적 비율",      "",     "전체 설계 영역 대비 비드 점유 목표 비율 (0~1)"),
+        "bead_area_ramp":         ("면적 램프 이터",      "iter", "[타임라인 1단계] 면적 비율을 1.0→목표까지 줄이는 기간"),
+        "min_width":              ("최소 비드 폭 (목표)", "mm",   "공간 필터 반경. 이 값 미만의 피처는 평활화됨"),
+        "min_width_init":         ("최소 비드 폭 (초기)", "mm",   "필터 연속화 시작값. 크게 시작 후 min_width까지 감소"),
+        "min_width_ramp":         ("폭 램프 이터",        "iter", "[타임라인 2단계] min_width_init→min_width 감소 기간"),
+        "max_width":              ("최대 비드 폭",        "mm",   "넓은 비드 내부를 비우는 패널티 반경. -1=비활성"),
+        "max_width_weight":       ("max_width 강도",      "×C₀",  "최대 폭 패널티 강도. 클수록 hollow 효과 강함"),
+        "height_steps":           ("이산화 단계",         "단계", "비드 높이 양자화 수준. 2→{0,h/2,h} 3단계"),
+        "beta_init":              ("β 시작값",            "",     "이산화 투사 β 초기값. 작을수록 초기 전이 부드러움"),
+        "beta_max":               ("β 최대값",            "",     "이산화 투사 β 상한. 클수록 최종 경계 선명"),
+        "beta_start_iter":        ("β 시작 이터",         "iter", "[타임라인 3단계] -1=bead_area_ramp 완료 후 자동"),
+        "projection":             ("Heaviside β",         "",     "0=비활성. 활성 시 0.5 기준 이분화 강화"),
+        "filter_type":            ("필터 유형",           "",     "linear=hat 커널 / gaussian=부드러운 덩어리"),
+        "bidirectional":          ("양방향 비드",         "",     "True=±방향 동시 허용, False=단방향"),
+        "sym_x":                  ("좌우 대칭",           "",     "True=X축 대칭 강제 적용"),
+        "bead_connect":           ("비드 연결 갭",        "mm",   "이 거리 이하의 단절 비드를 자동 연결. 0=비활성"),
+        "bead_connect_alg":       ("연결 알고리즘",       "",     "closing / mst / geodesic / hybrid"),
+        "bead_connect_start_iter":("연결 시작 이터",      "iter", "[타임라인 4단계] -1=β 중간점 자동"),
+        "obj_type":               ("목적함수 유형",       "",     "sum / max(softmax 최악) / sum+max"),
+        "freq_weight":            ("진동수 패널티 강도",  "",     "0=비활성. 목표 진동수 이하일 때 패널티"),
+        "freq_target":            ("진동수 목표",         "Hz",   "이 진동수 이상이 되도록 패널티 적용"),
+        "n_nodes":                ("총 노드 수",          "개",   "FEM 모델 전체 노드 수"),
+        "n_design_elems":         ("설계 요소 수",        "개",   "최적화 변수로 사용되는 설계 요소 수"),
+    }
+
+    def _build_tab_settings(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        self._settings_table = QTableWidget(0, 4)
+        self._settings_table.setHorizontalHeaderLabels(["파라미터", "값", "단위", "설명"])
+        self._settings_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._settings_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self._settings_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._settings_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self._settings_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._settings_table.setAlternatingRowColors(True)
+        self._settings_table.setStyleSheet(
+            "QTableWidget { font-size: 11px; }"
+            "QTableWidget::item { padding: 3px 6px; }"
+        )
+        lay.addWidget(self._settings_table)
+        self.tabs.addTab(tab, "⚙ Settings")
+
+    def _update_settings_tab(self, settings: dict):
+        """run_settings dict를 받아 Settings 탭 테이블 갱신."""
+        if not self._settings_table:
+            return
+        t = self._settings_table
+        t.setRowCount(0)
+
+        # 그룹 헤더 색상
+        from PySide6.QtGui import QColor, QFont
+        _GRP_COLOR = QColor("#2a2a3e")
+        _GRP_FONT  = QFont(); _GRP_FONT.setBold(True)
+
+        def _add_group(label: str):
+            r = t.rowCount(); t.insertRow(r)
+            item = QTableWidgetItem(f"  {label}")
+            item.setBackground(_GRP_COLOR)
+            item.setFont(_GRP_FONT)
+            item.setForeground(QColor("#aabbff"))
+            t.setItem(r, 0, item)
+            for c in range(1, 4):
+                g = QTableWidgetItem("")
+                g.setBackground(_GRP_COLOR)
+                t.setItem(r, c, g)
+            t.setSpan(r, 0, 1, 4)
+
+        def _add_row(key: str, value):
+            meta = self._SETTINGS_META.get(key, (key, "", ""))
+            name, unit, desc = meta
+            r = t.rowCount(); t.insertRow(r)
+            t.setItem(r, 0, QTableWidgetItem(f"  {name}"))
+            # 값 포맷
+            if isinstance(value, float):
+                val_str = f"{value:.4g}"
+            elif isinstance(value, bool):
+                val_str = "✓ ON" if value else "OFF"
+            else:
+                val_str = str(value)
+            val_item = QTableWidgetItem(val_str)
+            val_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            t.setItem(r, 1, val_item)
+            t.setItem(r, 2, QTableWidgetItem(unit))
+            t.setItem(r, 3, QTableWidgetItem(desc))
+
+        _add_group("■ 기본 설정")
+        for k in ("max_iter", "h_max", "n_nodes", "n_design_elems"):
+            if k in settings: _add_row(k, settings[k])
+
+        _add_group("■ Continuation 전략  [1] 면적")
+        for k in ("bead_area", "bead_area_ramp"):
+            if k in settings: _add_row(k, settings[k])
+
+        _add_group("■ Continuation 전략  [2] 폭")
+        for k in ("min_width", "min_width_init", "min_width_ramp", "max_width", "max_width_weight"):
+            if k in settings: _add_row(k, settings[k])
+
+        _add_group("■ Continuation 전략  [3] 이산화 (β)")
+        for k in ("height_steps", "beta_init", "beta_max", "beta_start_iter", "projection", "filter_type"):
+            if k in settings: _add_row(k, settings[k])
+
+        _add_group("■ Continuation 전략  [4] 연결")
+        for k in ("bead_connect", "bead_connect_alg", "bead_connect_start_iter"):
+            if k in settings: _add_row(k, settings[k])
+
+        _add_group("■ 최적화 설정")
+        for k in ("obj_type", "freq_weight", "freq_target", "bidirectional", "sym_x"):
+            if k in settings: _add_row(k, settings[k])
 
     def _build_tab_summary(self):
         tab = QWidget(); lay = QVBoxLayout(tab)
@@ -1095,17 +1257,20 @@ class WHTMonitorWindow(QMainWindow):
         self.iter_case_combo.addItem("Modal Analysis")
         ctrl_action.addWidget(self.iter_case_combo)
 
+        ctrl_action.addWidget(QLabel("  Solver:"))
+        self.iter_solver_combo = QComboBox()
+        self.iter_solver_combo.addItems(["WHT Solver", "CalculiX"])
+        self.iter_solver_combo.setFixedWidth(100)
+        ctrl_action.addWidget(self.iter_solver_combo)
+
         self.iter_run_btn = QPushButton("Run Analysis")
         self.iter_run_btn.setStyleSheet("font-weight:bold;")
-        self.iter_run_btn.setToolTip("선택 하중 케이스로 wht_solver 해석 후 결과를 visualizer에 표시")
-        self.iter_run_btn.clicked.connect(self._on_run_analysis)
+        self.iter_run_btn.setToolTip("선택 솔버로 해석 후 결과를 visualizer에 표시")
+        self.iter_run_btn.clicked.connect(self._on_run_analysis_dispatch)
         ctrl_action.addWidget(self.iter_run_btn)
 
-        self.iter_ccx_btn = QPushButton("Run CalculiX")
-        self.iter_ccx_btn.setStyleSheet("font-weight:bold; background-color:#1e3d59; color:white;")
-        self.iter_ccx_btn.setToolTip("선택 하중 케이스로 CalculiX 해석 후 결과를 visualizer에 표시")
-        self.iter_ccx_btn.clicked.connect(self._on_run_calculix)
-        ctrl_action.addWidget(self.iter_ccx_btn)
+        # 하위 호환용 — 직접 접근하는 코드가 있을 수 있으므로 참조 유지
+        self.iter_ccx_btn = self.iter_run_btn
 
         self.iter_export_btn = QPushButton("Export OptiStruct")
         self.iter_export_btn.setStyleSheet("font-weight:bold;")
@@ -1119,7 +1284,7 @@ class WHTMonitorWindow(QMainWindow):
         self.iter_export_ccx_btn.clicked.connect(self._on_export_calculix)
         ctrl_action.addWidget(self.iter_export_ccx_btn)
 
-        ctrl_action.addWidget(QLabel("  뷰어:"))
+        ctrl_action.addWidget(QLabel("  Visualizer:"))
         self.viewer_combo = QComboBox()
         self.viewer_combo.addItems(["WHTVisualizer", "ParaView"])
         self.viewer_combo.setToolTip("해석 결과 표시 방식 선택\nWHTVisualizer: PyVista 내장 뷰어\nParaView: VTKHDF 내보내기 후 ParaView 실행")
@@ -1294,6 +1459,8 @@ class WHTMonitorWindow(QMainWindow):
     # ────────────────────────────────────────────────────────────────────────
 
     def update_data(self, data: dict):
+        if "run_settings" in data:
+            self._update_settings_tab(data["run_settings"])
         if data.get("status") == "STOP":
             if self.status_label:
                 self.status_label.setText("Status: Optimization Completed / Stopped")
@@ -1696,10 +1863,10 @@ class WHTMonitorWindow(QMainWindow):
                          if self.height_interp_combo else "linear")
         show_contour  = (self.height_contour_check.isChecked()
                          if self.height_contour_check else False)
-        # 격자 해상도: 요소 수에 비례, 최소 64 — 흐릿함 방지
-        n_grid = max(64, int(len(x) ** 0.5) * 3)
-        xi = np.linspace(x.min(), x.max(), n_grid)
-        yi = np.linspace(y.min(), y.max(), n_grid)
+        # 격자 해상도: 요소 크기에 맞춤 (1 cell ≈ 1 element) → 가짜 보간 제거
+        nx_g, ny_g = _grid_res_from_elements(x, y)
+        xi = np.linspace(x.min(), x.max(), nx_g)
+        yi = np.linspace(y.min(), y.max(), ny_g)
         Xi, Yi = np.meshgrid(xi, yi)
         Zi = griddata((x, y), heights, (Xi, Yi), method=interp_method)
         Zi_near = griddata((x, y), heights, (Xi, Yi), method='nearest')
@@ -1936,6 +2103,14 @@ class WHTMonitorWindow(QMainWindow):
             self.iter_ccx_btn.setEnabled(True)
         self._set_iter_status(f"CCX 오류: {msg[:120]}", "red")
         QMessageBox.critical(self, "CalculiX 해석 오류", msg[:400])
+
+    def _on_run_analysis_dispatch(self):
+        """Solver 콤보 선택에 따라 WHT Solver 또는 CalculiX로 분기."""
+        solver = self.iter_solver_combo.currentText() if self.iter_solver_combo else "WHT Solver"
+        if solver == "CalculiX":
+            self._on_run_calculix()
+        else:
+            self._on_run_analysis()
 
     def _on_concept_tool(self):
         if not self.height_snapshots:
@@ -2257,7 +2432,7 @@ class BeadConceptEvalWorker(QThread):
                     lc0 = next((lc for lc, _ in static_lcs if lc.name == case), None)
                     if lc0:
                         r0 = fea0.solve_static(lc0)
-                        u0 = np.max(np.abs(np.array(r0.node_displacements)[:, :3]))
+                        u0 = np.max(np.abs(np.array(r0.displacement)[:, :3]))
                         baselines[case] = ("static", float(u0))
 
             # 개념 비드 해석
@@ -2303,7 +2478,7 @@ class BeadConceptEvalWorker(QThread):
                         if lc is None:
                             results.append({"type":"error","case":case,"msg":"하중케이스 없음"}); continue
                         r    = fea.solve_static(lc)
-                        umax = float(np.max(np.abs(np.array(r.node_displacements)[:, :3])))
+                        umax = float(np.max(np.abs(np.array(r.displacement)[:, :3])))
                         b_entry = baselines.get(case)
                         if b_entry is None:
                             results.append({"type":"error","case":case,"msg":"iter0 기준값 계산 실패"}); continue
@@ -2348,6 +2523,15 @@ class _ConceptCcxWorker(QThread):
         try:
             import numpy as np
             from pathlib import Path
+
+            # ── 사전 점검 ────────────────────────────────────────────────────
+            if run_calculix_analysis is None:
+                self.error.emit(
+                    "AutoCalculix API를 임포트하지 못했습니다.\n"
+                    "D:/PythonCodeStudy/AutoCalculix 경로를 점검하세요.\n"
+                    "WHT Solver 선택 후 재시도하거나 CalculiX를 설치하세요.")
+                return
+
             snap_dir = Path(self.snap_dir)
 
             self.progress.emit("init.pkl 로드 중...")
@@ -2360,6 +2544,16 @@ class _ConceptCcxWorker(QThread):
             aggr_src    = init["aggr_src"]
             aggr_dst    = init["aggr_dst"]
             orig_coords = init["orig_coords"]
+
+            # 로드케이스 존재 여부 사전 확인
+            static_lcs = init.get("static_load_cases", [])
+            if self.case_name != "Modal Analysis":
+                lc_names = [lc.name for lc, _ in static_lcs]
+                if self.case_name not in lc_names:
+                    self.error.emit(
+                        f"하중케이스 '{self.case_name}'를 init.pkl에서 찾을 수 없습니다.\n"
+                        f"사용 가능한 케이스: {lc_names}")
+                    return
 
             # 원본 좌표 복원 + 컨셉 비드 높이 적용
             for nid, (x, y, z) in orig_coords.items():
@@ -2414,6 +2608,7 @@ class BeadConceptDialog(QDialog):
     def __init__(self, snap: dict, snap_dir: str, load_cases: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Bead Concept Evaluation Tool")
+        self.setWindowIcon(_app_icon())
         self.resize(1100, 720)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
 
@@ -2513,17 +2708,25 @@ class BeadConceptDialog(QDialog):
         self._case_combo.setMinimumWidth(150)
         bot.addWidget(self._case_combo)
 
+        bot.addWidget(QLabel("  Solver:"))
+        self._solver_combo = QComboBox()
+        self._solver_combo.addItems(["WHT Solver", "CalculiX"])
+        self._solver_combo.setFixedWidth(100)
+        bot.addWidget(self._solver_combo)
+
         ev_btn = QPushButton("Evaluate")
         ev_btn.setStyleSheet("font-weight:bold; background:#1e5f2f; color:white;")
+        ev_btn.setToolTip("선택 솔버로 현재 하중 케이스 해석")
         ev_btn.clicked.connect(self._on_eval_one)
         bot.addWidget(ev_btn)
 
         ev_all_btn = QPushButton("Evaluate All")
         ev_all_btn.setStyleSheet("font-weight:bold; background:#1e3d59; color:white;")
+        ev_all_btn.setToolTip("선택 솔버로 전체 하중 케이스 해석")
         ev_all_btn.clicked.connect(self._on_eval_all)
         bot.addWidget(ev_all_btn)
 
-        bot.addWidget(QLabel("  Viewer:"))
+        bot.addWidget(QLabel("  Visualizer:"))
         self._viewer_combo = QComboBox()
         self._viewer_combo.addItems(["WHTVisualizer", "ParaView"])
         self._viewer_combo.setFixedWidth(110)
@@ -2534,12 +2737,6 @@ class BeadConceptDialog(QDialog):
         exp_os_btn.setToolTip("현재 컨셉 비드 형상을 OptiStruct .fem으로 내보내기")
         exp_os_btn.clicked.connect(self._on_export_optistruct)
         bot.addWidget(exp_os_btn)
-
-        exp_ccx_btn = QPushButton("Run CalculiX")
-        exp_ccx_btn.setStyleSheet("font-weight:bold; background:#1e3d59; color:white;")
-        exp_ccx_btn.setToolTip("현재 컨셉 비드 형상으로 CalculiX 해석 실행")
-        exp_ccx_btn.clicked.connect(self._on_run_ccx)
-        bot.addWidget(exp_ccx_btn)
 
         self._status_lbl = QLabel("준비")
         self._status_lbl.setStyleSheet("color:#aaa; font-size:10px;")
@@ -2752,9 +2949,10 @@ class BeadConceptDialog(QDialog):
         h_max   = float(self.snap.get("h_max", 15.0))
         bsteps  = int(self.snap.get("bead_steps", 0))
 
-        n_grid = max(64, int(len(x)**0.5) * 3)
-        Xi, Yi = np.meshgrid(np.linspace(x.min(), x.max(), n_grid),
-                             np.linspace(y.min(), y.max(), n_grid))
+        # 격자 해상도: 요소 크기에 맞춤 (1 cell ≈ 1 element)
+        nx_g, ny_g = _grid_res_from_elements(x, y)
+        Xi, Yi = np.meshgrid(np.linspace(x.min(), x.max(), nx_g),
+                             np.linspace(y.min(), y.max(), ny_g))
         Zi = griddata((x,y), heights, (Xi,Yi), method='nearest')
         Zi = np.clip(Zi, -h_max, h_max)
 
@@ -2812,20 +3010,39 @@ class BeadConceptDialog(QDialog):
     def _on_eval_all(self):
         self._run_eval(list(self.load_cases))
 
+    def _is_ccx(self) -> bool:
+        return (hasattr(self, '_solver_combo') and
+                self._solver_combo.currentText() == "CalculiX")
+
     def _run_eval(self, cases):
         if not self.snap_dir:
             QMessageBox.warning(self, "오류", "snap_dir가 설정되지 않았습니다."); return
         if self._worker and self._worker.isRunning():
             QMessageBox.information(self, "실행 중", "이전 해석이 진행 중입니다."); return
         h_concept = self._compute_heights()
-        self._status_lbl.setText("해석 중...")
-        self._worker = BeadConceptEvalWorker(self.snap_dir, h_concept, cases, parent=self)
-        self._worker.progress.connect(self._status_lbl.setText)
-        self._worker.finished.connect(self._on_eval_done)
-        self._worker.error.connect(
-            lambda e: (self._status_lbl.setText("오류"),
-                       QMessageBox.critical(self, "해석 오류", e[:500])))
-        self._worker.start()
+        if self._is_ccx():
+            # CalculiX: 케이스 하나씩 순차 실행
+            case = cases[0] if cases else self._case_combo.currentText()
+            self._log(f"CalculiX 해석: {case}", "#6af")
+            self._status_lbl.setText("CalculiX 해석 중...")
+            self._worker = _ConceptCcxWorker(self.snap_dir, h_concept, case, parent=self)
+            self._worker.progress.connect(lambda m: self._log(m, "#aaa"))
+            self._worker.finished.connect(self._on_ccx_done)
+            self._worker.error.connect(lambda e: (
+                self._status_lbl.setText("오류"),
+                self._log(f"CCX 오류: {e[:200]}", "#f55")))
+            self._worker.start()
+        else:
+            # WHT Solver
+            self._log(f"WHT Solver 해석: {cases}", "#6af")
+            self._status_lbl.setText("WHT 해석 중...")
+            self._worker = BeadConceptEvalWorker(self.snap_dir, h_concept, cases, parent=self)
+            self._worker.progress.connect(lambda m: self._log(m, "#aaa"))
+            self._worker.finished.connect(self._on_eval_done)
+            self._worker.error.connect(lambda e: (
+                self._status_lbl.setText("오류"),
+                QMessageBox.critical(self, "해석 오류", e[:500])))
+            self._worker.start()
 
     def _on_eval_done(self, results: list):
         self._log(f"── Concept Evaluation 완료 [iter {self.snap.get('iter','?')}] ──", "#ff0")
@@ -2945,6 +3162,7 @@ def start_monitor_ui(queue, stop_event=None, results_dir: str = "",
             print(f"[Monitor] 로그 파일 열기 실패: {_e}", flush=True)
 
     app    = QApplication.instance() or QApplication(sys.argv)
+    app.setWindowIcon(_app_icon())
     window = WHTMonitorWindow(stop_event=stop_event, results_dir=results_dir,
                               num_modal_modes=num_modal_modes)
     window.show()

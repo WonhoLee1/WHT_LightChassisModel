@@ -272,6 +272,16 @@ class WHTVisualizer:
         self.plotter = BackgroundPlotter(title=title, show=show, toolbar=False)
         self.plotter.set_background('black') # Rule-aligned: Force black as requested
         
+        # Setup Main App Icon
+        if QtWidgets:
+            app_icon = QtGui.QIcon()
+            sizes = [16, 24, 32, 48, 64, 128]
+            for size in sizes:
+                icon_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "resources", f"logo_icon_{size}x{size}.png"))
+                if os.path.exists(icon_path):
+                    app_icon.addFile(icon_path, QtCore.QSize(size, size))
+            self.plotter.app_window.setWindowIcon(app_icon)
+        
         # Ensure styling is applied to the active app instance
         app = QtWidgets.QApplication.instance()
         if app:
@@ -708,11 +718,11 @@ class WHTVisualizer:
         layout.setSpacing(10)
         
         # 1. Controls Group
-        self.btn_first = QtWidgets.QPushButton("|<")
-        self.btn_prev = QtWidgets.QPushButton("<")
-        self.btn_play = QtWidgets.QPushButton("▶")
-        self.btn_next = QtWidgets.QPushButton(">")
-        self.btn_last = QtWidgets.QPushButton(">|")
+        self.btn_first = QtWidgets.QPushButton("⏮\uFE0E")
+        self.btn_prev = QtWidgets.QPushButton("⏪\uFE0E")
+        self.btn_play = QtWidgets.QPushButton("▶\uFE0E")
+        self.btn_next = QtWidgets.QPushButton("⏩\uFE0E")
+        self.btn_last = QtWidgets.QPushButton("⏭\uFE0E")
         
         for btn in [self.btn_first, self.btn_prev, self.btn_play, self.btn_next, self.btn_last]:
             btn.setFixedSize(40, 30)
@@ -965,7 +975,7 @@ class WHTVisualizer:
         self.toolbar.addWidget(spacer)
 
         logo_lbl = QtWidgets.QLabel()
-        _logo_path = os.path.join(os.path.dirname(__file__), "..", "wht_topo", "resources", "logo_icon_48x48.png")
+        _logo_path = os.path.join(os.path.dirname(__file__), "..", "resources", "logo_icon_48x48.png")
         _logo_path = os.path.normpath(_logo_path)
         if os.path.exists(_logo_path):
             _pix = QtGui.QPixmap(_logo_path).scaled(
@@ -1488,7 +1498,7 @@ class WHTVisualizer:
                     elif value == "Feature Edges":
                         if "feature" not in part:
                             part["feature"] = part["mesh"].extract_feature_edges()
-                        target_mesh = part["feature"]
+                        target_mesh = part["mesh"]
                         if hasattr(prop, 'SetRepresentationToSurface'): prop.SetRepresentationToSurface()
                         if hasattr(prop, 'SetEdgeVisibility'): prop.SetEdgeVisibility(True)
                     
@@ -1727,6 +1737,8 @@ class WHTVisualizer:
                 for sc_name, array_3d in self.result_data.point_data.items():
                     if t_idx < array_3d.shape[0]:
                         data = np.nan_to_num(array_3d[t_idx], nan=0.0, posinf=0.0, neginf=0.0)
+                        if data.ndim == 2 and data.shape[1] == 1:
+                            data = data.ravel()
                         if orig_ids is not None:
                             # Submesh mapping: Use >= to avoid skipping boundary case
                             if len(data) > np.max(orig_ids):
@@ -1752,6 +1764,8 @@ class WHTVisualizer:
                 for sc_name, array_3d in self.result_data.cell_data.items():
                     if t_idx < array_3d.shape[0]:
                         data = array_3d[t_idx] 
+                        if data.ndim == 2 and data.shape[1] == 1:
+                            data = data.ravel()
                         orig_cids = mesh.cell_data.get('vtkOriginalCellIds')
                         if orig_cids is not None:
                             # [WHT] 안전한 인덱스 필터링: data 범위 내 orig_cids만 사용
@@ -2470,7 +2484,7 @@ class WHTVisualizer:
 
     def _toggle_animation(self):
         self.is_playing = not self.is_playing
-        self.btn_play.setText("⏸" if self.is_playing else "▶")
+        self.btn_play.setText("⏸\uFE0E" if self.is_playing else "▶\uFE0E")
         if self.is_playing:
             self.anim_timer.start(int(1000 / self.spin_fps.value()))
         else:

@@ -46,7 +46,7 @@ class MMAOptimizer:
 
     def update(self, x: jnp.ndarray, f0val: float, df0dx: jnp.ndarray,
                fval: jnp.ndarray, dfdx: jnp.ndarray, iteration: int,
-               project_fn=None) -> jnp.ndarray:
+               project_fn=None, vol_target=None) -> jnp.ndarray:
         """
         MMA 업데이트 1회 수행.
 
@@ -97,12 +97,13 @@ class MMAOptimizer:
                 return float(jnp.mean(project_fn(x_t)))
             return float(jnp.mean(x_t))
 
+        target_vol = vol_target if vol_target is not None else self.vol_frac
         l1, l2 = 1e-10, 1e12
         for _ in range(60):
             l_mid = np.sqrt(l1 * l2)  # geometric mean: uniform convergence across scale
             step = jnp.sqrt(-safe_df0dx / (l_mid * dfdx + 1e-10))
             x_test = jnp.clip(x * step, alpha, beta_)
-            if _vol(x_test) > self.vol_frac:
+            if _vol(x_test) > target_vol:
                 l1 = l_mid
             else:
                 l2 = l_mid
