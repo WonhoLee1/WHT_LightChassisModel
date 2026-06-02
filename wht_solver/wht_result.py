@@ -435,6 +435,52 @@ class WHTSolverResult:
     # Conversion to wht_converter IR
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _add_nodal_averaged_fields(base_rd, cell_data: Dict[str, np.ndarray],
+                                   point_data: Dict[str, np.ndarray]) -> None:
+        """
+        Stress/Strain cell_data를 셸 요소 기준으로 절점 평균하여 point_data에 추가.
+
+        요소 단위 응력은 ParaView/PyVista에서 블록처럼 끊겨(discrete) 보이므로,
+        인접 셸 요소(QUAD4=9, TRIA3=5) 값을 공유 절점으로 평균해 부드러운 컨투어를
+        만든다. cell_data와 동일한 키 이름을 사용하므로, 소비자는 point(매끄러운)
+        버전을 선택해 표시할 수 있다. 비셸 요소(BEAM/RIGID)는 평균에서 제외한다.
+        """
+        SHELL_TYPES = (5, 9)  # VTK_TRIANGLE, VTK_QUAD
+
+        targets = [k for k in cell_data
+                   if k.startswith("Stress") or k.startswith("Strain")]
+        if not targets:
+            return
+
+        offsets = np.asarray(base_rd.offsets, dtype=np.int64)
+        conn    = np.asarray(base_rd.connectivity, dtype=np.int64)
+        ctypes  = np.asarray(base_rd.cell_types)
+        N = base_rd.n_nodes
+        M = base_rd.n_cells
+
+        # Map each connectivity corner back to its owning cell, keep shell cells only.
+        cell_lengths = np.diff(offsets)                       # (M,)
+        corner_cell  = np.repeat(np.arange(M), cell_lengths)  # (K,)
+        keep = np.isin(ctypes, SHELL_TYPES)[corner_cell]
+        cn = conn[keep]            # node index per kept corner
+        cc = corner_cell[keep]     # cell index per kept corner
+
+        counts = np.zeros(N)
+        np.add.at(counts, cn, 1.0)
+        safe = np.where(counts == 0.0, 1.0, counts)
+
+        for key in targets:
+            val = cell_data[key]                  # (T, M, D)
+            T, _, D = val.shape
+            pt = np.zeros((T, N, D))
+            for t in range(T):
+                for d in range(D):
+                    acc = np.zeros(N)
+                    np.add.at(acc, cn, val[t, cc, d])
+                    pt[t, :, d] = acc / safe
+            point_data[key] = pt
+
     def to_wht_result_data(
         self,
         metadata: "WHTMetadata",
@@ -486,6 +532,12 @@ class WHTSolverResult:
                     processed_cell_data[key] = padded
                 else:
                     processed_cell_data[key] = val
+
+            # Nodal-averaged (smooth) Stress/Strain → point_data.
+            # Element-wise cell_data renders as discrete blocks in ParaView/PyVista;
+            # averaging over adjacent shell cells gives smooth contours. Same key
+            # names are reused so consumers can pick the point (smooth) version.
+            self._add_nodal_averaged_fields(base_rd, processed_cell_data, point_data)
 
         return WHTResultData(
             nodes       = base_rd.nodes,

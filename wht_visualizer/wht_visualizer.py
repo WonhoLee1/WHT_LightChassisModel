@@ -172,16 +172,22 @@ class WHTRangeDialog(QtWidgets.QDialog):
         self.group_robust = group_robust
         layout.addWidget(group_robust)
 
-        # ── 4. Apply / Cancel 버튼 ────────────────────────────────────────
+        # ── 4. Apply / Cancel / Close 버튼 ────────────────────────────────
+        # Apply : 범위 적용 + 컬러바 즉시 갱신 (다이얼로그는 유지)
+        # Cancel: 열기 전 상태로 복원 후 닫기
+        # Close : 현재 적용된 상태를 유지한 채 닫기
         h_btns = QtWidgets.QHBoxLayout()
         btn_apply  = QtWidgets.QPushButton("Apply")
         btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_close  = QtWidgets.QPushButton("Close")
         btn_apply.setDefault(True)
         btn_apply.clicked.connect(self._on_apply)
         btn_cancel.clicked.connect(self._on_cancel)
+        btn_close.clicked.connect(self._on_close)
         h_btns.addStretch()
         h_btns.addWidget(btn_apply)
         h_btns.addWidget(btn_cancel)
+        h_btns.addWidget(btn_close)
         layout.addLayout(h_btns)
 
         self.finished.connect(self._cleanup)
@@ -196,6 +202,7 @@ class WHTRangeDialog(QtWidgets.QDialog):
         self.group_robust.setEnabled(static_checked)
 
     def _on_apply(self):
+        # 범위만 적용하고 다이얼로그는 닫지 않는다 (반복 조정 가능).
         if self.radio_static.isChecked():
             try:
                 self.vis.range_min = float(self.edit_min.text())
@@ -206,15 +213,23 @@ class WHTRangeDialog(QtWidgets.QDialog):
         else:
             self.vis.current_range_mode = "Dynamic (Auto)"
         self.vis._apply_colorbar_range(show_stats=True)
-        self.accept()
+        # 컬러바·뷰포트 즉시 갱신
+        if hasattr(self.vis, 'plotter') and hasattr(self.vis.plotter, 'render'):
+            self.vis.plotter.render()
 
     def _on_cancel(self):
-        # 열리기 전 상태로 복원
+        # 열리기 전 상태로 복원 후 닫기
         self.vis.current_range_mode = self._saved_mode
         self.vis.range_min = self._saved_min
         self.vis.range_max = self._saved_max
         self.vis._apply_colorbar_range()
+        if hasattr(self.vis, 'plotter') and hasattr(self.vis.plotter, 'render'):
+            self.vis.plotter.render()
         self.reject()
+
+    def _on_close(self):
+        # 현재 적용된 상태를 유지한 채 닫기
+        self.accept()
 
     def _cleanup(self):
         self.vis.clear_outliers()
@@ -1889,7 +1904,10 @@ class WHTVisualizer:
                                     pass  # Fallback: cell_data 그대로 사용
 
                 if current_field and (current_field in mesh.point_data or current_field in mesh.cell_data):
-                    mesh.set_active_scalars(current_field)
+                    # Prefer point (nodal-averaged) data so Stress/Strain renders as
+                    # smooth contours instead of discrete per-cell blocks.
+                    _pref = 'point' if current_field in mesh.point_data else 'cell'
+                    mesh.set_active_scalars(current_field, preference=_pref)
                     part["actor"].mapper.SetInputData(mesh)
                     # Force scalar visibility if a real result is selected
                     if current_field != "Body Color":
@@ -2089,11 +2107,17 @@ class WHTVisualizer:
             
         self.combo_component.blockSignals(False)
         
-        # [User Request] Ensure user feels the change: 
-        # Trigger a range reset if switching categories to a meaningful new field
+        # [User Request] Ensure user feels the change:
+        # Trigger a range reset if switching categories to a meaningful new field.
+        # Stress/Strain은 FEA 특이점(점하중·구속부) 때문에 절대 min/max(Dynamic)를
+        # 쓰면 한 점이 범위를 장악해 전부 파랗게 깔린다 → 백분위 클리핑(Robust)을 기본으로.
         if category != "Body Color":
-            self.current_range_mode = "Dynamic (Auto)"
-            print(f" -> [Visualizer] Category changed to '{category}'. Auto-resetting range for visibility.")
+            if "Stress" in category or "Strain" in category:
+                self.current_range_mode = "Robust (Auto)"
+                print(f" -> [Visualizer] Category '{category}': 특이점 방어를 위해 Robust(Auto) 범위 적용.")
+            else:
+                self.current_range_mode = "Dynamic (Auto)"
+                print(f" -> [Visualizer] Category changed to '{category}'. Auto-resetting range for visibility.")
             
         self._update_active_result()
 
@@ -2124,7 +2148,10 @@ class WHTVisualizer:
         for part in self.parts.values():
             m = part["mesh"]
             if field_name in m.point_data or field_name in m.cell_data:
-                r = m.get_data_range(field_name)
+                # Match the display preference (point = smooth) so the colorbar
+                # range corresponds to the values actually rendered.
+                pref = 'point' if field_name in m.point_data else 'cell'
+                r = m.get_data_range(field_name, preference=pref)
                 rng[0] = min(rng[0], r[0])
                 rng[1] = max(rng[1], r[1])
         if rng[0] == float('inf'): return 0.0, 1.0
@@ -2290,7 +2317,9 @@ class WHTVisualizer:
             else:
                 actor.mapper.scalar_visibility = True
                 if name in mesh.point_data or name in mesh.cell_data:
-                    mesh.set_active_scalars(name)
+                    # Prefer point (nodal-averaged) data → smooth contours, not blocks.
+                    _pref = 'point' if name in mesh.point_data else 'cell'
+                    mesh.set_active_scalars(name, preference=_pref)
                     actor.mapper.SetInputData(mesh)
                     
                     # [Fix] 스칼라가 처음 활성화될 때 PyVista 기본값 덮어쓰기로 인해 Colormap이 반전되는 현상 방지

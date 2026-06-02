@@ -217,9 +217,13 @@ class StochasticLoadManager:
             키: "bending", "bending_xspan", "bending_yspan",
                 "twisting", "twisting_alt", "lifting"
         loads : Dict[str, float]
-            각 하중 케이스의 적용 하중 크기 [N].
+            각 하중 케이스의 적용 하중 크기 [N]. (run_topo에서 자중 W_N×w_basic_weight
+            으로 스케일된 값이 전달된다.)
             키: "bending", "bending_xspan", "bending_yspan",
                 "twisting", "twisting_alt", "lifting"
+            - bending: 바닥 전면 균일분포 총하중 [N] (분포 압력).
+            - bending_xspan/yspan: 자중 힘 W를 단부 모멘트 M = W·L/8 [N·mm]로 환산해
+              양단 ±M 커플로 부여(L=스팬 길이). 힘/모멘트 제어.
 
         Returns
         -------
@@ -245,6 +249,7 @@ class StochasticLoadManager:
                 "lifting":        3000.0,
             }
         bending_load_z  = loads.get("bending",       -5000.0)
+        # 스팬 굽힘: 자중 스케일 힘 W를 단부 모멘트 M = W·L/8 로 환산해 부여한다.
         bx_load_z       = loads.get("bending_xspan", bending_load_z)
         by_load_z       = loads.get("bending_yspan", bending_load_z)
         twisting_load_z = loads.get("twisting",      -3000.0)
@@ -252,7 +257,6 @@ class StochasticLoadManager:
         lifting_load_z  = loads.get("lifting",         3000.0)
 
         flange_nids = self.get_boundary_nodes(mesh_size_z=mesh_size_z)
-        center_nids = self.get_load_nodes()
         corner0 = self.get_corner_nodes(0)  # 좌하 (-x, -y)
         corner1 = self.get_corner_nodes(1)  # 우하 (+x, -y)
         corner2 = self.get_corner_nodes(2)  # 좌상 (-x, +y)
@@ -260,18 +264,22 @@ class StochasticLoadManager:
 
         load_cases = []
 
-        # ── Case 1: Bending (굽힘) ──────────────────────────────────────────
+        # ── Case 1: Bending (중앙 굽힘) ─────────────────────────────────────
         # BC: 플랜지 전체 고정 (모든 DOF)
-        # LOAD: 바닥 중앙부에 하향 균등 분포 하중
+        # LOAD: 바닥 전체에 하향 균일 분포 하중 → 매끄러운 판 굽힘(중앙 최대 bowl).
+        #       중앙 점하중이 아니라 바닥 전면 분포라 응력 특이점·중앙 집중이 없다.
+        floor_nids = list(WHTSelector(self.model).by_box(
+            z=(self.z_min - 0.1, self.z_min + 5.0)
+        ).get_ids())
         lc_bending = WHTLoadCase(name="bending")
         lc_bending.add_bc(flange_nids, dofs=(0, 1, 2, 3, 4, 5))
-        if center_nids:
+        if floor_nids:
             lc_bending.add_force(
-                center_nids, dofs=(2,),
+                floor_nids, dofs=(2,),
                 values=(bending_load_z,), distribute=True
             )
-        print(f" -> [LoadCase] Bending: {len(flange_nids)}개 플랜지 고정, "
-              f"{len(center_nids)}개 중앙 노드에 {bending_load_z:.0f}N 하중")
+        print(f" -> [LoadCase] Bending(중앙): {len(flange_nids)}개 플랜지 고정, "
+              f"바닥 {len(floor_nids)}개 노드 균일분포 총 {bending_load_z:.0f}N")
         load_cases.append((lc_bending, weights["bending"]))
 
         # ── Case 2: Twisting (비틀림) ───────────────────────────────────────
@@ -289,32 +297,43 @@ class StochasticLoadManager:
               f"반대 2코너에 ±{abs(twisting_load_z):.0f}N 비틀림 하중")
         load_cases.append((lc_twisting, weights["twisting"]))
 
-        # ── Case 3: Bending X-span (X 방향 스팬 굽힘) ──────────────────────────
-        # BC: Y-min 벽면 상단 + Y-max 플랜지만 고정 → X 방향 1800mm 스팬
-        # LOAD: 중앙 하향 하중 (현재 벤딩과 동일)
-        ymin_nids = self.get_edge_flange_nodes('Y', 'min', mesh_size_z)
-        ymax_nids = self.get_edge_flange_nodes('Y', 'max', mesh_size_z)
-        lc_bending_x = WHTLoadCase(name="bending_xspan")
-        lc_bending_x.add_bc(ymin_nids + ymax_nids, dofs=(0, 1, 2, 3, 4, 5))
-        if center_nids:
-            lc_bending_x.add_force(center_nids, dofs=(2,),
-                                    values=(bx_load_z,), distribute=True)
-        print(f" -> [LoadCase] Bending_Xspan: Y-min({len(ymin_nids)}) + Y-max({len(ymax_nids)})개 고정, "
-              f"X방향 {self.x_max - self.x_min:.0f}mm 스팬, 하중={bx_load_z:.0f}N")
-        load_cases.append((lc_bending_x, weights.get("bending_xspan", 0.8)))
-
-        # ── Case 4: Bending Y-span (Y 방향 스팬 굽힘) ──────────────────────────
-        # BC: X-min + X-max 플랜지만 고정 → Y 방향 1200mm 스팬
-        # LOAD: 중앙 하향 하중
+        # ── Case 3: Bending X-span (X 스팬 순수 굽힘) ──────────────────────────
+        # 양 X단(x_min/x_max) edge를 잡고(병진 고정) Y축 내측 모멘트 커플(±M)을 부여
+        # → X 방향 스팬에 걸친 단일 곡률 순수 굽힘. 점하중 없음.
+        # M = W·L/8 (자중 분포하중을 받는 단순지지 보의 최대모멘트 등가, W=자중 스케일 힘).
+        L_x = self.x_max - self.x_min
+        M_x = abs(bx_load_z) * L_x / 8.0
         xmin_nids = self.get_edge_flange_nodes('X', 'min', mesh_size_z)
         xmax_nids = self.get_edge_flange_nodes('X', 'max', mesh_size_z)
+        lc_bending_x = WHTLoadCase(name="bending_xspan")
+        # 양단 병진 고정(= 양끝을 잡음)
+        lc_bending_x.add_bc(xmin_nids + xmax_nids, dofs=(0, 1, 2), value=0.0)
+        # 내측 모멘트 커플: x_min은 +M, x_max는 -M (My, dof=4) → sagging(중앙 하향)
+        if xmin_nids:
+            lc_bending_x.add_force(xmin_nids, dofs=(4,), values=(+M_x,), distribute=True)
+        if xmax_nids:
+            lc_bending_x.add_force(xmax_nids, dofs=(4,), values=(-M_x,), distribute=True)
+        print(f" -> [LoadCase] Bending_Xspan: X단 고정 x_min({len(xmin_nids)})/x_max({len(xmax_nids)}), "
+              f"Y축 ±{M_x:.0f}N·mm 모멘트 커플(W·L/8), X스팬 {L_x:.0f}mm 순수굽힘")
+        load_cases.append((lc_bending_x, weights.get("bending_xspan", 0.8)))
+
+        # ── Case 4: Bending Y-span (Y 스팬 순수 굽힘) ──────────────────────────
+        # 양 Y단(y_min/y_max) edge를 잡고 X축 내측 모멘트 커플(±M)을 부여
+        # → Y 방향 스팬에 걸친 단일 곡률 순수 굽힘. 점하중 없음. M = W·L/8.
+        L_y = self.y_max - self.y_min
+        M_y = abs(by_load_z) * L_y / 8.0
+        ymin_nids = self.get_edge_flange_nodes('Y', 'min', mesh_size_z)
+        ymax_nids = self.get_edge_flange_nodes('Y', 'max', mesh_size_z)
         lc_bending_y = WHTLoadCase(name="bending_yspan")
-        lc_bending_y.add_bc(xmin_nids + xmax_nids, dofs=(0, 1, 2, 3, 4, 5))
-        if center_nids:
-            lc_bending_y.add_force(center_nids, dofs=(2,),
-                                    values=(by_load_z,), distribute=True)
-        print(f" -> [LoadCase] Bending_Yspan: X-min({len(xmin_nids)}) + X-max({len(xmax_nids)})개 고정, "
-              f"Y방향 {self.y_max - self.y_min:.0f}mm 스팬, 하중={by_load_z:.0f}N")
+        # 양단 병진 고정(= 양끝을 잡음)
+        lc_bending_y.add_bc(ymin_nids + ymax_nids, dofs=(0, 1, 2), value=0.0)
+        # 내측 모멘트 커플: y_min은 -M, y_max는 +M (Mx, dof=3) → sagging(중앙 하향)
+        if ymin_nids:
+            lc_bending_y.add_force(ymin_nids, dofs=(3,), values=(-M_y,), distribute=True)
+        if ymax_nids:
+            lc_bending_y.add_force(ymax_nids, dofs=(3,), values=(+M_y,), distribute=True)
+        print(f" -> [LoadCase] Bending_Yspan: Y단 고정 y_min({len(ymin_nids)})/y_max({len(ymax_nids)}), "
+              f"X축 ±{M_y:.0f}N·mm 모멘트 커플(W·L/8), Y스팬 {L_y:.0f}mm 순수굽힘")
         load_cases.append((lc_bending_y, weights.get("bending_yspan", 0.8)))
 
         # ── Case 5: Twisting Alt (반전 대각선 비틀림) ───────────────────────────
