@@ -256,6 +256,7 @@ class WHTopographySolver:
         proj_beta_max: float = 32.0,
         proj_eta: float = 0.5,
         load_cases: Optional[List[Tuple["WHTLoadCase", float]]] = None,
+        objective_weights: Optional[Dict[str, float]] = None,
         load_case_provider=None,
         out_dir=None,
         normalize_obj: bool = False,
@@ -277,6 +278,8 @@ class WHTopographySolver:
         beta_max: float = 50.0,
         beta_delay: int = -1,
         bead_connect_start_iter: int = -1,
+        design_elset: Optional[str] = None,
+
     ):
         self.model          = model
         self.load_manager   = load_manager
@@ -299,9 +302,11 @@ class WHTopographySolver:
         self.bead_steps     = bead_steps
         self.filter_type    = filter_type         # "linear" | "gaussian"
         self.use_projection = use_projection      # Heaviside projection 활성화
-        self.proj_beta_max  = proj_beta_max       # beta 최대값 (continuation)
-        self.proj_eta       = proj_eta
-
+        self.proj_beta_max    = proj_beta_max
+        self.proj_eta         = proj_eta
+        
+        self.objective_weights = objective_weights or {"compliance": 1.0}
+        self.iter_stats       = []
         self.beta_init = beta_init
         self.beta_max = beta_max
         self.beta_delay = beta_delay
@@ -337,6 +342,7 @@ class WHTopographySolver:
         self.constraints    = constraints or []
         self.freq_min       = 0.0
         self.freq_max       = 0.0
+        self.design_elset   = design_elset
         for c in self.constraints:
             if hasattr(c, "min_freq"): self.freq_min = c.min_freq
             if hasattr(c, "max_freq"): self.freq_max = c.max_freq
@@ -584,6 +590,16 @@ class WHTopographySolver:
         design_elems : List[int]  — 설계 요소 ID 리스트 (정렬됨)
         design_nids  : List[int]  — 설계 요소에 속한 고유 노드 ID 리스트 (정렬됨)
         """
+        if getattr(self, 'design_elset', None):
+            try:
+                design_elems = self.model.get_elems_by_set_name(self.design_elset)
+                design_elems = sorted(list(design_elems))
+                design_nids = self.model.get_nodes_from_elem_set_name(self.design_elset)
+                print(f"    - ELSET '{self.design_elset}'을(를) 설계 영역으로 적용합니다.")
+                return design_elems, sorted(list(design_nids))
+            except KeyError:
+                print(f"    [경고] 지정된 ELSET '{self.design_elset}'을(를) 찾을 수 없습니다. 기본 탐색 사용.")
+
         if self.load_manager is not None:
             flange_nids = set(self.load_manager.get_boundary_nodes(
                 mesh_size_z=self.mesh_size_z
@@ -1659,6 +1675,23 @@ class WHTopographySolver:
             # 컴플라이언스 및 민감도 계산 (솔버 인스턴스 공유)
             C_total, C_responses, dC_dh_base, per_case_sens = self._compute_total_compliance(fea_solver, iter_num=i)
             ndof = len(self.sorted_nids) * 6
+
+            # 통계 데이터 추출 및 누적 저장
+            try:
+                import json
+                from wht_solver.wht_stats import ResultStatsCalculator
+                iter_stat_entry = {"iter": i, "cases": {}}
+                for name, res_dict in C_responses.items():
+                    stats = ResultStatsCalculator.compute_stats(res_dict["result"], self.model)
+                    iter_stat_entry["cases"][name] = stats
+                
+                self.iter_stats.append(iter_stat_entry)
+                
+                stats_path = _snap_dir.parent / "iter_stats.json"
+                with open(stats_path, "w", encoding="utf-8") as f:
+                    json.dump(self.iter_stats, f, indent=2)
+            except Exception as e:
+                print(f"    [경고] 통계 데이터 산출/저장 실패: {e}")
 
             # 초기값 저장 및 정규화 (수렴 안정성 강화)
             # 케이스별 기준은 평면 상태(_C_0_cases_flat)로 고정 → 성능 % 가 평면 대비.

@@ -6,9 +6,10 @@ from .lsdyna_reader import LSDYNAReader
 from .lsdyna_writer import LSDYNAWriter
 from .optistruct_reader import OptistructReader
 from .radioss_reader import RadiossReader
+from .calculix_reader import CalculixReader
 
 __all__ = [
     "BaseFEMReader", "BaseFEMWriter", 
     "LSDYNAReader", "LSDYNAWriter",
-    "OptistructReader", "RadiossReader"
+    "OptistructReader", "RadiossReader", "CalculixReader"
 ]

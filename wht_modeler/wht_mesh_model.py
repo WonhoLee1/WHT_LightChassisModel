@@ -54,6 +54,9 @@ class WHTMeshModel:
         # BCs and Loads
         self.spc_conditions: List[WHTSPCEntry] = []
         self.loads:          List[WHTLoadEntry] = []
+        
+        # Load Cases (Multiple Steps from external solvers)
+        self.load_cases: List['WHTLoadCase'] = []
 
         # Internal geometry bookkeeping for SET_GENERAL
         self._boxes: Dict[int, np.ndarray] = {}   # {bid: [xmin,xmax,ymin,ymax,zmin,zmax]}

@@ -1670,23 +1670,34 @@ class TopographyPipeline:
 
     def _build_mesh(self) -> None:
         _section("메시 생성", "1")
-        self.model, self.node_db = _build_tray(
-            width       = self.cfg.tray_width,
-            length      = self.cfg.tray_length,
-            height      = self.cfg.tray_height,
-            mesh_xy     = self.cfg.mesh_xy,
-            mesh_z      = self.cfg.mesh_z,
-            draft_angle = self.cfg.draft_angle,
-            E           = self.cfg.mat_E,
-            nu          = self.cfg.mat_nu,
-            rho         = self.cfg.mat_rho,
-            t           = self.cfg.mat_t,
-        )
-        _row("섀시 치수 (W × L × H)",
-             f"{self.cfg.tray_width:.0f} × {self.cfg.tray_length:.0f} × {self.cfg.tray_height:.0f} mm")
-        _row("재료", f"E={self.cfg.mat_E:.0f} MPa  ν={self.cfg.mat_nu}  "
-                     f"ρ={self.cfg.mat_rho:.2e} t/mm³  t={self.cfg.mat_t} mm")
-        _row("메시 크기 (XY / Z)", f"{self.cfg.mesh_xy:.0f} / {self.cfg.mesh_z:.0f} mm")
+        if getattr(self.cfg, 'input_inp', None):
+            print(f"     [외부 INP 파싱] {self.cfg.input_inp}")
+            from wht_modeler.io.calculix_reader import CalculixReader
+            reader = CalculixReader()
+            self.model = reader.read(self.cfg.input_inp)
+            self.model.build_node_array()
+            self.model.build_element_array()
+            self.node_db = {nid: nd for nid, nd in self.model.nodes.items()}
+            _row("입력 파일", Path(self.cfg.input_inp).name)
+        else:
+            self.model, self.node_db = _build_tray(
+                width       = self.cfg.tray_width,
+                length      = self.cfg.tray_length,
+                height      = self.cfg.tray_height,
+                mesh_xy     = self.cfg.mesh_xy,
+                mesh_z      = self.cfg.mesh_z,
+                draft_angle = self.cfg.draft_angle,
+                E           = self.cfg.mat_E,
+                nu          = self.cfg.mat_nu,
+                rho         = self.cfg.mat_rho,
+                t           = self.cfg.mat_t,
+            )
+            _row("섀시 치수 (W × L × H)",
+                 f"{self.cfg.tray_width:.0f} × {self.cfg.tray_length:.0f} × {self.cfg.tray_height:.0f} mm")
+            _row("재료", f"E={self.cfg.mat_E:.0f} MPa  ν={self.cfg.mat_nu}  "
+                         f"ρ={self.cfg.mat_rho:.2e} t/mm³  t={self.cfg.mat_t} mm")
+        
+        _row("메시 크기", f"XY={self.cfg.mesh_xy:.0f} / Z={self.cfg.mesh_z:.0f} mm" if not getattr(self.cfg, 'input_inp', None) else "외부 메시")
         _row("노드 / 요소", f"{len(self.node_db):,}  /  {len(self.model.elements):,}")
         _endsec()
 
@@ -1707,6 +1718,26 @@ class TopographyPipeline:
         모드 C/D + 반복 추출 (기본, --iterative-esl): (static만, provider)
         모드 C/D + 1회 추출 (--no-iterative-esl): (static+ESL 병합, None)
         """
+        if getattr(self.cfg, 'input_inp', None) and hasattr(self.model, 'load_cases') and self.model.load_cases:
+            _section("외부 하중 케이스 (INP)", "3")
+            custom_weights = {}
+            if getattr(self.cfg, 'obj_weights', None):
+                try:
+                    pairs = self.cfg.obj_weights.split(',')
+                    for p in pairs:
+                        k, v = p.split('=')
+                        custom_weights[k.strip()] = float(v.strip())
+                except Exception as e:
+                    print(f"     [경고] --obj-weights 파싱 실패: {e}")
+            
+            static_cases = []
+            for lc in self.model.load_cases:
+                w = custom_weights.get(lc.name, 1.0)
+                static_cases.append((lc.name, w, lc))
+                _row(f"Loadcase", f"{lc.name} (w={w})")
+            _endsec()
+            return static_cases, None
+
         if not getattr(self.cfg, 'dynamic_opts', None):
             # 모드 A (정적 전용): 자중 계산 후 scaled_loads를 self에 저장
             _section("정적 하중 케이스", "3")
@@ -1924,6 +1955,7 @@ class TopographyPipeline:
             max_width            = getattr(self.cfg, 'max_width', -1.0),
             max_width_weight     = getattr(self.cfg, 'max_width_weight', 1.0),
             bead_connect_start_iter  = getattr(self.cfg, 'bead_connect_start_iter', -1),
+            design_elset             = getattr(self.cfg, 'design_elset', None),
         )
         n_designs = getattr(self.cfg, 'n_designs', 1)
         _div_start = getattr(self.cfg, 'diversity_start_iter', -1)
@@ -2849,7 +2881,7 @@ def main():
 --min-width-ramp N  (기본: 10)
     --min-width-init → --min-width 선형 감소 이터레이션 수.
     너무 짧으면(< 5) 격자화(checkerboard) 불안정 위험. 충분히 길게 설정.
-    권장: 전체 iters의 30~50%. 예) --iters 30 → --min-width-ramp 10~15
+    권장: 전체 iters의 30~50%%. 예) --iters 30 → --min-width-ramp 10~15
 
 --sym-x / --no-sym-x  (기본: 활성)
     X축 기준 좌우 대칭 강제. 설계 변수와 민감도를 좌우 평균하여 동기화.
@@ -2894,7 +2926,7 @@ def main():
                이후 10 iter에 걸쳐 패널티 강도를 0 → λ(--diversity-weight)로 ramp-in.
     전략: 초기 자유 탐색으로 뼈대 확보 → N iter 이후 현재 형태에서 멀어지는 방향 탐색.
     주의: --n-designs 1(기본값)에서 단일 루프 내 적용.
-    권장: 전체 iters의 50~70%. 예) --iters 40 --diversity-start-iter 25
+    권장: 전체 iters의 50~70%%. 예) --iters 40 --diversity-start-iter 25
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 목적함수 옵션
@@ -2905,7 +2937,7 @@ def main():
               하중 크기가 다른 정적·동적 케이스 혼재 시 권장.
               C_i0 = 각 케이스 Iter 0 컴플라이언스 → 케이스 간 크기 차이 제거.
     1.0~2.0 : 정규화 + 케이스별 가중치 랜덤 변동 (의외성 탐색).
-              V=1.4 → 매 이터마다 각 케이스 가중치에 ±40% 균등 변동 적용.
+              V=1.4 → 매 이터마다 각 케이스 가중치에 ±40%% 균등 변동 적용.
               MMA가 이터마다 다른 케이스를 강조하여 단일 최소값에 고착되지 않음.
     권장: 다중 케이스 최적화 시 1.0, 다양성 탐색 시 1.2~1.5
 
@@ -2921,7 +2953,7 @@ def main():
 --obj-alpha α  (기본: 10.0, obj-type=max/sum+max 시)
     KS softmax 온도 파라미터.
     1~3  : 모든 케이스 가중 평균에 가까움 (sum과 유사)
-    10   : 최악 케이스에 ~60~80% 집중 (권장 시작값)
+    10   : 최악 케이스에 ~60~80%% 집중 (권장 시작값)
     50+  : hard-max에 근접, gradient가 나머지 케이스에서 거의 0 → 수렴 불안정
     권장: 5~20
 
@@ -3025,11 +3057,18 @@ def main():
     preset_choices = [f"[{k}] {v['label']}" for k, v in _WIZARD_PRESETS.items()]
     g1.add_argument("--preset", type=str, choices=preset_choices, default=None,
                     help="프리셋을 선택하면 지정된 옵션들이 일괄 적용됩니다. (기타 개별 옵션들을 덮어씁니다)")
-    g1.add_argument("--input-dir", type=str, default=None, widget='DirChooser',
+    g1.add_argument("--input-dir", type=str, default="", widget='DirChooser',
                     metavar="DIR",
                     help="입력 디렉토리 경로. 해당 폴더의 topo_arg.txt를 기본 옵션으로 로드하고, "
                          "하위 폴더 안의 첫 번째 .csv 파일을 --dynamic-opts에 자동 추가합니다.")
-    g1.add_argument("--pos-data", type=str, default=None, widget='FileChooser',
+    g1.add_argument("--input-inp", type=str, default="", widget='FileChooser',
+                    metavar="INP",
+                    help="CalculiX 메쉬/하중 입력 파일 경로. 지정 시 기본 형상 대신 파일을 파싱하여 토포 최적화를 수행합니다.")
+    g1.add_argument("--design-elset", type=str, default="",
+                    help="--input-inp 사용 시, 비드가 생성될 설계 영역의 ELSET 이름 (생략시 전체가 설계 영역).")
+    g1.add_argument("--obj-weights", type=str, default=None,
+                    help="다목적 함수 가중치 매핑 (예: Step1=0.6,Step2=0.4)")
+    g1.add_argument("--pos-data", type=str, default="", widget='FileChooser',
                     metavar="CSV",
                     help="[모드 B] 단독 동적 응답 해석 (최적화 미진행). "
                          "CSV 위치 데이터 경로를 지정하면 Kabsch 전처리 → 과도 응답 해석 → 결과 시각화만 실행합니다.")
@@ -3142,7 +3181,7 @@ def main():
                     help="[타임라인 4단계] 비드 연결 시작 이터 (기본: -1=β 중간 지점 자동).\n"
                          "너무 이르면: 비드가 아직 이동 중 → 연결이 area 제약에 의해 즉시 제거됨\n"
                          "권장: beta-start-iter + (iters - beta-start-iter) × 0.5\n"
-                         "  또는 -1 자동 (β가 50% 이상 상승한 시점 = 패턴 안정 후)")
+                         "  또는 -1 자동 (β가 50%% 이상 상승한 시점 = 패턴 안정 후)")
     g3.add_argument("--n-designs",        type=int,   default=1,
                     help="생성할 설계 수 (기본: 1). >1이면 수렴 후 반발 패널티로 다양성 탐색")
     g3.add_argument("--diversity-weight",     type=float, default=0.3,  help="반발 패널티 강도 λ (기본: 0.3)")

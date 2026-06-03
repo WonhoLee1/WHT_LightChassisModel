@@ -32,7 +32,13 @@
       "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -c \"from wht_topo.solver import WHTopographySolver; from wht_topo.run_topo import TopographyPipeline; print\\('OK'\\)\")",
       "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" -c \"import ast; ast.parse\\(open\\('d:/PythonCodeStudy/WHT_LightChassisModel/wht_topo/solver.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(\"C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe\" d:/PythonCodeStudy/WHT_LightChassisModel/wht_topo/run_topo.py --help)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "Bash([ -f \"$HOME/.claude/CLAUDE.md\" ])",
+      "Bash(command -v ruby)",
+      "Bash(ruby --version)",
+      "Bash(node *)",
+      "Bash(command -v omc)",
+      "Bash(omc --version)"
     ]
   }
 }

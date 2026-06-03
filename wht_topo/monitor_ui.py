@@ -1151,6 +1151,14 @@ class WHTMonitorWindow(QMainWindow):
 
     def _build_tab_curve(self):
         tab = QWidget(); lay = QVBoxLayout(tab)
+        
+        self.curve_canvas = PlotCanvas(tab)
+        self.curve_toolbar = NavigationToolbar(self.curve_canvas, tab)
+        from PySide6.QtCore import QSize
+        _sz = self.curve_toolbar.iconSize()
+        self.curve_toolbar.setIconSize(QSize(int(_sz.width() * 0.6), int(_sz.height() * 0.6)))
+        lay.addWidget(self.curve_toolbar)
+        
         ctrl = QHBoxLayout()
         self.metric_combo = QComboBox()
         self.metric_combo.setMaxVisibleItems(25)
@@ -1163,7 +1171,6 @@ class WHTMonitorWindow(QMainWindow):
         ctrl.addWidget(self.metric_combo)
         ctrl.addStretch()
         lay.addLayout(ctrl)
-        self.curve_canvas = PlotCanvas(tab)
         lay.addWidget(self.curve_canvas)
         self.tabs.addTab(tab, "Convergence Curve")
 
@@ -1172,6 +1179,13 @@ class WHTMonitorWindow(QMainWindow):
         lay = QVBoxLayout(tab)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(4)
+
+        self.height_canvas = PlotCanvas(tab)
+        self.height_toolbar = NavigationToolbar(self.height_canvas, tab)
+        from PySide6.QtCore import QSize
+        _sz = self.height_toolbar.iconSize()
+        self.height_toolbar.setIconSize(QSize(int(_sz.width() * 0.6), int(_sz.height() * 0.6)))
+        lay.addWidget(self.height_toolbar)
 
         # ── 이터레이션 선택 행 ────────────────────────────────────────────
         ctrl_iter_w = QWidget()
@@ -1216,17 +1230,11 @@ class WHTMonitorWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         lay.addWidget(splitter, stretch=1)
 
-        # 상단: 높이 분포 캔버스 + matplotlib toolbar
+        # 상단: 높이 분포 캔버스
         canvas_container = QWidget()
         canvas_vlay = QVBoxLayout(canvas_container)
         canvas_vlay.setContentsMargins(0, 0, 0, 0)
         canvas_vlay.setSpacing(0)
-        self.height_canvas = PlotCanvas(tab)
-        self.height_toolbar = NavigationToolbar(self.height_canvas, canvas_container)
-        from PySide6.QtCore import QSize
-        _sz = self.height_toolbar.iconSize()
-        self.height_toolbar.setIconSize(QSize(int(_sz.width() * 0.6), int(_sz.height() * 0.6)))
-        canvas_vlay.addWidget(self.height_toolbar)
         canvas_vlay.addWidget(self.height_canvas)
         splitter.addWidget(canvas_container)
 
@@ -1250,6 +1258,12 @@ class WHTMonitorWindow(QMainWindow):
         self.iter_mesh_btn.setToolTip("선택 이터레이션 메시를 wht_visualizer 창에 표시")
         self.iter_mesh_btn.clicked.connect(self._on_mesh_view_clicked)
         ctrl_action.addWidget(self.iter_mesh_btn)
+
+        self.iter_stats_btn = QPushButton("View Analysis Results")
+        self.iter_stats_btn.setStyleSheet("font-weight:bold;")
+        self.iter_stats_btn.setToolTip("통계 결과(응력, 변형률, 변위, 에너지 등)를 텍스트로 확인")
+        self.iter_stats_btn.clicked.connect(self._on_view_analysis_results)
+        ctrl_action.addWidget(self.iter_stats_btn)
 
         ctrl_action.addWidget(QLabel("  Load Case:"))
         self.iter_case_combo = QComboBox(); self.iter_case_combo.setMinimumWidth(160)
@@ -1974,14 +1988,38 @@ class WHTMonitorWindow(QMainWindow):
         """WHTResultData를 VTKHDF로 내보내고 ParaView를 실행합니다."""
         import tempfile, re
         from wht_converter.wht_exporters import VTKHDFExporter
-        from wht_visualizer.wht_visualizer import launch_paraview
+        from wht_visualizer.wht_visualizer import launch_paraview, paraview_warp_vector
 
         safe = re.sub(r'[^\w\-]', '_', title)[:48]
         tmp_dir = Path(tempfile.mkdtemp(prefix="wht_pv_"))
         hdf_path = str(tmp_dir / f"{safe}.hdf")
         VTKHDFExporter().export(wht_result_data, hdf_path)
         self._set_iter_status(f"ParaView HDF: {hdf_path}", "#2a7a2a")
-        launch_paraview(hdf_path)
+        # 정적(미변형) 결과는 변위로 자동 Warp, 모달/동적(이미 변형됨)은 생략
+        warp_vec = paraview_warp_vector(wht_result_data, transient_geometry=True)
+        launch_paraview(hdf_path, warp_vector=warp_vec)
+
+    def _on_view_analysis_results(self):
+        """해당 이터레이션의 해석 통계 결과를 텍스트 박스로 보여주는 다이얼로그 표시"""
+        stats_path = Path(self.results_dir) / "iter_stats.json"
+        if not stats_path.exists():
+            QMessageBox.warning(self, "경고", "해석 통계 결과 파일(iter_stats.json)이 없습니다.\n최적화가 1회 이상 진행되어야 합니다.")
+            return
+        
+        try:
+            import json
+            with open(stats_path, "r", encoding="utf-8") as f:
+                iter_stats_data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "오류", f"통계 결과 로드 실패: {e}")
+            return
+            
+        current_iter = self._get_selected_iter_num()
+        if current_iter == -1 and self.history:
+            current_iter = self.history[-1]["iter"]
+            
+        dlg = _AnalysisResultsDialog(self, iter_stats_data, current_iter)
+        dlg.exec()
 
     def _on_mesh_view_clicked(self):
         """선택 이터레이션 메시(변형 좌표)를 WHTVisualizer로 표시합니다."""
@@ -3133,6 +3171,63 @@ class _TeeStream:
     def __getattr__(self, attr):
         return getattr(self._orig, attr)
 
+class _AnalysisResultsDialog(QDialog):
+    def __init__(self, parent=None, iter_stats_data=None, initial_iter=0):
+        super().__init__(parent)
+        self.setWindowTitle("Analysis Results")
+        self.resize(600, 500)
+        self.iter_stats_data = iter_stats_data or []
+        self._build_ui(initial_iter)
+
+    def _build_ui(self, initial_iter):
+        lay = QVBoxLayout(self)
+        
+        top_lay = QHBoxLayout()
+        top_lay.addWidget(QLabel("Select Iteration:"))
+        self.combo = QComboBox()
+        for item in self.iter_stats_data:
+            self.combo.addItem(f"Iteration {item['iter']}", userData=item)
+            
+        top_lay.addWidget(self.combo)
+        top_lay.addStretch()
+        lay.addLayout(top_lay)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        font = self.text_edit.font()
+        font.setFamily("Consolas")
+        self.text_edit.setFont(font)
+        lay.addWidget(self.text_edit)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.reject)
+        lay.addWidget(btn_box)
+
+        self.combo.currentIndexChanged.connect(self._on_combo_changed)
+        
+        idx = 0
+        for i, item in enumerate(self.iter_stats_data):
+            if item["iter"] == initial_iter:
+                idx = i
+                break
+        self.combo.setCurrentIndex(idx)
+        self._on_combo_changed(idx)
+
+    def _on_combo_changed(self, idx):
+        if idx < 0 or idx >= len(self.iter_stats_data):
+            return
+        item = self.iter_stats_data[idx]
+        text_lines = []
+        text_lines.append(f"Iteration: {item['iter']}")
+        text_lines.append("-" * 50)
+        for case_name, stats in item.get("cases", {}).items():
+            text_lines.append(f"\n[Load Case: {case_name}]")
+            for k, v in stats.items():
+                if isinstance(v, float):
+                    text_lines.append(f"  {k:<30}: {v:.6e}")
+                else:
+                    text_lines.append(f"  {k:<30}: {v}")
+        self.text_edit.setPlainText("\\n".join(text_lines))
 
 def start_monitor_ui(queue, stop_event=None, results_dir: str = "",
                      num_modal_modes: int = 20):
