@@ -326,6 +326,7 @@ class WHTVisualizer:
         self._is_updating = False
         self._is_ready = False
         self._kabsch = None  # KabschPreprocessor instance (강체 변환 시각화용)
+        self._ground_actor = None  # Ground plane actor (투명 바닥면)
         
         # State: Multi-Part Management
         self.parts: Dict[str, dict] = {} # {name: {"mesh": Grid, "actor": Actor, "style": dict}}
@@ -663,7 +664,43 @@ class WHTVisualizer:
         group_query.setLayout(vbox_query)
         # --------------------------------------------
         
+        # Ground Plane Group
+        group_ground = QtWidgets.QGroupBox("Ground")
+        vbox_ground = QtWidgets.QVBoxLayout()
+        vbox_ground.setSpacing(3)
+
+        hbox_ground = QtWidgets.QHBoxLayout()
+        hbox_ground.setSpacing(5)
+
+        self.chk_ground = QtWidgets.QCheckBox("Ground")
+        self.chk_ground.setChecked(False)
+        self.chk_ground.setToolTip("원점 기준 투명 바닥면을 표시합니다.")
+        self.chk_ground.stateChanged.connect(self._update_ground_plane)
+        hbox_ground.addWidget(self.chk_ground)
+
+        self.combo_ground_dir = QtWidgets.QComboBox()
+        self.combo_ground_dir.addItems(["XY", "XZ", "YZ"])
+        self.combo_ground_dir.setFixedWidth(55)
+        self.combo_ground_dir.setToolTip("바닥면 방향")
+        self.combo_ground_dir.currentTextChanged.connect(self._update_ground_plane)
+        hbox_ground.addWidget(self.combo_ground_dir)
+
+        hbox_ground.addWidget(QtWidgets.QLabel("Offset:"))
+        self.spin_ground_offset = QtWidgets.QDoubleSpinBox()
+        self.spin_ground_offset.setRange(-1e6, 1e6)
+        self.spin_ground_offset.setValue(0.0)
+        self.spin_ground_offset.setSingleStep(10.0)
+        self.spin_ground_offset.setFixedWidth(80)
+        self.spin_ground_offset.setToolTip("원점 기준 수직 오프셋 [mm]")
+        self.spin_ground_offset.valueChanged.connect(self._update_ground_plane)
+        hbox_ground.addWidget(self.spin_ground_offset)
+        hbox_ground.addStretch()
+
+        vbox_ground.addLayout(hbox_ground)
+        group_ground.setLayout(vbox_ground)
+
         prop_layout.addWidget(group_deform)
+        prop_layout.addWidget(group_ground)
         prop_layout.addWidget(group_contour)
         prop_layout.addWidget(group_query)
 
@@ -778,6 +815,62 @@ class WHTVisualizer:
         self.anim_timer = QtCore.QTimer(self.plotter.app_window)
         self.anim_timer.timeout.connect(self._on_animation_tick)
         self.is_playing = False
+
+    def _update_ground_plane(self, *_):
+        """Ground 체크박스/방향/오프셋 변경 시 투명 바닥면 액터를 갱신한다."""
+        if self._ground_actor is not None:
+            self.plotter.remove_actor(self._ground_actor)
+            self._ground_actor = None
+
+        if not self.chk_ground.isChecked():
+            self.plotter.render()
+            return
+
+        # 모델 범위로 plane 크기 결정 (결과 없으면 기본 1000mm)
+        if self.parts:
+            all_bounds = []
+            for p in self.parts.values():
+                if "mesh" in p:
+                    all_bounds.append(p["mesh"].bounds)
+            if all_bounds:
+                b = np.array(all_bounds)
+                span = max(b[:, 1].max() - b[:, 0].min(),
+                           b[:, 3].max() - b[:, 2].min(),
+                           b[:, 5].max() - b[:, 4].min(), 1.0)
+                size = span * 1.5
+            else:
+                size = 1000.0
+        else:
+            size = 1000.0
+
+        direction = self.combo_ground_dir.currentText()
+        offset = self.spin_ground_offset.value()
+
+        if direction == "XY":
+            center = (0.0, 0.0, offset)
+            normal = (0.0, 0.0, 1.0)
+            i_size, j_size = size, size
+        elif direction == "XZ":
+            center = (0.0, offset, 0.0)
+            normal = (0.0, 1.0, 0.0)
+            i_size, j_size = size, size
+        else:  # YZ
+            center = (offset, 0.0, 0.0)
+            normal = (1.0, 0.0, 0.0)
+            i_size, j_size = size, size
+
+        plane = pv.Plane(center=center, direction=normal,
+                         i_size=i_size, j_size=j_size,
+                         i_resolution=1, j_resolution=1)
+        self._ground_actor = self.plotter.add_mesh(
+            plane,
+            color="lightblue",
+            opacity=0.25,
+            show_edges=False,
+            lighting=False,
+            name="_ground_plane",
+        )
+        self.plotter.render()
 
     def _setup_view_controls(self):
         """Sets up key events and prepares for context menu."""
