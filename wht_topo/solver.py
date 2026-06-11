@@ -120,7 +120,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
 
-from wht_modeler.wht_mesh_model import WHTMeshModel, WHTSPCEntry
+from wht_modeler.wht_mesh_model import WHTMeshModel
 from wht_solver.wht_solver import WHTSolver
 from wht_topo.loads import StochasticLoadManager
 from wht_topo.mma import MMAOptimizer
@@ -278,6 +278,7 @@ class WHTopographySolver:
         n_workers: int = 4,
         modal_modes: int = 20,
         vol_ramp_iters: int = 5,
+        bead_area_init: float = -1.0,
         bidirectional: bool = False,
         min_width_init: float = -1.0,
         min_width_ramp_iters: int = 0,
@@ -295,6 +296,11 @@ class WHTopographySolver:
         self.h_max          = bead_height_max
         self.h_ratio        = bead_height_ratio
         self.vol_ramp_iters = vol_ramp_iters
+        # area ramp 시작값: -1=자동(h_ratio+0.25, high→low), ≥0=지정값(양방향 지원)
+        if bead_area_init < 0.0:
+            self._area_start = min(0.85, bead_height_ratio + 0.25)
+        else:
+            self._area_start = float(np.clip(bead_area_init, 0.0, 1.0))
         self.bidirectional  = bidirectional    # True: x→(x-0.5)*2*h_max, ±방향 모두 허용
         _rmin_start         = min_width_init if min_width_init > min_width else min_width
         self.rmin           = _rmin_start
@@ -458,10 +464,21 @@ class WHTopographySolver:
         else:
             # [중요] 고분산 난수 초기장으로 대칭 파괴 + 공간 대비 씨앗 확보.
             # 균일 초기화(모두 같은 값)는 균일해에 갇히는 원인 → 반드시 분산 유지.
-            # 평균을 시작 vol_target 부근으로 스케일하되 full random 분산은 보존.
+            # _area_start 에 따라 x0 초기 분포를 결정 (occ 임계값 ~0.5 기준).
             if getattr(self, 'vol_ramp_iters', 0) > 0:
-                _start_vol = min(0.85, bead_height_ratio + 0.25)  # 목표+여유, 대비 보존(≤0.85)
-                x0 = np.clip(x0 * (_start_vol / max(x0.mean(), 1e-6)), 0.01, 0.99)
+                _as = self._area_start
+                if _as < 0.05:
+                    # 평판 출발: 모든 요소 임계값 이하 → 비드 없는 상태
+                    x0 = rng.uniform(0.01, 0.44, self._n_design)
+                elif _as > 0.95:
+                    # 전체 비드 출발: 모든 요소 임계값 이상
+                    x0 = rng.uniform(0.56, 0.99, self._n_design)
+                else:
+                    # 혼합: _as 비율 요소는 임계값 위, 나머지는 아래
+                    x0_lo = rng.uniform(0.01, 0.44, self._n_design)
+                    x0_hi = rng.uniform(0.56, 0.99, self._n_design)
+                    mask  = rng.random(self._n_design) < _as
+                    x0    = np.where(mask, x0_hi, x0_lo)
             else:
                 x0 = np.clip(x0 * (bead_height_ratio / max(x0.mean(), 1e-6)), 0.01, 0.99)
             self.heights = x0 * self.h_max
@@ -1594,22 +1611,18 @@ class WHTopographySolver:
                     "max_stress": res["max_stress"]
                 }
             
-            # ── Iter 0 모달 해석 (Ref. 주파수) ──────────────────────────────
+            # ── Iter 0 모달 해석 (Ref. 주파수, 표시 전용) ───────────────────
+            # SPC 완전 제거 → free-free: 강체 6모드 + 탄성 모드, exclude_rigid_body=True로 표시.
             _ref_freqs = []
             _orig_spcs = list(fea_solver.model.spc_conditions)
             try:
-                _spcd_nids = [nid for nid in fea_solver.model.nodes if nid >= 900000]
-                _temp_spcs = [WHTSPCEntry(nid, (0,1,2,3,4,5), 0.0) for nid in _spcd_nids]
-                # SPCD 노드가 있으면 해당 노드만 고정(free-free + SPCD 고정),
-                # SPCD 노드가 없으면 원래 SPC 유지(강체 모드 방지)
-                fea_solver.model.spc_conditions = _temp_spcs if _spcd_nids else _orig_spcs
-                
-                # 구속 모달 해석이므로 exclude_rigid_body=False로 강체 모드 제외 비활성화 및 shift_hz=0.0 설정
+                fea_solver.model.spc_conditions = []  # free-free
                 _ref_modal = fea_solver.solve_modal(
-                    num_modes=self.modal_modes, exclude_rigid_body=False, shift_hz=0.0
+                    num_modes=self.modal_modes + 6,
+                    exclude_rigid_body=True, shift_hz=0.5
                 )
                 _ref_freqs = _ref_modal.frequencies.tolist()
-                print(f"   [Iter 0] 초기 고유진동수: "
+                print(f"   [Iter 0] 초기 고유진동수 (free-free): "
                       f"{', '.join(f'{f:.2f}Hz' for f in _ref_freqs[:6])}"
                       f"{'...' if len(_ref_freqs) > 6 else ''}")
             except Exception as _e:
@@ -1755,29 +1768,18 @@ class WHTopographySolver:
                 C_0 = max(abs(float(C_total)), 1e-6)
                 self._C_0_cases = dict(self._C_0_cases_flat)
 
-            # ── 고유진동수 해석 (--modal-modes로 모드 수 제어) ──
+            # ── 고유진동수 해석 (주파수 테이블 표시 전용) ──────────────────────
+            # SPC 완전 제거 → free-free 해석: 어느 이터레이션에서도 강체 모드 6개가
+            # 항상 나타남 → exclude_rigid_body=True 로 제거 후 탄성 모드만 표시.
+            # [주의] 이 모달 해석은 "표시 전용". 정하중/ESL FEA는 orig_spcs 복원 후 수행.
             orig_spcs = list(fea_solver.model.spc_conditions)
             try:
-                # [WHT] 실제 모델의 코너(마운트부) 노드 및 SPCD 마스터 노드를 구속하여 모달 해석
-                from wht_modeler.wht_mesh_model import WHTSPCEntry
-                from wht_topo.loads import StochasticLoadManager
-                
-                lm = StochasticLoadManager(fea_solver.model)
-                corner_nids = set()
-                for corner_idx in range(4):
-                    # 반경 50mm 이내의 코너 노드 선택 (너무 넓게 잡히지 않도록 조절)
-                    corner_nids.update(lm.get_corner_nodes(corner_idx, radius=50.0))
-                
-                _spcd_nids = [nid for nid in fea_solver.model.nodes if nid >= 900000 or nid in corner_nids]
-                # 코너부는 병진(Translation: 0,1,2)만 구속하여 과구속(over-constraint) 방지
-                _temp_spcs = [WHTSPCEntry(nid, (0,1,2), 0.0) for nid in _spcd_nids]
-                fea_solver.model.spc_conditions = _temp_spcs if _spcd_nids else orig_spcs
-
-                # 코너부 구속 모드 해석: exclude_rigid_body=False 및 shift_hz=0.0 설정으로 탄성 모드 보존
+                fea_solver.model.spc_conditions = []   # SPC 완전 제거 → free-free
                 modal_results = fea_solver.solve_modal(
-                    num_modes=self.modal_modes, exclude_rigid_body=False, shift_hz=0.0
+                    num_modes=self.modal_modes + 6,    # 강체 모드 6개 여유 포함
+                    exclude_rigid_body=True, shift_hz=0.5
                 )
-                freqs = modal_results.frequencies  # Hz
+                freqs = modal_results.frequencies  # Hz (강체 모드 제외된 탄성 모드)
             except Exception as e:
                 print(f"    [경고] 고유진동수 해석 실패 (Iter {i}): {e}")
                 modal_results = None
@@ -2122,16 +2124,14 @@ class WHTopographySolver:
             if self.sym_x:
                 df0dx = 0.5 * (df0dx + df0dx[self._sym_map])
 
-            # ── vol_frac ramping: start_vol → h_ratio (처음 vol_ramp_iters 구간) ──
-            # [중요] 토포그래피는 밀도 토폴로지와 다름.
-            #   area=mean(x_proj), x_proj∈[0,1] → area=1.0이면 모든 x_proj=1.0(균일)
-            #   = 평판의 균일 z-offset = 비드(굴곡) 없음 = 위상 대비 0.
-            # 따라서 시작값은 1.0 미만이어야 공간 대비가 존재하고 패턴이 형성됨.
-            # 목표의 약 2배(상한 0.6)에서 시작 → 초기 자유도 확보 + 대비 유지.
+            # ── vol_frac ramping: _area_start → h_ratio (처음 vol_ramp_iters 구간) ──
+            # _area_start > h_ratio: high→low (기본 자동 모드)
+            # _area_start < h_ratio: low→high (--bead-area-init 0.0 등)
+            # _area_start == h_ratio: 램프 없이 즉시 목표값 고정
+            # 양방향 선형 보간: iter=0→target=_area_start, iter=ramp_n→target=h_ratio
             _ramp_n = max(1, self.vol_ramp_iters)
             _t = min(1.0, i / _ramp_n)          # 0.0(iter=0) → 1.0(iter=ramp_n)
-            _start_vol = min(0.85, self.h_ratio + 0.25)  # 목표+여유, 대비 보존(≤0.85)
-            _vol_target = _start_vol - _t * (_start_vol - self.h_ratio)
+            _vol_target = self._area_start + _t * (self.h_ratio - self._area_start)
 
             # ── 비드 연결 활성화 시점 ──────────────────────────────────────────
             # vol_ramp 완료(area가 목표 도달, 패턴 대략 배치) 직후부터 연결 시작.
@@ -2225,6 +2225,33 @@ class WHTopographySolver:
                 vol_target=_vol_target_eff,
             )
             x = np.clip(x, 0.0, 1.0)
+
+            # ── area equality 강제: 균일 오프셋 binary-search ──────────────────
+            # MMA bisection은 area ≤ target (단방향 부등호).
+            # ramp-up(저→고) 구간에서 move 한계로 target 미달 시 언더슈트 발생.
+            # 보정: x에 균일 δ ∈ [-move, move]를 더해 mean(occ(H@x)) = target 달성.
+            _area_after = float(np.mean(_occ(self._H @ x)))
+            if abs(_area_after - _vol_target_eff) > 5e-3:
+                _mv = float(self.mma.move)
+                lo_s, hi_s = max(-_mv, -float(x.min())), min(_mv, 1.0 - float(x.max()))
+                # hi_s 방향에서 area > target 인지 확인해 이분법 방향 결정
+                _area_hi = float(np.mean(_occ(self._H @ np.clip(x + hi_s, 0.0, 1.0))))
+                _area_lo = float(np.mean(_occ(self._H @ np.clip(x + lo_s, 0.0, 1.0))))
+                if _area_lo <= _vol_target_eff <= _area_hi:
+                    for _ in range(30):
+                        _s = (lo_s + hi_s) * 0.5
+                        _at = float(np.mean(_occ(self._H @ np.clip(x + _s, 0.0, 1.0))))
+                        if _at < _vol_target_eff:
+                            lo_s = _s
+                        else:
+                            hi_s = _s
+                    x = np.clip(x + (lo_s + hi_s) * 0.5, 0.0, 1.0)
+                # target이 달성 가능 범위 밖이면 이동 한계 내 최대 근사값 사용
+                elif _area_hi < _vol_target_eff:
+                    x = np.clip(x + hi_s, 0.0, 1.0)  # 최대 면적으로 이동
+                # _area_lo > target: 이미 lo 경계도 초과 → lo로 이동
+                elif _area_lo > _vol_target_eff:
+                    x = np.clip(x + lo_s, 0.0, 1.0)
 
             # ── 비드 연결 phase 2: 물리적 closing 적용 (패턴 안정 후에만) ───────────
             if _bead_connect_active:

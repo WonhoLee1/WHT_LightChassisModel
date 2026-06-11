@@ -1936,6 +1936,7 @@ class TopographyPipeline:
             n_workers         = self.cfg.n_workers,
             modal_modes       = self.cfg.modal_modes,
             vol_ramp_iters       = getattr(self.cfg, 'bead_area_ramp', 5),
+            bead_area_init       = getattr(self.cfg, 'bead_area_init', -1.0),
             bidirectional        = getattr(self.cfg, 'bead_bidirectional', False),
             min_width_init       = getattr(self.cfg, 'min_width_init', -1.0),
             min_width_ramp_iters = getattr(self.cfg, 'min_width_ramp', 10),
@@ -3122,8 +3123,13 @@ def main():
                          "→ 다중 하중(twisting/lifting) 유리. 작을수록 집중된 소수 비드.")
     g3.add_argument("--bead-bidirectional", action="store_true", default=False,
                     help="양방향 비드 (±방향 동시 최적화). colorbar: coolwarm ±h_max.")
+    g3.add_argument("--bead-area-init",   type=float, default=-1.0,
+                    help="비드 면적 비율 초기값 (-1=자동, 0.0=평판 출발, 1.0=전체 비드 출발).\n"
+                         "-1(자동): bead-area+0.25에서 시작해 bead-area로 감소 (기존 동작).\n"
+                         "0.0: 평판(비드 없음)에서 출발 → bead-area까지 ramp-up.\n"
+                         "ramp 방향(증가/감소) 모두 bead-area-ramp 이터에 걸쳐 목표 도달.")
     g3.add_argument("--bead-area-ramp",   type=int,   default=6,
-                    help="[타임라인 1단계] 면적 비율을 1.0 → bead-area까지 줄이는 이터 수 (기본: 6).\n"
+                    help="[타임라인 1단계] 면적 비율을 bead-area-init → bead-area까지 조정하는 이터 수 (기본: 6).\n"
                          "권장: iters × 0.3  (iters=20이면 6, iters=30이면 9)\n"
                          "너무 짧으면: 면적이 빨리 잠겨 β 상승 시 비드가 사라짐 (살두께 소멸)\n"
                          "너무 길면:  형상이 자유도 높은 상태에서 수렴 → 특징 없는 균일 패턴")
