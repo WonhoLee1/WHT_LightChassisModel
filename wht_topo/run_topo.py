@@ -3210,7 +3210,7 @@ def main():
     sym_group.gooey_options = {'initial_selection': 0}
     sym_group.add_argument("--sym-x",    dest="sym_x", action="store_const", const=True,  default=True, help="좌우 대칭 활성화 (기본)")
     sym_group.add_argument("--no-sym-x", dest="sym_x", action="store_const", const=False,               help="좌우 대칭 해제")
-    g3.add_argument("--bead-connect",          type=float, default=220.0,
+    g3.add_argument("--bead-connect",          type=float, default=150.0,
                     help="비드 자동 연결 최대 갭 mm (기본: 220.0, 0=비활성).\n"
                          "인접 비드 섬을 브릿지로 연결. 너무 크면 과도하게 연결되어 패턴 왜곡.")
     g3.add_argument("--bead-connect-alg",      type=str,   default="geodesic",

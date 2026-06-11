@@ -1640,7 +1640,7 @@ class WHTopographySolver:
             try:
                 fea_solver.model.spc_conditions = []  # free-free
                 _ref_modal = fea_solver.solve_modal(
-                    num_modes=self.modal_modes + 6,
+                    num_modes=self.modal_modes,
                     exclude_rigid_body=True, shift_hz=0.5
                 )
                 _ref_freqs = _ref_modal.frequencies.tolist()
@@ -1798,7 +1798,7 @@ class WHTopographySolver:
             try:
                 fea_solver.model.spc_conditions = []   # SPC 완전 제거 → free-free
                 modal_results = fea_solver.solve_modal(
-                    num_modes=self.modal_modes + 6,    # 강체 모드 6개 여유 포함
+                    num_modes=self.modal_modes,    # 하위 모듈이 내부에서 +6 처리함
                     exclude_rigid_body=True, shift_hz=0.5
                 )
                 freqs = modal_results.frequencies  # Hz (강체 모드 제외된 탄성 모드)

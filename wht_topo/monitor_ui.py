@@ -987,16 +987,25 @@ class WHTMonitorWindow(QMainWindow):
                 if case_name not in self.case_names:
                     self.case_names.append(case_name)
 
-            # height_snapshots → slider/combo 복원
+            # height_snapshots → slider/combo/list 복원
             if self.height_snapshots and self.height_iter_combo:
                 self.height_iter_combo.blockSignals(True)
                 self.height_iter_combo.clear()
-                self.height_iter_combo.addItem("Latest")
-                for sn in reversed(self.height_snapshots):   # 최신→구 순서 (insertItem(1) 패턴과 일치)
-                    self.height_iter_combo.addItem(f"Iter {sn['iter']}")
+                for sn in self.height_snapshots:
+                    self.height_iter_combo.addItem(f"Iter {sn['iter']:03d}")
                 self.height_iter_combo.blockSignals(False)
+            if self.iter_list and self.height_snapshots:
+                self.iter_list.blockSignals(True)
+                self.iter_list.clear()
+                for sn in self.height_snapshots:
+                    self.iter_list.addItem(f"Iter {sn['iter']:03d}")
+                self.iter_list.blockSignals(False)
             if self.height_slider and self.height_snapshots:
-                self.height_slider.setMaximum(len(self.height_snapshots))
+                self.height_slider.blockSignals(True)
+                self.height_slider.setMinimum(0)
+                self.height_slider.setMaximum(len(self.height_snapshots) - 1)
+                self.height_slider.setValue(len(self.height_snapshots) - 1)
+                self.height_slider.blockSignals(False)
 
             # 곡선 및 비드 높이 플롯 업데이트
             if self.history["iter"]:
@@ -1009,27 +1018,40 @@ class WHTMonitorWindow(QMainWindow):
                 self.modal_table.setColumnCount(1)
                 self.modal_table.setHorizontalHeaderLabels(["Ref. (Hz)"])
                 if self.ref_freqs:
+                    n_needed = len(self.ref_freqs) + 1
+                    if self.modal_table.rowCount() < n_needed:
+                        self.modal_table.setRowCount(n_needed)
+                    self.modal_table.setVerticalHeaderLabels(
+                        ["RBody Modes"] + [f"Mode {i+1}" for i in range(len(self.ref_freqs))]
+                    )
+                    self.modal_table.setItem(0, 0, QTableWidgetItem("6"))
                     for idx_f, f in enumerate(self.ref_freqs):
-                        if idx_f < self.modal_table.rowCount():
+                        if idx_f + 1 < self.modal_table.rowCount():
                             self.modal_table.setItem(
-                                idx_f, 0, QTableWidgetItem(f"{f:.2f}"))
+                                idx_f + 1, 0, QTableWidgetItem(f"{f:.2f}")
+                            )
+
                 for idx_i, it in enumerate(self.history["iter"]):
                     freqs = self.history["frequencies"][idx_i]
                     if freqs:
-                        n_needed = len(freqs)
+                        n_needed = len(freqs) + 1
                         if self.modal_table.rowCount() < n_needed:
                             self.modal_table.setRowCount(n_needed)
-                            self.modal_table.setVerticalHeaderLabels(
-                                [f"Mode {i+1}" for i in range(n_needed)])
+                        self.modal_table.setVerticalHeaderLabels(
+                            ["RBody Modes"] + [f"Mode {i+1}" for i in range(len(freqs))]
+                        )
                         col = self.modal_table.columnCount()
                         self.modal_table.insertColumn(col)
                         self.modal_table.setColumnWidth(col, 80)
                         self.modal_table.setHorizontalHeaderItem(
-                            col, QTableWidgetItem(f"Iter {it}"))
+                            col, QTableWidgetItem(f"Iter {it}")
+                        )
+                        self.modal_table.setItem(0, col, QTableWidgetItem("6"))
                         for idx_f, f in enumerate(freqs):
-                            if idx_f < self.modal_table.rowCount():
+                            if idx_f + 1 < self.modal_table.rowCount():
                                 self.modal_table.setItem(
-                                    idx_f, col, QTableWidgetItem(f"{f:.2f}"))
+                                    idx_f + 1, col, QTableWidgetItem(f"{f:.2f}")
+                                )
 
             # iteration 결과 테이블 복원
             if self.table and self.history.get("iter"):
@@ -1226,51 +1248,63 @@ class WHTMonitorWindow(QMainWindow):
             self.modal_table.setColumnCount(1)
             self.modal_table.setHorizontalHeaderLabels(["Ref. (Hz)"])
             if self.ref_freqs:
+                n_needed = len(self.ref_freqs) + 1
+                if self.modal_table.rowCount() < n_needed:
+                    self.modal_table.setRowCount(n_needed)
+                    self.modal_table.setVerticalHeaderLabels(["RBody Modes"] + [f"Mode {i+1}" for i in range(len(self.ref_freqs))])
+                self.modal_table.setItem(0, 0, QTableWidgetItem("6"))
                 for idx_f, f in enumerate(self.ref_freqs):
-                    if idx_f < self.modal_table.rowCount():
-                        self.modal_table.setItem(idx_f, 0, QTableWidgetItem(f"{f:.2f}"))
+                    if idx_f + 1 < self.modal_table.rowCount():
+                        self.modal_table.setItem(idx_f + 1, 0, QTableWidgetItem(f"{f:.2f}"))
                         
             for idx_i, it in enumerate(self.history["iter"]):
                 freqs = self.history["frequencies"][idx_i]
                 if freqs:
-                    n_needed = len(freqs)
+                    n_needed = len(freqs) + 1
                     if self.modal_table.rowCount() < n_needed:
                         self.modal_table.setRowCount(n_needed)
                         self.modal_table.setVerticalHeaderLabels(
-                            [f"Mode {i+1}" for i in range(n_needed)])
+                            ["RBody Modes"] + [f"Mode {i+1}" for i in range(len(freqs))])
                     col = self.modal_table.columnCount()
                     self.modal_table.insertColumn(col)
                     self.modal_table.setColumnWidth(col, 80)
                     self.modal_table.setHorizontalHeaderItem(col, QTableWidgetItem(f"Iter {it}"))
+                    self.modal_table.setItem(0, col, QTableWidgetItem("6"))
                     for idx_f, f in enumerate(freqs):
-                        if idx_f < self.modal_table.rowCount():
-                            self.modal_table.setItem(idx_f, col, QTableWidgetItem(f"{f:.2f}"))
+                        if idx_f + 1 < self.modal_table.rowCount():
+                            self.modal_table.setItem(idx_f + 1, col, QTableWidgetItem(f"{f:.2f}"))
             self.modal_table.scrollToBottom()
 
         # ── 콤보박스 및 슬라이더 복원 ─────────────────────────────────────────────
         if self.height_iter_combo and self.history["iter"]:
             self.height_iter_combo.blockSignals(True)
             self.height_iter_combo.clear()
-            self.height_iter_combo.addItem("Latest")
-            for it in reversed(self.history["iter"]):
+            for it in self.history["iter"]:
                 self.height_iter_combo.addItem(f"Iter {it:03d}")
             self.height_iter_combo.blockSignals(False)
         if self.iter_list and self.history["iter"]:
             self.iter_list.blockSignals(True)
             self.iter_list.clear()
-            self.iter_list.addItem("Latest")
-            for it in reversed(self.history["iter"]):
+            for it in self.history["iter"]:
                 self.iter_list.addItem(f"Iter {it:03d}")
-            self.iter_list.setCurrentRow(0)
             self.iter_list.blockSignals(False)
             
         if self.height_slider and self.history["iter"]:
             self.height_slider.blockSignals(True)
-            max_it = max(self.history["iter"])
+            max_idx = len(self.history["iter"]) - 1
             self.height_slider.setMinimum(0)
-            self.height_slider.setMaximum(max_it)
-            self.height_slider.setValue(max_it)
+            self.height_slider.setMaximum(max_idx)
+            self.height_slider.setValue(max_idx)
             self.height_slider.blockSignals(False)
+
+            if self.iter_list:
+                self.iter_list.blockSignals(True)
+                self.iter_list.setCurrentRow(max_idx)
+                self.iter_list.blockSignals(False)
+            if self.height_iter_combo:
+                self.height_iter_combo.blockSignals(True)
+                self.height_iter_combo.setCurrentIndex(max_idx)
+                self.height_iter_combo.blockSignals(False)
 
         # ── 그래프 및 시각화 갱신 ────────────────────────────────────────────────
         self._update_curves()
@@ -1484,31 +1518,56 @@ class WHTMonitorWindow(QMainWindow):
             if k in settings: _add_row(k, settings[k])
 
     def _build_tab_summary(self):
-        tab = QWidget(); lay = QVBoxLayout(tab)
-        self.table = QTableWidget(0, 2)
+        tab = QWidget(); lay = QHBoxLayout(tab)
+        lay.setContentsMargins(2, 2, 2, 2); lay.setSpacing(0)
+
+        # 좌측 고정 테이블
+        self.table_left = QTableWidget(0, 3)
+        self.table_left.setWordWrap(True)
+        self.table_left.setHorizontalHeaderLabels(["No.", "항목", "설명"])
+        self.table_left.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table_left.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table_left.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
+        self.table_left.setColumnWidth(1, 80)
+        self.table_left.setColumnWidth(2, 180)
+        self.table_left.verticalHeader().hide()
+        self.table_left.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table_left.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table_left.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table_left.setFixedWidth(400)
+        self.table_left.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+        # 우측 스크롤 테이블
+        self.table = QTableWidget(0, 0)
         self.table.setWordWrap(True)
-        self.table.setHorizontalHeaderLabels(["항목", "설명"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
-        self.table.setColumnWidth(1, 180)
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self._on_table_header_context_menu)
+
+        # 스크롤 동기화
+        self.table.verticalScrollBar().valueChanged.connect(self.table_left.verticalScrollBar().setValue)
+        self.table_left.verticalScrollBar().valueChanged.connect(self.table.verticalScrollBar().setValue)
+
         self._table_row_keys = []
-        for key, name, desc in self._TABLE_ROW_META:
-            self._append_summary_row(key, name, desc)
-        lay.addWidget(self.table)
+        for i, (key, name, desc) in enumerate(self._TABLE_ROW_META, 1):
+            self._append_summary_row(key, name, desc, idx=i)
+
+        lay.addWidget(self.table_left)
+        lay.addWidget(self.table, stretch=1)
         self.tabs.addTab(tab, "Summary Table")
 
-    def _append_summary_row(self, key: str, name: str, desc: str):
+    def _append_summary_row(self, key: str, name: str, desc: str, idx: int = None):
         """Summary Table에 새 행(항목)을 추가합니다."""
-        row = self.table.rowCount()
+        row = self.table_left.rowCount()
+        self.table_left.insertRow(row)
         self.table.insertRow(row)
-        for col, text in enumerate([name, desc]):
+        if idx is None:
+            idx = row + 1
+        for col, text in enumerate([f"{idx:02d}", name, desc]):
             item = QTableWidgetItem(text)
             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.table.setItem(row, col, item)
+            self.table_left.setItem(row, col, item)
         self._table_row_keys.append(key)
 
     def _table_row_of(self, key: str) -> int:
@@ -1523,7 +1582,7 @@ class WHTMonitorWindow(QMainWindow):
         col = self.table.columnCount()
         self.table.insertColumn(col)
         self.table.setHorizontalHeaderItem(col, QTableWidgetItem(f"Iter {it:03d}"))
-        self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.Interactive)
         self.table.setColumnWidth(col, 90)
         for key, val in val_map.items():
             r = self._table_row_of(key)
@@ -1587,11 +1646,11 @@ class WHTMonitorWindow(QMainWindow):
         left_lay.addWidget(self._show_legend_check)
 
         cols_row = QHBoxLayout()
-        cols_row.addWidget(QLabel("Subplot 열:"))
+        cols_row.addWidget(QLabel("Subplot Rows:"))
         self._subplot_cols_spin = QSpinBox()
-        self._subplot_cols_spin.setRange(1, 6)
+        self._subplot_cols_spin.setRange(1, 10)
         self._subplot_cols_spin.setValue(2)
-        self._subplot_cols_spin.setToolTip("복수 선택 시 subplot 최대 열 수")
+        self._subplot_cols_spin.setToolTip("복수 선택 시 subplot 최대 행 수")
         self._subplot_cols_spin.valueChanged.connect(self._update_curves)
         cols_row.addWidget(self._subplot_cols_spin)
         cols_row.addStretch()
@@ -1636,7 +1695,6 @@ class WHTMonitorWindow(QMainWindow):
         ctrl_iter.setContentsMargins(0, 0, 0, 0)
         self.height_iter_combo = QComboBox()
         self.height_iter_combo.setMaxVisibleItems(25)
-        self.height_iter_combo.addItem("Latest")
         self.height_iter_combo.currentIndexChanged.connect(self._on_height_combo_changed)
         self.btn_prev_h = QPushButton("<"); self.btn_prev_h.setFixedWidth(30)
         self.btn_prev_h.clicked.connect(self._on_prev_height)
@@ -1664,6 +1722,19 @@ class WHTMonitorWindow(QMainWindow):
         self.height_contour_check.stateChanged.connect(self._update_height_plot)
         ctrl_iter.addWidget(self.height_contour_check)
 
+        ctrl_iter.addWidget(QLabel("  |  "))
+        self._iter_show_legend = QCheckBox("Legend 표시")
+        self._iter_show_legend.setChecked(True)
+        self._iter_show_legend.stateChanged.connect(self._update_height_plot)
+        ctrl_iter.addWidget(self._iter_show_legend)
+
+        ctrl_iter.addWidget(QLabel("  Subplot Rows:"))
+        self._iter_subplot_cols_spin = QSpinBox()
+        self._iter_subplot_cols_spin.setRange(1, 10)
+        self._iter_subplot_cols_spin.setValue(2)
+        self._iter_subplot_cols_spin.valueChanged.connect(self._update_height_plot)
+        ctrl_iter.addWidget(self._iter_subplot_cols_spin)
+
         ctrl_iter.addStretch()
         lay.addWidget(ctrl_iter_w)
 
@@ -1674,55 +1745,36 @@ class WHTMonitorWindow(QMainWindow):
 
         # ── 왼쪽: iter 목록 + 컨트롤 ──────────────────────────────────────
         iter_list_w = QWidget()
-        iter_list_w.setMinimumWidth(110)
-        iter_list_w.setMaximumWidth(180)
+        iter_list_w.setMinimumWidth(154)
+        iter_list_w.setMaximumWidth(220)
         _il_lay = QVBoxLayout(iter_list_w)
         _il_lay.setContentsMargins(4, 4, 4, 4)
         _il_lay.setSpacing(4)
         _il_lay.addWidget(QLabel("Iterations (Ctrl+클릭=복수):"))
         self.iter_list = QListWidget()
         self.iter_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.iter_list.addItem("Latest")
         self.iter_list.setCurrentRow(0)
         self.iter_list.selectionModel().selectionChanged.connect(self._on_iter_list_selection_changed)
         _il_lay.addWidget(self.iter_list, stretch=1)
-        self._iter_show_legend = QCheckBox("Legend 표시")
-        self._iter_show_legend.setChecked(False)
-        self._iter_show_legend.stateChanged.connect(self._update_height_plot)
-        _il_lay.addWidget(self._iter_show_legend)
-        _ic_row = QHBoxLayout()
-        _ic_row.addWidget(QLabel("Subplot 열:"))
-        self._iter_subplot_cols_spin = QSpinBox()
-        self._iter_subplot_cols_spin.setRange(1, 4)
-        self._iter_subplot_cols_spin.setValue(2)
-        self._iter_subplot_cols_spin.valueChanged.connect(self._update_height_plot)
-        _ic_row.addWidget(self._iter_subplot_cols_spin)
-        _ic_row.addStretch()
-        _il_lay.addLayout(_ic_row)
         h_splitter.addWidget(iter_list_w)
 
-        # ── 오른쪽: 캔버스 + 하단 패널 (세로 splitter) ───────────────────
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setChildrenCollapsible(False)
-        h_splitter.addWidget(splitter)
-        h_splitter.setStretchFactor(0, 0)
-        h_splitter.setStretchFactor(1, 1)
-
-        # 상단: 높이 분포 캔버스
+        # ── 오른쪽: 캔버스 전용 컨테이너 (세로 splitter 삭제) ───────────────────
         canvas_container = QWidget()
         canvas_vlay = QVBoxLayout(canvas_container)
         canvas_vlay.setContentsMargins(0, 0, 0, 0)
         canvas_vlay.setSpacing(0)
         canvas_vlay.addWidget(self.height_canvas)
-        splitter.addWidget(canvas_container)
+        h_splitter.addWidget(canvas_container)
 
-        # 하단: 버튼 + 상태창
+        h_splitter.setStretchFactor(0, 0)
+        h_splitter.setStretchFactor(1, 1)
+
+        # ── 하단 영역: h_splitter 바깥, 탭 전체 QVBoxLayout (lay) 의 하단 ────────
         bottom_widget = QWidget()
         bottom_lay = QVBoxLayout(bottom_widget)
         bottom_lay.setContentsMargins(0, 0, 0, 0)
         bottom_lay.setSpacing(2)
-        splitter.addWidget(bottom_widget)
-        splitter.setSizes([400, 120])  # 초기 비율 (캔버스:하단)
+        lay.addWidget(bottom_widget)
 
         # ── 액션 행: Mesh View / Run Analysis / Export ───────────────────
         ctrl_widget = QWidget()
@@ -1796,7 +1848,7 @@ class WHTMonitorWindow(QMainWindow):
         self.iter_status_label = QTextEdit()
         self.iter_status_label.setReadOnly(True)
         self.iter_status_label.setStyleSheet(
-            "color:#555; font-size:11px; background:#1e1e1e; border:none;"
+            "color:#d4d4d4; font-size:11px; background:#1e1e1e; border:none;"
         )
         fm = self.iter_status_label.fontMetrics()
         line_h = fm.lineSpacing()
@@ -2052,6 +2104,10 @@ class WHTMonitorWindow(QMainWindow):
             coords  = data.get("coords")
             heights = data.get("heights")
             if coords is not None and heights is not None:
+                is_latest_selected = False
+                if self.height_slider:
+                    is_latest_selected = (self.height_slider.value() == self.height_slider.maximum())
+
                 self.height_snapshots.append({
                     "iter":    it,
                     "coords":  coords.copy(),
@@ -2060,18 +2116,28 @@ class WHTMonitorWindow(QMainWindow):
                 label_str = f"Iter {it:03d}"
                 if self.height_iter_combo:
                     self.height_iter_combo.blockSignals(True)
-                    self.height_iter_combo.insertItem(1, label_str)
+                    self.height_iter_combo.addItem(label_str)
                     self.height_iter_combo.blockSignals(False)
                 if self.iter_list:
                     self.iter_list.blockSignals(True)
-                    self.iter_list.insertItem(1, label_str)
+                    self.iter_list.addItem(label_str)
                     self.iter_list.blockSignals(False)
 
                 if self.height_slider:
                     self.height_slider.blockSignals(True)
-                    self.height_slider.setMaximum(it)
-                    if self.height_iter_combo.currentIndex() == 0:
-                        self.height_slider.setValue(it)
+                    max_idx = len(self.height_snapshots) - 1
+                    self.height_slider.setMaximum(max_idx)
+                    # 만약 이전에 최신 스냅샷을 보고 있었다면 새로 들어온 최신 스냅샷으로 갱신
+                    if is_latest_selected:
+                        self.height_slider.setValue(max_idx)
+                        if self.height_iter_combo:
+                            self.height_iter_combo.blockSignals(True)
+                            self.height_iter_combo.setCurrentIndex(max_idx)
+                            self.height_iter_combo.blockSignals(False)
+                        if self.iter_list:
+                            self.iter_list.blockSignals(True)
+                            self.iter_list.setCurrentRow(max_idx)
+                            self.iter_list.blockSignals(False)
                     self.height_slider.blockSignals(False)
 
             # ── 테이블 열 추가 (전치 구조: 행=항목, 열=iter) ─────────────────
@@ -2103,11 +2169,11 @@ class WHTMonitorWindow(QMainWindow):
 
             # ── Modal 테이블 갱신: 이터레이션마다 열 추가 ────────────────────
             if self.modal_table and freqs:
-                n_needed = len(freqs)
+                n_needed = len(freqs) + 1
                 if self.modal_table.rowCount() < n_needed:
                     self.modal_table.setRowCount(n_needed)
                     self.modal_table.setVerticalHeaderLabels(
-                        [f"Mode {i+1}" for i in range(n_needed)])
+                        ["RBody Modes"] + [f"Mode {i+1}" for i in range(len(freqs))])
                 n_rows = self.modal_table.rowCount()
                 col = self.modal_table.columnCount()
                 self.modal_table.insertColumn(col)
@@ -2115,10 +2181,11 @@ class WHTMonitorWindow(QMainWindow):
                 self.modal_table.setHorizontalHeaderItem(
                     col, QTableWidgetItem(f"Iter {it}")
                 )
+                self.modal_table.setItem(0, col, QTableWidgetItem("6"))
                 for i, f in enumerate(freqs):
-                    if i < n_rows:
+                    if i + 1 < n_rows:
                         self.modal_table.setItem(
-                            i, col, QTableWidgetItem(f"{f:.2f}")
+                            i + 1, col, QTableWidgetItem(f"{f:.2f}")
                         )
                 # 가로 스크롤: 새로 추가된 컬럼이 보이도록 오른쪽 끝으로 이동
                 self.modal_table.scrollToBottom()
@@ -2193,7 +2260,6 @@ class WHTMonitorWindow(QMainWindow):
         if self.height_iter_combo:
             self.height_iter_combo.blockSignals(True)
             self.height_iter_combo.clear()
-            self.height_iter_combo.addItem("Latest")
             self.height_iter_combo.blockSignals(False)
         if self.iter_case_combo:
             self.iter_case_combo.blockSignals(True)
@@ -2335,9 +2401,10 @@ class WHTMonitorWindow(QMainWindow):
             if show_legend:
                 self._add_legend_auto(ax)
         else:
+            max_rows = self._subplot_cols_spin.value() if self._subplot_cols_spin else 2
             n      = len(metrics)
-            ncols  = min(n, max_cols)
-            nrows  = (n + ncols - 1) // ncols
+            nrows  = min(n, max_rows)
+            ncols  = (n + nrows - 1) // nrows
             axes   = fig.subplots(nrows, ncols, squeeze=False)
             self.curve_canvas.ax = axes[0][0]
             for idx, metric in enumerate(metrics):
@@ -2363,8 +2430,7 @@ class WHTMonitorWindow(QMainWindow):
     def _on_height_combo_changed(self, _idx):
         if self.height_slider and not self.height_slider.signalsBlocked():
             self.height_slider.blockSignals(True)
-            mx = self.height_slider.maximum()
-            self.height_slider.setValue(mx - _idx)
+            self.height_slider.setValue(_idx)
             self.height_slider.blockSignals(False)
         if self.iter_list:
             self.iter_list.blockSignals(True)
@@ -2377,29 +2443,25 @@ class WHTMonitorWindow(QMainWindow):
     def _on_height_slider_changed(self, val):
         if self.height_iter_combo and not self.height_iter_combo.signalsBlocked():
             self.height_iter_combo.blockSignals(True)
-            mx = self.height_slider.maximum()
-            combo_idx = mx - val
-            self.height_iter_combo.setCurrentIndex(combo_idx)
+            self.height_iter_combo.setCurrentIndex(val)
             self.height_iter_combo.blockSignals(False)
         if self.iter_list:
-            mx = self.height_slider.maximum()
-            combo_idx = mx - val
             self.iter_list.blockSignals(True)
             self.iter_list.clearSelection()
-            if combo_idx < self.iter_list.count():
-                self.iter_list.setCurrentRow(combo_idx)
+            if val < self.iter_list.count():
+                self.iter_list.setCurrentRow(val)
             self.iter_list.blockSignals(False)
         self._update_height_plot()
 
     def _on_prev_height(self):
         idx = self.height_iter_combo.currentIndex()
-        if idx < self.height_iter_combo.count() - 1:
-            self.height_iter_combo.setCurrentIndex(idx + 1)
+        if idx > 0:
+            self.height_iter_combo.setCurrentIndex(idx - 1)
 
     def _on_next_height(self):
         idx = self.height_iter_combo.currentIndex()
-        if idx > 0:
-            self.height_iter_combo.setCurrentIndex(idx - 1)
+        if idx < self.height_iter_combo.count() - 1:
+            self.height_iter_combo.setCurrentIndex(idx + 1)
 
     def _on_iter_list_selection_changed(self):
         """iter_list 선택 변경 → 슬라이더/콤보 동기화 후 플롯 갱신."""
@@ -2413,20 +2475,16 @@ class WHTMonitorWindow(QMainWindow):
                 self.height_iter_combo.setCurrentIndex(idx)
                 self.height_iter_combo.blockSignals(False)
             if self.height_slider:
-                mx = self.height_slider.maximum()
                 self.height_slider.blockSignals(True)
-                self.height_slider.setValue(max(0, mx - idx))
+                self.height_slider.setValue(idx)
                 self.height_slider.blockSignals(False)
         self._update_height_plot()
 
     def _get_snap_by_combo_idx(self, idx: int):
-        """combo index(0=Latest, 1=최신…)로 스냅샷 반환."""
+        """combo index로 스냅샷 반환."""
         if not self.height_snapshots:
             return None
-        if idx == 0:
-            return self.height_snapshots[-1]
-        snap_idx = len(self.height_snapshots) - idx
-        snap_idx = max(0, min(snap_idx, len(self.height_snapshots) - 1))
+        snap_idx = max(0, min(idx, len(self.height_snapshots) - 1))
         return self.height_snapshots[snap_idx]
 
     def _draw_height_snap(self, ax, fig, snap, *, colorbar: bool = True):
@@ -2500,32 +2558,36 @@ class WHTMonitorWindow(QMainWindow):
                     selected_snaps.append(snap)
 
         fig = self.height_canvas.fig
+        
+        show_cb = self._iter_show_legend.isChecked() if hasattr(self, '_iter_show_legend') else False
 
         if len(selected_snaps) <= 1:
-            # 단일 모드: 기존 동작
+            # 단일 모드: 기존 동작 (전체 초기화 후 111 생성)
             snap = selected_snaps[0] if selected_snaps else self._get_snap(self.height_iter_combo)
             if snap is None:
                 return
-            ax = self.height_canvas.ax
-            ax.clear()
-            self._draw_height_snap(ax, fig, snap, colorbar=True)
+            fig.clf()
+            ax = fig.add_subplot(111)
+            self.height_canvas.ax = ax
+            self._height_colorbar = None
+            self._draw_height_snap(ax, fig, snap, colorbar=show_cb)
             try:
                 fig.tight_layout()
             except Exception:
                 pass
         else:
             # 다중 선택: subplot 모드
-            max_cols = self._iter_subplot_cols_spin.value() if self._iter_subplot_cols_spin else 2
+            max_rows = self._iter_subplot_cols_spin.value() if self._iter_subplot_cols_spin else 2
             n        = len(selected_snaps)
-            ncols    = min(n, max_cols)
-            nrows    = (n + ncols - 1) // ncols
+            nrows    = min(n, max_rows)
+            ncols    = (n + nrows - 1) // nrows
             fig.clf()
             self._height_colorbar = None
             self.height_canvas.ax = None
             axes = fig.subplots(nrows, ncols, squeeze=False)
             for i, snap in enumerate(selected_snaps):
                 r, c = divmod(i, ncols)
-                self._draw_height_snap(axes[r][c], fig, snap, colorbar=False)
+                self._draw_height_snap(axes[r][c], fig, snap, colorbar=show_cb)
             for i in range(n, nrows * ncols):
                 r, c = divmod(i, ncols)
                 axes[r][c].set_visible(False)
@@ -2768,7 +2830,7 @@ class WHTMonitorWindow(QMainWindow):
             return
         cases = [self.iter_case_combo.itemText(i)
                  for i in range(self.iter_case_combo.count())]
-        dlg = BeadConceptDialog(snap, self.snap_dir, cases, parent=self)
+        dlg = BeadConceptDialog(snap, self.snap_dir, cases, num_modal_modes=self.num_modal_modes, parent=self)
         dlg.show()
 
     def _on_run_analysis(self):
@@ -2922,13 +2984,7 @@ class WHTMonitorWindow(QMainWindow):
         if not self.height_snapshots:
             return None
         idx = combo.currentIndex() if combo else 0
-        if idx == 0:
-            # "Latest" → 가장 최근 스냅샷
-            return self.height_snapshots[-1]
-        # insertItem(1,…) 로 최신이 항상 idx=1 에 삽입됨
-        # → idx=1: snapshots[n-1](최신), idx=n: snapshots[0](Initial)
-        snap_idx = len(self.height_snapshots) - idx
-        snap_idx = max(0, min(snap_idx, len(self.height_snapshots) - 1))
+        snap_idx = max(0, min(idx, len(self.height_snapshots) - 1))
         return self.height_snapshots[snap_idx]
 
 
@@ -3025,11 +3081,12 @@ class BeadConceptEvalWorker(QThread):
     error    = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, snap_dir: str, h_concept, case_names: list, parent=None):
+    def __init__(self, snap_dir: str, h_concept, case_names: list, num_modal_modes: int = 20, parent=None):
         super().__init__(parent)
         self.snap_dir  = snap_dir
         self.h_concept = h_concept
         self.cases     = case_names
+        self.num_modal_modes = num_modal_modes
 
     def run(self):
         try:
@@ -3077,7 +3134,7 @@ class BeadConceptEvalWorker(QThread):
             baselines = {}
             for case in self.cases:
                 if case == "Modal Analysis":
-                    r0 = fea0.solve_modal(num_modes=20)
+                    r0 = fea0.solve_modal(num_modes=self.num_modal_modes)
                     baselines[case] = ("modal", r0.frequencies[0] if len(r0.frequencies) > 0 else 1e-6)
                 else:
                     lc0 = next((lc for lc, _ in static_lcs if lc.name == case), None)
@@ -3095,7 +3152,7 @@ class BeadConceptEvalWorker(QThread):
                 self.progress.emit(f"해석: {case}")
                 try:
                     if case == "Modal Analysis":
-                        r  = fea.solve_modal(num_modes=20)
+                        r  = fea.solve_modal(num_modes=self.num_modal_modes)
                         freqs = list(r.frequencies) if len(r.frequencies) > 0 else []
                         f1 = freqs[0] if freqs else 0.0
                         b_entry = baselines.get(case)
@@ -3113,7 +3170,6 @@ class BeadConceptEvalWorker(QThread):
                         # WHTResultData for visualizer
                         rd = None
                         try:
-                            from wht_converter.wht_adapters import JaxSSOAdapter
                             from wht_converter.wht_exporters import WHTMetadata
                             meta = WHTMetadata(solver_name="WHT-Concept", solver_version="1.0",
                                               analysis_type="modal", coordinate_system="cartesian",
@@ -3256,7 +3312,7 @@ class BeadConceptDialog(QDialog):
 
     _SHAPE_TYPES = ["Line", "Filled Rect", "Outline Rect", "Filled Circle", "Outline Circle"]
 
-    def __init__(self, snap: dict, snap_dir: str, load_cases: list, parent=None):
+    def __init__(self, snap: dict, snap_dir: str, load_cases: list, num_modal_modes: int = 20, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Bead Concept Evaluation Tool")
         self.setWindowIcon(_app_icon())
@@ -3266,6 +3322,7 @@ class BeadConceptDialog(QDialog):
         self.snap       = snap
         self.snap_dir   = snap_dir
         self.load_cases = load_cases if load_cases else ["Modal Analysis"]
+        self.num_modal_modes = num_modal_modes
 
         self._shapes: list   = []       # 그려진 도형 목록
         self._pts_buf: list  = []       # 현재 진행 중 점 버퍼
@@ -3637,17 +3694,7 @@ class BeadConceptDialog(QDialog):
                     bbox=dict(facecolor='black', alpha=0.6 if selected else 0.5,
                               pad=1, edgecolor='#00e5ff' if selected else 'none'))
 
-        # 레전드
-        if self._shapes:
-            import matplotlib.patches as _mp
-            handles = []
-            for shape in self._shapes:
-                patch = _mp.Patch(color='white', alpha=0.65,
-                                  label=f"#{shape['id']} {shape['type']} h={shape['bead_h']:+.1f}")
-                handles.append(patch)
-            ax.legend(handles=handles, loc='upper right', fontsize=7,
-                      facecolor='#1e1e1e', edgecolor='#555', labelcolor='white',
-                      framealpha=0.85)
+        # 레전드 부분은 사용자 요청으로 삭제됨
 
         ax.set_title(f"Concept Bead Preview  (iter {self.snap.get('iter','?')})")
         ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
@@ -3687,7 +3734,7 @@ class BeadConceptDialog(QDialog):
             # WHT Solver
             self._log(f"WHT Solver 해석: {cases}", "#6af")
             self._status_lbl.setText("WHT 해석 중...")
-            self._worker = BeadConceptEvalWorker(self.snap_dir, h_concept, cases, parent=self)
+            self._worker = BeadConceptEvalWorker(self.snap_dir, h_concept, cases, num_modal_modes=self.num_modal_modes, parent=self)
             self._worker.progress.connect(lambda m: self._log(m, "#aaa"))
             self._worker.finished.connect(self._on_eval_done)
             self._worker.error.connect(lambda e: (
