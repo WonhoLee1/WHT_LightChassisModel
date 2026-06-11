@@ -464,19 +464,24 @@ class WHTopographySolver:
         else:
             # [중요] 고분산 난수 초기장으로 대칭 파괴 + 공간 대비 씨앗 확보.
             # 균일 초기화(모두 같은 값)는 균일해에 갇히는 원인 → 반드시 분산 유지.
-            # _area_start 에 따라 x0 초기 분포를 결정 (occ 임계값 ~0.5 기준).
+            # _area_start 에 따라 x0 초기 분포를 결정.
+            # occ 임계값 η = 1/(2×bead_steps): steps=1→0.5, steps=2→0.25.
+            # x0 범위를 η 기준으로 설정해야 초기 area ≈ _area_start.
             if getattr(self, 'vol_ramp_iters', 0) > 0:
                 _as = self._area_start
+                _eta_o_init = 1.0 / (2.0 * max(1, self.bead_steps))
+                _thr_lo = max(0.02, _eta_o_init - 0.12)  # occ≈0 구간 상한
+                _thr_hi = min(0.98, _eta_o_init + 0.12)  # occ≈1 구간 하한
                 if _as < 0.05:
-                    # 평판 출발: 모든 요소 임계값 이하 → 비드 없는 상태
-                    x0 = rng.uniform(0.01, 0.44, self._n_design)
+                    # 평판 출발: 모든 요소를 occ≈0 영역에 배치
+                    x0 = rng.uniform(0.01, _thr_lo, self._n_design)
                 elif _as > 0.95:
-                    # 전체 비드 출발: 모든 요소 임계값 이상
-                    x0 = rng.uniform(0.56, 0.99, self._n_design)
+                    # 전체 비드 출발: 모든 요소를 occ≈1 영역에 배치
+                    x0 = rng.uniform(_thr_hi, 0.99, self._n_design)
                 else:
-                    # 혼합: _as 비율 요소는 임계값 위, 나머지는 아래
-                    x0_lo = rng.uniform(0.01, 0.44, self._n_design)
-                    x0_hi = rng.uniform(0.56, 0.99, self._n_design)
+                    # 혼합: _as 비율 요소는 occ≈1 영역, 나머지는 occ≈0 영역
+                    x0_lo = rng.uniform(0.01, _thr_lo, self._n_design)
+                    x0_hi = rng.uniform(_thr_hi, 0.99, self._n_design)
                     mask  = rng.random(self._n_design) < _as
                     x0    = np.where(mask, x0_hi, x0_lo)
             else:
@@ -2233,8 +2238,10 @@ class WHTopographySolver:
             _area_after = float(np.mean(_occ(self._H @ x)))
             if abs(_area_after - _vol_target_eff) > 5e-3:
                 _mv = float(self.mma.move)
-                lo_s, hi_s = max(-_mv, -float(x.min())), min(_mv, 1.0 - float(x.max()))
-                # hi_s 방향에서 area > target 인지 확인해 이분법 방향 결정
+                # lo/hi 경계: clip(x+s, 0, 1) 로 처리하므로 move 전체 범위 사용.
+                # (이전: max(-_mv, -x.min()) 은 x.min()≈0일 때 하한이 0에 갇혀
+                #  ramp-up 초기 면적을 목표 이하로 낮출 수 없는 버그가 있었음)
+                lo_s, hi_s = -_mv, _mv
                 _area_hi = float(np.mean(_occ(self._H @ np.clip(x + hi_s, 0.0, 1.0))))
                 _area_lo = float(np.mean(_occ(self._H @ np.clip(x + lo_s, 0.0, 1.0))))
                 if _area_lo <= _vol_target_eff <= _area_hi:
@@ -2246,12 +2253,10 @@ class WHTopographySolver:
                         else:
                             hi_s = _s
                     x = np.clip(x + (lo_s + hi_s) * 0.5, 0.0, 1.0)
-                # target이 달성 가능 범위 밖이면 이동 한계 내 최대 근사값 사용
                 elif _area_hi < _vol_target_eff:
-                    x = np.clip(x + hi_s, 0.0, 1.0)  # 최대 면적으로 이동
-                # _area_lo > target: 이미 lo 경계도 초과 → lo로 이동
+                    x = np.clip(x + hi_s, 0.0, 1.0)  # 이동 한계 내 최대 면적
                 elif _area_lo > _vol_target_eff:
-                    x = np.clip(x + lo_s, 0.0, 1.0)
+                    x = np.clip(x + lo_s, 0.0, 1.0)  # 이동 한계 내 최소 면적
 
             # ── 비드 연결 phase 2: 물리적 closing 적용 (패턴 안정 후에만) ───────────
             if _bead_connect_active:
@@ -2356,17 +2361,19 @@ class WHTopographySolver:
             # 목적함수 개선율 (Iter 0 대비)
             f0_impv = (f0_init - f0val) / (abs(f0_init) + 1e-12) * 100.0
 
-            # 체적 제약 상태 (projected 기준 — fval과 동일 척도)
-            vol_cur = float(np.mean(_area_density))
+            # 체적 제약 상태: MMA+equality 보정 후 실제 x 기준으로 측정
+            # (FEA는 보정 전 x 기반이지만, 다음 iter 진입 시 면적 조건 추종 확인용)
+            vol_cur_pre = float(np.mean(_area_density))          # FEA 시점 면적
+            vol_cur     = float(np.mean(_occ(self._H @ x)))      # 보정 후 면적
             vol_tgt = _vol_target
             vol_vio = vol_cur - vol_tgt   # >0: 초과, <0: 미달
-            vol_mark = "OK" if abs(vol_vio) < 0.01 else ("HI" if vol_vio > 0 else "LO")
+            vol_mark = "OK" if abs(vol_vio) < 5e-3 else ("HI" if vol_vio > 0 else "LO")
 
             print(f"\n  ┌─ Iter {i:03d} {'─' * (_SW - 15)}┐")
             print(f"     Obj: f0={f0val:.4f}{obj_tag}  "
                   f"impr={f0_impv:+.1f}%  (init={f0_init:.4f})"
                   f"   dx={change:.4f}")
-            print(f"     Vol: {vol_cur*100:.1f}% / target {vol_tgt*100:.1f}%  [{vol_mark}]"
+            print(f"     Vol: {vol_cur_pre*100:.1f}%→{vol_cur*100:.1f}% / target {vol_tgt*100:.1f}%  [{vol_mark}]"
                   f"   Avg_h={np.mean(x_proj_in*self.h_max):.2f}mm"
                   f"   {f1_str}")
             def get_C0_safe(n):
