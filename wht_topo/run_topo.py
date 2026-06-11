@@ -3188,8 +3188,8 @@ def main():
                     help="공간 필터 커널. linear=hat(기본) / gaussian=부드러운 덩어리 유도")
     # [4] 비드 연결 / 대칭 / 다양성 ─────────────────────────────────────────
     sym_group = g3.add_mutually_exclusive_group()
-    sym_group.add_argument("--sym-x",    action="store_true",  default=True,  help="좌우 대칭 활성화 (기본)")
-    sym_group.add_argument("--no-sym-x", action="store_false", dest="sym_x",  help="좌우 대칭 해제")
+    sym_group.add_argument("--sym-x",    dest="sym_x", action="store_const", const=True,  default=True, help="좌우 대칭 활성화 (기본)")
+    sym_group.add_argument("--no-sym-x", dest="sym_x", action="store_const", const=False,               help="좌우 대칭 해제")
     g3.add_argument("--bead-connect",          type=float, default=100.0,
                     help="비드 자동 연결 최대 갭 mm (기본: 100.0, 0=비활성).\n"
                          "인접 비드 섬을 브릿지로 연결. 너무 크면 과도하게 연결되어 패턴 왜곡.")
