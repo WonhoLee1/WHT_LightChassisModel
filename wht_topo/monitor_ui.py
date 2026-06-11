@@ -1061,6 +1061,11 @@ class WHTMonitorWindow(QMainWindow):
             for idx_i, it in enumerate(self.history["iter"]):
                 freqs = self.history["frequencies"][idx_i]
                 if freqs:
+                    n_needed = len(freqs)
+                    if self.modal_table.rowCount() < n_needed:
+                        self.modal_table.setRowCount(n_needed)
+                        self.modal_table.setVerticalHeaderLabels(
+                            [f"Mode {i+1}" for i in range(n_needed)])
                     col = self.modal_table.columnCount()
                     self.modal_table.insertColumn(col)
                     self.modal_table.setColumnWidth(col, 80)
@@ -1782,6 +1787,11 @@ class WHTMonitorWindow(QMainWindow):
 
             # ── Modal 테이블 갱신: 이터레이션마다 열 추가 ────────────────────
             if self.modal_table and freqs:
+                n_needed = len(freqs)
+                if self.modal_table.rowCount() < n_needed:
+                    self.modal_table.setRowCount(n_needed)
+                    self.modal_table.setVerticalHeaderLabels(
+                        [f"Mode {i+1}" for i in range(n_needed)])
                 n_rows = self.modal_table.rowCount()
                 col = self.modal_table.columnCount()
                 self.modal_table.insertColumn(col)
@@ -1949,8 +1959,7 @@ class WHTMonitorWindow(QMainWindow):
                     ax.plot(iters, arr / mx if mx > 1e-12 else arr,
                             fmt, label=label, markersize=3, linewidth=1)
             ax.set_ylabel("Normalized Value")
-            ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0),
-                      fontsize=7, borderaxespad=0)
+            pass  # legend 제거
         elif metric == "Natural Frequencies":
             RIGID = 0.5
             fa = self._freq_array(self.history["frequencies"])
@@ -1959,8 +1968,7 @@ class WHTMonitorWindow(QMainWindow):
                 for rank, col in enumerate(cols[:10]):
                     ax.plot(iters, fa[:, col],
                             label=f"M{rank+1}({fa[-1, col]:.1f}Hz)")
-                ax.legend(fontsize=8, loc='upper left',
-                          bbox_to_anchor=(1, 1))
+                pass  # legend 제거
             ax.set_ylabel("Frequency (Hz)")
         elif metric == "Area_Ratio":
             ax.plot(iters, self.history["area_ratio"], 'D-',
@@ -3251,18 +3259,17 @@ class BeadConceptDialog(QDialog):
     def _on_eval_done(self, results: list):
         self._log(f"── Concept Evaluation 완료 [iter {self.snap.get('iter','?')}] ──", "#ff0")
         result_lines = [f"== Bead Concept Evaluation  [iter {self.snap.get('iter','?')}] ==", ""]
+        vis_queue = []  # (rd, title) — dialog 닫은 후 열기
         for r in results:
             case = r["case"]
             if r["type"] == "modal":
                 freqs = r.get("freqs", [r["f1"]])
                 b, d  = r["base"], r["delta_pct"]
                 sign  = "▲" if d >= 0 else "▼"
-                # 메시지 패널 출력
                 self._log(f"[{case}]", "#6cf")
                 self._log(f"  f1={freqs[0]:.2f} Hz  (iter0: {b:.2f} Hz)  {sign} {d:+.1f}%", "#2a7a2a")
                 for i, f in enumerate(freqs[:10], 1):
                     self._log(f"    Mode {i}: {f:.2f} Hz")
-                # effective mass
                 em = r.get("eff_mass_data")
                 if em is not None:
                     try:
@@ -3272,15 +3279,13 @@ class BeadConceptDialog(QDialog):
                             self._log(f"    Mode {i} eff.mass ratio: {ratio:.1f}%")
                     except Exception:
                         pass
-                # result dialog line
                 result_lines += [f"[{case}]",
                                   f"  f1={freqs[0]:.2f} Hz  (iter0: {b:.2f} Hz)  {sign} {d:+.1f}%"]
                 for i, f in enumerate(freqs[:10], 1):
                     result_lines.append(f"    Mode {i}: {f:.2f} Hz")
-                # visualizer
                 rd = r.get("wht_result_data")
                 if rd:
-                    self._open_result_in_viewer(rd, f"Concept Modal — iter {self.snap.get('iter','?')}")
+                    vis_queue.append((rd, f"Concept Modal — iter {self.snap.get('iter','?')}"))
             elif r["type"] == "static":
                 u, b, d = r["u_max"], r["base"], r["delta_pct"]
                 sign = "▲" if d >= 0 else "▼"
@@ -3290,13 +3295,16 @@ class BeadConceptDialog(QDialog):
                                   f"  Max|U|={u:.4f} mm  (iter0: {b:.4f} mm)  {sign} {d:+.1f}%"]
                 rd = r.get("wht_result_data")
                 if rd:
-                    self._open_result_in_viewer(rd, f"Concept {case} — iter {self.snap.get('iter','?')}")
+                    vis_queue.append((rd, f"Concept {case} — iter {self.snap.get('iter','?')}"))
             else:
                 msg = r.get("msg", "")
                 self._log(f"[{case}]  ERROR: {msg}", "#f55")
                 result_lines.append(f"[{case}]  ERROR: {msg}")
         dlg = _ConceptResultDialog("\n".join(result_lines), self)
         dlg.exec()
+        # result dialog 닫힌 후 visualizer 열기
+        for rd, title in vis_queue:
+            self._open_result_in_viewer(rd, title)
 
 
 class _ConceptResultDialog(QDialog):

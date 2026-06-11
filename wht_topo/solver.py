@@ -1830,6 +1830,13 @@ class WHTopographySolver:
                 h_node_arr = h_node_sum_e / (self._node_adj_count_arr + 1e-12)
                 current_nids = self.model.sorted_node_ids()
                 current_nid_to_idx = {nid: i for i, nid in enumerate(current_nids)}
+
+                # 원점 기준 노드 좌표 — visualizer에서 deform 스케일 기준으로 사용 가능
+                pos_arr = np.array([[self.model.nodes[nid].x,
+                                     self.model.nodes[nid].y,
+                                     self.model.nodes[nid].z]
+                                    for nid in current_nids], dtype=np.float32)
+                wht_data.point_data["Position"] = pos_arr.reshape(1, -1, 3)
                 h_current_full = np.zeros(len(current_nids))
                 for i_dn, nid in enumerate(self._design_nids):
                     h_current_full[current_nid_to_idx[nid]] = h_node_arr[i_dn]
