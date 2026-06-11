@@ -345,6 +345,7 @@ class _CalculixReAnalysisWorker(QThread):
 
             model       = init["model"]
             bead_dir    = init["bead_dir"]
+            bead_mode   = init.get("bead_mode", "node")
             design_nids = init["design_nids"]
             aggr_src    = init["aggr_src"]
             aggr_dst    = init["aggr_dst"]
@@ -379,9 +380,13 @@ class _CalculixReAnalysisWorker(QThread):
             if self.iter_num != -1:
                 n_int      = len(design_nids)
                 h_node_sum = np.zeros(n_int)
-                np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
-                node_adj   = np.bincount(aggr_src, minlength=n_int)
-                h_node     = h_node_sum / (node_adj + 1e-12)
+                if bead_mode == "elem_centroid":
+                    np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+                    node_adj = np.bincount(aggr_src, minlength=n_int)
+                    h_node   = h_node_sum / (node_adj + 1e-12)
+                else:
+                    np.maximum.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+                    h_node = h_node_sum
                 for i, nid in enumerate(design_nids):
                     ox, oy, oz = orig_coords[nid]
                     nd = model.nodes[nid]
@@ -665,6 +670,7 @@ def _write_optistruct_fem(out_path: str, snap_dir: str, iter_num: int,
 
     model       = init["model"]
     bead_dir    = init["bead_dir"]
+    bead_mode   = init.get("bead_mode", "node")
     design_nids = init["design_nids"]
     aggr_src    = init["aggr_src"]
     aggr_dst    = init["aggr_dst"]
@@ -695,9 +701,13 @@ def _write_optistruct_fem(out_path: str, snap_dir: str, iter_num: int,
     # h_elem → h_node → 노드 좌표 업데이트
     n_int      = len(design_nids)
     h_node_sum = np.zeros(n_int)
-    np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
-    node_adj   = np.bincount(aggr_src, minlength=n_int)
-    h_node     = h_node_sum / (node_adj + 1e-12)
+    if bead_mode == "elem_centroid":
+        np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+        node_adj = np.bincount(aggr_src, minlength=n_int)
+        h_node   = h_node_sum / (node_adj + 1e-12)
+    else:
+        np.maximum.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+        h_node = h_node_sum
     for i, nid in enumerate(design_nids):
         ox, oy, oz = orig_coords[nid]
         nd = model.nodes[nid]
@@ -2613,6 +2623,7 @@ class BeadConceptEvalWorker(QThread):
             aggr_src    = init["aggr_src"]
             aggr_dst    = init["aggr_dst"]
             orig_coords = init["orig_coords"]
+            bead_mode   = init.get("bead_mode", "node")
             static_lcs  = init.get("static_load_cases", [])
 
             def _apply(h_elem):
@@ -2620,9 +2631,13 @@ class BeadConceptEvalWorker(QThread):
                     nd = model.nodes[nid]; nd.x, nd.y, nd.z = x, y, z
                 n_int = len(design_nids)
                 hs = np.zeros(n_int)
-                np.add.at(hs, aggr_src, h_elem[aggr_dst])
-                adj = np.bincount(aggr_src, minlength=n_int)
-                hn = hs / (adj + 1e-12)
+                if bead_mode == "elem_centroid":
+                    np.add.at(hs, aggr_src, h_elem[aggr_dst])
+                    adj = np.bincount(aggr_src, minlength=n_int)
+                    hn = hs / (adj + 1e-12)
+                else:
+                    np.maximum.at(hs, aggr_src, h_elem[aggr_dst])
+                    hn = hs
                 for i, nid in enumerate(design_nids):
                     ox, oy, oz = orig_coords[nid]; nd = model.nodes[nid]
                     nd.x = ox + float(hn[i])*bead_dir[0]

@@ -289,8 +289,10 @@ class WHTopographySolver:
         beta_delay: int = -1,
         bead_connect_start_iter: int = -1,
         design_elset: Optional[str] = None,
+        bead_mode: str = "node",
 
     ):
+        self.bead_mode      = bead_mode          # "node"(max 집계) | "elem_centroid"(평균 집계)
         self.model          = model
         self.load_manager   = load_manager
         self.h_max          = bead_height_max
@@ -1130,11 +1132,19 @@ class WHTopographySolver:
         """
         요소별 비드 높이 h_elem을 설계 노드 좌표에 반영합니다.
 
-        노드 높이 = 인접 설계 요소 높이의 **최댓값**:
-            h_n = max_{e adj n} h_e
-        → 활성 비드 요소의 모든 노드가 비드 높이 전체로 올라옴 (평탄 plateau 보장).
-           인접 비활성 요소와의 경계 노드는 비드 쪽으로 끌어올려져 노드 단위 스파이크
-           ("뾰족 솟음")가 발생하지 않음. 비드 경계는 한 노드만큼 외측으로 확장.
+        노드 이동 방식은 self.bead_mode에 따라 결정됩니다.
+
+        "node" (기본):
+            h_n = max_{e adj n} h_e  (최댓값 집계)
+            → 활성 비드 요소의 모든 노드가 비드 높이 전체로 올라옴.
+              경계 노드가 비드 쪽으로 끌어올려져 plateau 보장.
+              비드 경계는 한 노드만큼 외측으로 확장.
+
+        "elem_centroid" (요소 중심 기반):
+            h_n = mean_{e adj n} h_e  (평균 집계)
+            → 각 요소의 모든 노드가 동일한 높이로 이동 (요소 내부 평탄).
+              인접 요소 간 경계에서 부드럽게 전환.
+              요소 단위 비드 형성에 적합.
 
         Parameters
         ----------
@@ -1142,8 +1152,14 @@ class WHTopographySolver:
         """
         n_int = len(self._design_nids)
         h_node = np.zeros(n_int)
-        # in-place max: 각 노드에 인접한 요소들의 h_elem 중 최댓값으로 누적
-        np.maximum.at(h_node, self._aggr_src, h_elem[self._aggr_dst])
+
+        if self.bead_mode == "elem_centroid":
+            # 평균 집계: 각 요소의 h가 인접 노드에 균등하게 기여
+            np.add.at(h_node, self._aggr_src, h_elem[self._aggr_dst])
+            h_node /= (self._node_adj_count_arr + 1e-12)
+        else:
+            # 최댓값 집계(기본): 인접 요소 중 가장 높은 값으로 노드 이동
+            np.maximum.at(h_node, self._aggr_src, h_elem[self._aggr_dst])
 
         for i, nid in enumerate(self._design_nids):
             orig_xyz = self._coords_orig[nid]
@@ -1553,6 +1569,7 @@ class WHTopographySolver:
             "aggr_w":             self._aggr_w,
             "sorted_nids":        self.sorted_nids,
             "bead_dir":           self.bead_dir,
+            "bead_mode":          self.bead_mode,
             "h_max":              self.h_max,
             "orig_coords":        {nid: (self.model.nodes[nid].x,
                                          self.model.nodes[nid].y,

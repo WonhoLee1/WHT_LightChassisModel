@@ -1938,6 +1938,7 @@ class TopographyPipeline:
             vol_ramp_iters       = getattr(self.cfg, 'bead_area_ramp', 5),
             bead_area_init       = getattr(self.cfg, 'bead_area_init', -1.0),
             bidirectional        = getattr(self.cfg, 'bead_bidirectional', False),
+            bead_mode            = getattr(self.cfg, 'bead_mode', 'node'),
             min_width_init       = getattr(self.cfg, 'min_width_init', -1.0),
             min_width_ramp_iters = getattr(self.cfg, 'min_width_ramp', 10),
             max_width            = getattr(self.cfg, 'max_width', -1.0),
@@ -3123,6 +3124,11 @@ def main():
                          "→ 다중 하중(twisting/lifting) 유리. 작을수록 집중된 소수 비드.")
     g3.add_argument("--bead-bidirectional", action="store_true", default=False,
                     help="양방향 비드 (±방향 동시 최적화). colorbar: coolwarm ±h_max.")
+    g3.add_argument("--bead-mode", type=str, default="node",
+                    choices=["node", "elem_centroid"],
+                    help="비드 노드 이동 방식.\n"
+                         "node(기본): 인접 요소 최댓값으로 집계 → 활성 요소 전체 높이 유지, 경계 1노드 확장.\n"
+                         "elem_centroid: 인접 요소 평균으로 집계 → 요소 내부 평탄, 경계에서 부드러운 전환.")
     g3.add_argument("--bead-area-init",   type=float, default=-1.0,
                     help="비드 면적 비율 초기값 (-1=자동, 0.0=평판 출발, 1.0=전체 비드 출발).\n"
                          "-1(자동): bead-area+0.25에서 시작해 bead-area로 감소 (기존 동작).\n"
