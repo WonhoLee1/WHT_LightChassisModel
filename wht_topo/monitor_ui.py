@@ -876,6 +876,10 @@ class WHTMonitorWindow(QMainWindow):
         self.height_contour_check: "QCheckBox | None" = None
         self.height_toolbar = None
         self.concept_tool_btn = None
+        self._table_row_keys: list = []
+        self.iter_list: "QListWidget | None" = None
+        self._iter_show_legend: "QCheckBox | None" = None
+        self._iter_subplot_cols_spin: "QSpinBox | None" = None
         self.iter_case_combo = None   # Load Case 콤보 (Iteration Results 탭)
         self.iter_solver_combo = None  # Solver 선택 콤보
         self.iter_run_btn = None      # Run Analysis 버튼
@@ -1034,24 +1038,36 @@ class WHTMonitorWindow(QMainWindow):
             print(f"[Monitor] _rebuild_history_ui 오류: {e}", flush=True)
 
     def _rebuild_iter_table(self):
-        """iteration 결과 테이블을 history 데이터로 재구성합니다."""
+        """iteration 결과 테이블을 history 데이터로 재구성합니다 (전치 구조)."""
         try:
-            iters = self.history["iter"]
-            for idx, it in enumerate(iters):
-                row = self.table.rowCount()
-                self.table.insertRow(row)
-                def _set(c, v):
-                    self.table.setItem(row, c, QTableWidgetItem(str(v)))
-                _set(0, it)
-                _set(1, f"{self.history['compliance'][idx]:.6e}"
-                     if idx < len(self.history['compliance']) else "")
-                _set(2, f"{self.history['area_ratio'][idx]:.4f}"
-                     if idx < len(self.history['area_ratio']) else "")
-                _set(3, f"{self.history['max_h'][idx]:.4f}"
-                     if idx < len(self.history['max_h']) else "")
-                _set(4, f"{self.history['dx'][idx]:.6e}"
-                     if idx < len(self.history['dx']) else "")
-            self.table.scrollToBottom()
+            if not self.table or not self.history["iter"]:
+                return
+            # iter 열만 제거 (항목/설명 열 유지)
+            while self.table.columnCount() > 2:
+                self.table.removeColumn(self.table.columnCount() - 1)
+
+            def _safe(lst, idx, fmt):
+                try:
+                    return fmt.format(lst[idx])
+                except (IndexError, TypeError):
+                    return ""
+
+            for idx_i, it in enumerate(self.history["iter"]):
+                val_map = {
+                    "Iter":       str(it),
+                    "C_total":    _safe(self.history["compliance"],  idx_i, "{:.3e}"),
+                    "Avg_h":      _safe(self.history["avg_h"],       idx_i, "{:.2f}"),
+                    "Max_h":      _safe(self.history["max_h"],       idx_i, "{:.2f}"),
+                    "dx":         _safe(self.history["dx"],          idx_i, "{:.4f}"),
+                    "Area_Ratio": _safe(self.history["area_ratio"],  idx_i, "{:.3f}"),
+                    "Min_Width":  _safe(self.history["min_width"],   idx_i, "{:.1f}"),
+                }
+                for name in self.case_names:
+                    if name in self.history["cases"] and idx_i < len(self.history["cases"][name]["U"]):
+                        val_map[f"U_{name}"] = f"{self.history['cases'][name]['U'][idx_i]:.2e}"
+                        val_map[f"D_{name}"] = f"{self.history['cases'][name]['max_disp'][idx_i]:.2f}"
+                        val_map[f"S_{name}"] = f"{self.history['cases'][name]['max_stress'][idx_i]:.1f}"
+                self._summary_add_iter_col(it, val_map)
         except Exception as e:
             print(f"[Monitor] _rebuild_iter_table 오류: {e}", flush=True)
 
@@ -1194,37 +1210,16 @@ class WHTMonitorWindow(QMainWindow):
 
         # ── Summary Table 전체 복원 빌드 ──────────────────────────────────────────
         if self.table and self.history["iter"]:
-            self.table.setRowCount(0)
-            if self.case_names:
-                headers = ["Iter", "C_total", "Avg_h", "Max_h", "dx", "Area_Ratio", "Min_Width"]
-                for name in self.case_names:
-                    headers += [f"U_{name}", f"D_{name}", f"S_{name}"]
-                self.table.setColumnCount(len(headers))
-                self.table.setHorizontalHeaderLabels(headers)
-                
-                for idx_i, it in enumerate(self.history["iter"]):
-                    row = self.table.rowCount()
-                    self.table.insertRow(row)
-                    vals = [str(it),
-                            f"{self.history['compliance'][idx_i]:.3e}",
-                            f"{self.history['avg_h'][idx_i]:.2f}",
-                            f"{self.history['max_h'][idx_i]:.2f}",
-                            f"{self.history['dx'][idx_i]:.4f}",
-                            f"{self.history['area_ratio'][idx_i]:.3f}",
-                            f"{self.history['min_width'][idx_i]:.1f}"]
-                    for col_idx, v in enumerate(vals):
-                        self.table.setItem(row, col_idx, QTableWidgetItem(v))
-                        
-                    c_off = len(vals)
-                    for name in self.case_names:
-                        u_val    = self.history["cases"][name]["U"][idx_i]
-                        d_val    = self.history["cases"][name]["max_disp"][idx_i]
-                        s_val    = self.history["cases"][name]["max_stress"][idx_i]
-                        self.table.setItem(row, c_off,   QTableWidgetItem(f"{u_val:.2e}"))
-                        self.table.setItem(row, c_off+1, QTableWidgetItem(f"{d_val:.2f}"))
-                        self.table.setItem(row, c_off+2, QTableWidgetItem(f"{s_val:.1f}"))
-                        c_off += 3
-                self.table.scrollToBottom()
+            # case 행 추가 (아직 없는 경우만)
+            for name in self.case_names:
+                for key, nm, desc in [
+                    (f"U_{name}", f"U_{name}", f"변형 에너지 [J] — {name}"),
+                    (f"D_{name}", f"D_{name}", f"최대 변위 [mm] — {name}"),
+                    (f"S_{name}", f"S_{name}", f"최대 응력 [MPa] — {name}"),
+                ]:
+                    if self._table_row_of(key) < 0:
+                        self._append_summary_row(key, nm, desc)
+            self._rebuild_iter_table()
 
         # ── Modal Table 전체 복원 빌드 ────────────────────────────────────────────
         if self.modal_table and self.history["iter"]:
@@ -1260,6 +1255,14 @@ class WHTMonitorWindow(QMainWindow):
             for it in reversed(self.history["iter"]):
                 self.height_iter_combo.addItem(f"Iter {it:03d}")
             self.height_iter_combo.blockSignals(False)
+        if self.iter_list and self.history["iter"]:
+            self.iter_list.blockSignals(True)
+            self.iter_list.clear()
+            self.iter_list.addItem("Latest")
+            for it in reversed(self.history["iter"]):
+                self.iter_list.addItem(f"Iter {it:03d}")
+            self.iter_list.setCurrentRow(0)
+            self.iter_list.blockSignals(False)
             
         if self.height_slider and self.history["iter"]:
             self.height_slider.blockSignals(True)
@@ -1482,16 +1485,70 @@ class WHTMonitorWindow(QMainWindow):
 
     def _build_tab_summary(self):
         tab = QWidget(); lay = QVBoxLayout(tab)
-        self.table = QTableWidget(0, 0)
+        self.table = QTableWidget(0, 2)
+        self.table.setWordWrap(True)
+        self.table.setHorizontalHeaderLabels(["항목", "설명"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.table.setColumnWidth(1, 180)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self._on_table_header_context_menu)
+        self._table_row_keys = []
+        for key, name, desc in self._TABLE_ROW_META:
+            self._append_summary_row(key, name, desc)
         lay.addWidget(self.table)
         self.tabs.addTab(tab, "Summary Table")
+
+    def _append_summary_row(self, key: str, name: str, desc: str):
+        """Summary Table에 새 행(항목)을 추가합니다."""
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        for col, text in enumerate([name, desc]):
+            item = QTableWidgetItem(text)
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table.setItem(row, col, item)
+        self._table_row_keys.append(key)
+
+    def _table_row_of(self, key: str) -> int:
+        """key에 해당하는 행 인덱스 반환. 없으면 -1."""
+        try:
+            return self._table_row_keys.index(key)
+        except ValueError:
+            return -1
+
+    def _summary_add_iter_col(self, it: int, val_map: dict):
+        """Summary Table에 새 iter 열을 추가하고 val_map으로 채웁니다."""
+        col = self.table.columnCount()
+        self.table.insertColumn(col)
+        self.table.setHorizontalHeaderItem(col, QTableWidgetItem(f"Iter {it:03d}"))
+        self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.Fixed)
+        self.table.setColumnWidth(col, 90)
+        for key, val in val_map.items():
+            r = self._table_row_of(key)
+            if r >= 0:
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(r, col, item)
+        sb = self.table.horizontalScrollBar()
+        sb.setValue(sb.maximum())
 
     # 기본 메트릭 항목 목록
     _BASE_METRICS = [
         "ALL (Normalized)", "Compliance", "Avg_h", "Max_h",
         "dx", "Area_Ratio", "Min_Width", "Natural Frequencies",
+    ]
+
+    # Summary Table 행 정의: (key, 표시명, 설명)
+    _TABLE_ROW_META = [
+        ("Iter",       "Iter",       "반복 횟수"),
+        ("C_total",    "C_total",    "총 컴플라이언스 (변형 에너지 합계)"),
+        ("Avg_h",      "Avg_h",      "평균 비드 높이 [mm]"),
+        ("Max_h",      "Max_h",      "최대 비드 높이 [mm]"),
+        ("dx",         "dx",         "설계 변수 변화량 (수렴 지표)"),
+        ("Area_Ratio", "Area_Ratio", "비드 면적 비율 (0~1)"),
+        ("Min_Width",  "Min_Width",  "최소 비드 너비 [mm]"),
     ]
 
     def _build_tab_curve(self):
@@ -1610,10 +1667,46 @@ class WHTMonitorWindow(QMainWindow):
         ctrl_iter.addStretch()
         lay.addWidget(ctrl_iter_w)
 
-        # ── 캔버스 + 하단 패널을 QSplitter로 분리 (드래그로 크기 조절) ──
+        # ── 수평 Splitter: 왼쪽 iter 목록 / 오른쪽 캔버스+버튼 ─────────────
+        h_splitter = QSplitter(Qt.Horizontal)
+        h_splitter.setChildrenCollapsible(False)
+        lay.addWidget(h_splitter, stretch=1)
+
+        # ── 왼쪽: iter 목록 + 컨트롤 ──────────────────────────────────────
+        iter_list_w = QWidget()
+        iter_list_w.setMinimumWidth(110)
+        iter_list_w.setMaximumWidth(180)
+        _il_lay = QVBoxLayout(iter_list_w)
+        _il_lay.setContentsMargins(4, 4, 4, 4)
+        _il_lay.setSpacing(4)
+        _il_lay.addWidget(QLabel("Iterations (Ctrl+클릭=복수):"))
+        self.iter_list = QListWidget()
+        self.iter_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.iter_list.addItem("Latest")
+        self.iter_list.setCurrentRow(0)
+        self.iter_list.selectionModel().selectionChanged.connect(self._on_iter_list_selection_changed)
+        _il_lay.addWidget(self.iter_list, stretch=1)
+        self._iter_show_legend = QCheckBox("Legend 표시")
+        self._iter_show_legend.setChecked(False)
+        self._iter_show_legend.stateChanged.connect(self._update_height_plot)
+        _il_lay.addWidget(self._iter_show_legend)
+        _ic_row = QHBoxLayout()
+        _ic_row.addWidget(QLabel("Subplot 열:"))
+        self._iter_subplot_cols_spin = QSpinBox()
+        self._iter_subplot_cols_spin.setRange(1, 4)
+        self._iter_subplot_cols_spin.setValue(2)
+        self._iter_subplot_cols_spin.valueChanged.connect(self._update_height_plot)
+        _ic_row.addWidget(self._iter_subplot_cols_spin)
+        _ic_row.addStretch()
+        _il_lay.addLayout(_ic_row)
+        h_splitter.addWidget(iter_list_w)
+
+        # ── 오른쪽: 캔버스 + 하단 패널 (세로 splitter) ───────────────────
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
-        lay.addWidget(splitter, stretch=1)
+        h_splitter.addWidget(splitter)
+        h_splitter.setStretchFactor(0, 0)
+        h_splitter.setStretchFactor(1, 1)
 
         # 상단: 높이 분포 캔버스
         canvas_container = QWidget()
@@ -1731,85 +1824,69 @@ class WHTMonitorWindow(QMainWindow):
 
     def _on_table_header_context_menu(self, pos):
         menu = QMenu(self)
-        
-        col_menu = menu.addMenu("Toggle Columns")
-        for i in range(self.table.columnCount()):
-            col_name = self.table.horizontalHeaderItem(i).text()
+        # iter 열(index 2+)만 토글 가능
+        col_menu = menu.addMenu("Toggle Iterations")
+        for i in range(2, self.table.columnCount()):
+            h = self.table.horizontalHeaderItem(i)
+            col_name = h.text() if h else f"Col {i}"
             action = QAction(col_name, self)
             action.setCheckable(True)
             action.setChecked(not self.table.isColumnHidden(i))
             action.triggered.connect(lambda checked, i=i: self.table.setColumnHidden(i, not checked))
             col_menu.addAction(action)
-            
         menu.addSeparator()
-        
         plot_action = QAction("Plot Custom Graph", self)
         plot_action.triggered.connect(self._show_custom_plot_dialog)
         menu.addAction(plot_action)
-        
         header = self.table.horizontalHeader()
         global_pos = header.mapToGlobal(pos)
         menu.exec(global_pos)
 
     def _show_custom_plot_dialog(self):
-        if self.table.rowCount() == 0:
+        if self.table.columnCount() <= 2:
             QMessageBox.warning(self, "No Data", "플롯할 데이터가 없습니다.")
             return
-            
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Custom Plot")
         dlg.setMinimumWidth(300)
         lay = QFormLayout(dlg)
-        
-        combo_x = QComboBox()
+
         combo_y = QComboBox()
-        combo_x.setMaxVisibleItems(25)
         combo_y.setMaxVisibleItems(25)
-        
-        headers = [self.table.horizontalHeaderItem(i).text() for i in range(self.table.columnCount())]
-        combo_x.addItems(headers)
-        combo_y.addItems(headers)
-        
-        lay.addRow("X-Axis:", combo_x)
-        lay.addRow("Y-Axis:", combo_y)
-        
+        combo_y.addItems(self._table_row_keys)
+        lay.addRow("Y (Metric):", combo_y)
+
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(dlg.accept)
         btn_box.rejected.connect(dlg.reject)
         lay.addRow(btn_box)
-        
+
         if dlg.exec() == QDialog.Accepted:
-            idx_x = combo_x.currentIndex()
-            idx_y = combo_y.currentIndex()
-            
-            x_data = []
+            row_idx = self._table_row_of(combo_y.currentText())
+            x_labels = []
             y_data = []
-            for r in range(self.table.rowCount()):
-                try:
-                    x_val = float(self.table.item(r, idx_x).text())
-                    y_val = float(self.table.item(r, idx_y).text())
-                    x_data.append(x_val)
-                    y_data.append(y_val)
-                except Exception as e:
-                    pass
-                    
-            if not x_data: return
-            
-            plot_win = QDialog(self)
-            plot_win.setWindowTitle(f"{headers[idx_y]} vs {headers[idx_x]}")
-            plot_win.resize(600, 450)
-            plot_lay = QVBoxLayout(plot_win)
-            canvas = PlotCanvas(plot_win)
-            plot_lay.addWidget(canvas)
-            
-            canvas.ax.plot(x_data, y_data, marker='o', linestyle='-', color='b')
-            canvas.ax.set_xlabel(headers[idx_x])
-            canvas.ax.set_ylabel(headers[idx_y])
-            canvas.ax.grid(True, linestyle='--', alpha=0.7)
-            canvas.fig.tight_layout()
-            canvas.draw()
-            
-            plot_win.show()
+            for col in range(2, self.table.columnCount()):
+                item = self.table.item(row_idx, col)
+                if item:
+                    try:
+                        y_data.append(float(item.text()))
+                        h = self.table.horizontalHeaderItem(col)
+                        x_labels.append(h.text() if h else str(col - 1))
+                    except (ValueError, AttributeError):
+                        pass
+            if not y_data:
+                QMessageBox.warning(self, "No Data", "플롯할 숫자 데이터가 없습니다.")
+                return
+            fig, ax = plt.subplots()
+            ax.plot(range(len(y_data)), y_data, 'o-')
+            ax.set_xticks(range(len(y_data)))
+            ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=7)
+            ax.set_title(combo_y.currentText())
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.show()
+
 
     # ────────────────────────────────────────────────────────────────────────
     # 단축키 / 버튼 핸들러
@@ -1931,13 +2008,12 @@ class WHTMonitorWindow(QMainWindow):
                     }
                     if self.iter_case_combo:
                         self.iter_case_combo.addItem(name)
-                # Summary Table 헤더
+                # Summary Table: case 행 추가
                 if self.table:
-                    headers = ["Iter", "C_total", "Avg_h", "Max_h", "dx", "Area_Ratio", "Min_Width"]
                     for name in self.case_names:
-                        headers += [f"U_{name}", f"D_{name}", f"S_{name}"]
-                    self.table.setColumnCount(len(headers))
-                    self.table.setHorizontalHeaderLabels(headers)
+                        self._append_summary_row(f"U_{name}", f"U_{name}", f"변형 에너지 [J] — {name}")
+                        self._append_summary_row(f"D_{name}", f"D_{name}", f"최대 변위 [mm] — {name}")
+                        self._append_summary_row(f"S_{name}", f"S_{name}", f"최대 응력 [MPa] — {name}")
 
             def get_hist_name(n, h_dict):
                 if n in h_dict: return n
@@ -1986,6 +2062,10 @@ class WHTMonitorWindow(QMainWindow):
                     self.height_iter_combo.blockSignals(True)
                     self.height_iter_combo.insertItem(1, label_str)
                     self.height_iter_combo.blockSignals(False)
+                if self.iter_list:
+                    self.iter_list.blockSignals(True)
+                    self.iter_list.insertItem(1, label_str)
+                    self.iter_list.blockSignals(False)
 
                 if self.height_slider:
                     self.height_slider.blockSignals(True)
@@ -1994,20 +2074,9 @@ class WHTMonitorWindow(QMainWindow):
                         self.height_slider.setValue(it)
                     self.height_slider.blockSignals(False)
 
-            # ── 테이블 행 추가 ────────────────────────────────────────────
-            if self.table and self.table.columnCount() > 0:
-                row = self.table.rowCount()
-                self.table.insertRow(row)
-                ar   = data.get("area_ratio", 0.0)
-                vals = [str(it),
-                        f"{data.get('compliance', 0):.3e}",
-                        f"{data.get('avg_h', 0):.2f}",
-                        f"{data.get('max_h', 0):.2f}",
-                        f"{data.get('dx', 0):.4f}",
-                        f"{ar:.3f}",
-                        f"{data.get('min_width', 0):.1f}"]
-                for col, v in enumerate(vals):
-                    self.table.setItem(row, col, QTableWidgetItem(v))
+            # ── 테이블 열 추가 (전치 구조: 행=항목, 열=iter) ─────────────────
+            if self.table:
+                ar = data.get("area_ratio", 0.0)
                 def get_case_res(n, c_dict):
                     if n in c_dict: return c_dict[n]
                     if '_t' in n:
@@ -2016,15 +2085,21 @@ class WHTMonitorWindow(QMainWindow):
                             if new_n.startswith(base + '_t'):
                                 return val
                     return {"U": 0, "max_disp": 0, "max_stress": 0}
-
-                c_off = len(vals)
+                val_map = {
+                    "Iter":       str(it),
+                    "C_total":    f"{data.get('compliance', 0):.3e}",
+                    "Avg_h":      f"{data.get('avg_h', 0):.2f}",
+                    "Max_h":      f"{data.get('max_h', 0):.2f}",
+                    "dx":         f"{data.get('dx', 0):.4f}",
+                    "Area_Ratio": f"{ar:.3f}",
+                    "Min_Width":  f"{data.get('min_width', 0):.1f}",
+                }
                 for name in self.case_names:
                     res = get_case_res(name, cases_data)
-                    self.table.setItem(row, c_off,   QTableWidgetItem(f"{res.get('U',0):.2e}"))
-                    self.table.setItem(row, c_off+1, QTableWidgetItem(f"{res.get('max_disp',0):.2f}"))
-                    self.table.setItem(row, c_off+2, QTableWidgetItem(f"{res.get('max_stress',0):.1f}"))
-                    c_off += 3
-                self.table.scrollToBottom()
+                    val_map[f"U_{name}"] = f"{res.get('U', 0):.2e}"
+                    val_map[f"D_{name}"] = f"{res.get('max_disp', 0):.2f}"
+                    val_map[f"S_{name}"] = f"{res.get('max_stress', 0):.1f}"
+                self._summary_add_iter_col(it, val_map)
 
             # ── Modal 테이블 갱신: 이터레이션마다 열 추가 ────────────────────
             if self.modal_table and freqs:
@@ -2235,7 +2310,7 @@ class WHTMonitorWindow(QMainWindow):
         if not handles:
             return
         n = len(handles)
-        fontsize = max(5, min(9, 10 - max(0, n - 4)))
+        fontsize = 8
         ax.legend(handles, labels, fontsize=fontsize, loc='best',
                   framealpha=0.7, handlelength=1.5, borderpad=0.4,
                   labelspacing=0.3)
@@ -2291,14 +2366,29 @@ class WHTMonitorWindow(QMainWindow):
             mx = self.height_slider.maximum()
             self.height_slider.setValue(mx - _idx)
             self.height_slider.blockSignals(False)
+        if self.iter_list:
+            self.iter_list.blockSignals(True)
+            self.iter_list.clearSelection()
+            if _idx < self.iter_list.count():
+                self.iter_list.setCurrentRow(_idx)
+            self.iter_list.blockSignals(False)
         self._update_height_plot()
 
     def _on_height_slider_changed(self, val):
         if self.height_iter_combo and not self.height_iter_combo.signalsBlocked():
             self.height_iter_combo.blockSignals(True)
             mx = self.height_slider.maximum()
-            self.height_iter_combo.setCurrentIndex(mx - val)
+            combo_idx = mx - val
+            self.height_iter_combo.setCurrentIndex(combo_idx)
             self.height_iter_combo.blockSignals(False)
+        if self.iter_list:
+            mx = self.height_slider.maximum()
+            combo_idx = mx - val
+            self.iter_list.blockSignals(True)
+            self.iter_list.clearSelection()
+            if combo_idx < self.iter_list.count():
+                self.iter_list.setCurrentRow(combo_idx)
+            self.iter_list.blockSignals(False)
         self._update_height_plot()
 
     def _on_prev_height(self):
@@ -2311,34 +2401,51 @@ class WHTMonitorWindow(QMainWindow):
         if idx > 0:
             self.height_iter_combo.setCurrentIndex(idx - 1)
 
-    def _update_height_plot(self):
-        if not self.height_canvas or not self.height_snapshots:
+    def _on_iter_list_selection_changed(self):
+        """iter_list 선택 변경 → 슬라이더/콤보 동기화 후 플롯 갱신."""
+        if not self.iter_list:
             return
-        snap = self._get_snap(self.height_iter_combo)
-        if snap is None:
-            return
-        coords  = snap["coords"]   # (M, 3) — 요소 도심
-        heights = snap["heights"]  # (M,)
-        it_lbl  = snap["iter"]
+        selected = self.iter_list.selectedItems()
+        if len(selected) == 1:
+            idx = self.iter_list.row(selected[0])
+            if self.height_iter_combo:
+                self.height_iter_combo.blockSignals(True)
+                self.height_iter_combo.setCurrentIndex(idx)
+                self.height_iter_combo.blockSignals(False)
+            if self.height_slider:
+                mx = self.height_slider.maximum()
+                self.height_slider.blockSignals(True)
+                self.height_slider.setValue(max(0, mx - idx))
+                self.height_slider.blockSignals(False)
+        self._update_height_plot()
 
-        ax  = self.height_canvas.ax
-        fig = self.height_canvas.fig
-        ax.clear()
+    def _get_snap_by_combo_idx(self, idx: int):
+        """combo index(0=Latest, 1=최신…)로 스냅샷 반환."""
+        if not self.height_snapshots:
+            return None
+        if idx == 0:
+            return self.height_snapshots[-1]
+        snap_idx = len(self.height_snapshots) - idx
+        snap_idx = max(0, min(snap_idx, len(self.height_snapshots) - 1))
+        return self.height_snapshots[snap_idx]
 
-        x, y = coords[:, 0], coords[:, 1]
-
-        # 고정 컬러 범위 = ±h_max (--bead-height 값 고정, 이터레이션 무관)
-        h_max      = float(snap.get("h_max", 15.0))   # 기본 15mm (bead-height 기본값)
-        bead_steps = int(snap.get("bead_steps", 0))
-
+    def _draw_height_snap(self, ax, fig, snap, *, colorbar: bool = True):
+        """단일 스냅샷을 ax에 그립니다."""
         from scipy.interpolate import griddata
         from matplotlib.colors import BoundaryNorm
         from matplotlib import cm
+
+        coords  = snap["coords"]
+        heights = snap["heights"]
+        it_lbl  = snap["iter"]
+        x, y    = coords[:, 0], coords[:, 1]
+        h_max      = float(snap.get("h_max", 15.0))
+        bead_steps = int(snap.get("bead_steps", 0))
         interp_method = (self.height_interp_combo.currentText()
                          if self.height_interp_combo else "linear")
         show_contour  = (self.height_contour_check.isChecked()
                          if self.height_contour_check else False)
-        # 격자 해상도: 요소 크기에 맞춤 (1 cell ≈ 1 element) → 가짜 보간 제거
+
         nx_g, ny_g = _grid_res_from_elements(x, y)
         xi = np.linspace(x.min(), x.max(), nx_g)
         yi = np.linspace(y.min(), y.max(), ny_g)
@@ -2346,47 +2453,87 @@ class WHTMonitorWindow(QMainWindow):
         Zi = griddata((x, y), heights, (Xi, Yi), method=interp_method)
         Zi_near = griddata((x, y), heights, (Xi, Yi), method='nearest')
         Zi = np.where(np.isnan(Zi), Zi_near, Zi)
-        Zi = np.clip(Zi, -h_max, h_max)   # 보간 아티팩트가 범위 밖으로 나가지 않도록
+        Zi = np.clip(Zi, -h_max, h_max)
 
-        # 이산 colormap: 항상 ±h_max 대칭 범위, coolwarm 발산형
-        # - 단방향(+): [0, h_max] 구간에 값 분포 → 파란쪽이 0(비드 없음)
-        # - 단방향(-): [-h_max, 0] 구간에 값 분포
-        # - 양방향:    [-h_max, h_max] 전체 범위 활용
         n_steps = bead_steps if bead_steps >= 1 else 5
         pos_levels  = np.linspace(0, h_max, n_steps + 1)
-        full_levels = np.concatenate([-pos_levels[::-1], pos_levels[1:]])  # -(n_steps+1)레벨
+        full_levels = np.concatenate([-pos_levels[::-1], pos_levels[1:]])
         vmin, vmax  = -h_max, h_max
-
-        boundaries = (full_levels[:-1] + full_levels[1:]) * 0.5
-        boundaries = np.concatenate([[vmin - 1e-6], boundaries, [vmax + 1e-6]])
-        cmap_disc = cm.get_cmap('coolwarm', len(full_levels))
+        boundaries  = (full_levels[:-1] + full_levels[1:]) * 0.5
+        boundaries  = np.concatenate([[vmin - 1e-6], boundaries, [vmax + 1e-6]])
+        cmap_disc   = cm.get_cmap('coolwarm', len(full_levels))
         norm = BoundaryNorm(boundaries, ncolors=cmap_disc.N, clip=True)
         sc = ax.imshow(
             Zi, origin='lower', aspect='equal',
             extent=[x.min(), x.max(), y.min(), y.max()],
-            cmap=cmap_disc, norm=norm,
-            interpolation='nearest',
+            cmap=cmap_disc, norm=norm, interpolation='nearest',
         )
-
         if show_contour:
             ax.contour(Xi, Yi, Zi, levels=full_levels,
                        colors='k', linewidths=0.5, alpha=0.6)
 
-        _cb_label = "Bead Height (mm)  [+: outward / −: inward]"
-
-        if self._height_colorbar is None:
-            self._height_colorbar = fig.colorbar(sc, ax=ax)
-            self._height_colorbar.set_label(_cb_label)
-        else:
-            self._height_colorbar.update_normal(sc)
-            self._height_colorbar.set_label(_cb_label)
-        self._height_colorbar.set_ticks(full_levels)
-        self._height_colorbar.set_ticklabels([f"{v:.1f}" for v in full_levels])
+        _cb_label = "Bead Height (mm)"
+        if colorbar:
+            if self._height_colorbar is None:
+                self._height_colorbar = fig.colorbar(sc, ax=ax)
+                self._height_colorbar.set_label(_cb_label)
+            else:
+                self._height_colorbar.update_normal(sc)
+                self._height_colorbar.set_label(_cb_label)
+            self._height_colorbar.set_ticks(full_levels)
+            self._height_colorbar.set_ticklabels([f"{v:.1f}" for v in full_levels])
 
         ax.set_aspect('equal')
-        ax.set_title(f"Height Distribution — Iter {it_lbl}")
+        ax.set_title(f"Iter {it_lbl}", fontsize=9)
         ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)")
-        fig.tight_layout()
+
+    def _update_height_plot(self):
+        if not self.height_canvas or not self.height_snapshots:
+            return
+
+        # 선택된 iter 목록 수집
+        selected_snaps = []
+        if self.iter_list and self.iter_list.selectedItems():
+            for item in self.iter_list.selectedItems():
+                snap = self._get_snap_by_combo_idx(self.iter_list.row(item))
+                if snap is not None:
+                    selected_snaps.append(snap)
+
+        fig = self.height_canvas.fig
+
+        if len(selected_snaps) <= 1:
+            # 단일 모드: 기존 동작
+            snap = selected_snaps[0] if selected_snaps else self._get_snap(self.height_iter_combo)
+            if snap is None:
+                return
+            ax = self.height_canvas.ax
+            ax.clear()
+            self._draw_height_snap(ax, fig, snap, colorbar=True)
+            try:
+                fig.tight_layout()
+            except Exception:
+                pass
+        else:
+            # 다중 선택: subplot 모드
+            max_cols = self._iter_subplot_cols_spin.value() if self._iter_subplot_cols_spin else 2
+            n        = len(selected_snaps)
+            ncols    = min(n, max_cols)
+            nrows    = (n + ncols - 1) // ncols
+            fig.clf()
+            self._height_colorbar = None
+            self.height_canvas.ax = None
+            axes = fig.subplots(nrows, ncols, squeeze=False)
+            for i, snap in enumerate(selected_snaps):
+                r, c = divmod(i, ncols)
+                self._draw_height_snap(axes[r][c], fig, snap, colorbar=False)
+            for i in range(n, nrows * ncols):
+                r, c = divmod(i, ncols)
+                axes[r][c].set_visible(False)
+            try:
+                fig.tight_layout(pad=0.8)
+            except Exception:
+                pass
+
         self.height_canvas.draw()
         self.height_canvas.draw_idle()
 

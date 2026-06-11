@@ -2132,10 +2132,29 @@ class TopographyPipeline:
             from wht_visualizer.wht_visualizer import launch_paraview
             launch_paraview(hdf_path)
         else:
-            viz = WHTVisualizer(title="Industrial Topography Result")
-            viz.load_results(result_data)
-            viz.set_bead_discrete_levels(bead_steps if discrete else 0)
-            viz.show()
+            import pickle, subprocess
+            tmp_pkl = self.out_dir / "_vis_tmp.pkl"
+            with open(tmp_pkl, 'wb') as _f:
+                pickle.dump({'result_data': result_data,
+                             'bead_steps': bead_steps if discrete else 0}, _f)
+            project_root = Path(__file__).resolve().parent.parent
+            launcher = self.out_dir / "_vis_launcher.py"
+            launcher.write_text(
+                "import pickle, sys\n"
+                f"sys.path.insert(0, r'{project_root}')\n"
+                f"with open(r'{tmp_pkl}', 'rb') as _f:\n"
+                "    _d = pickle.load(_f)\n"
+                "from wht_visualizer.wht_visualizer import WHTVisualizer\n"
+                "_v = WHTVisualizer(title='Industrial Topography Result')\n"
+                "_v.load_results(_d['result_data'])\n"
+                "_v.set_bead_discrete_levels(_d['bead_steps'])\n"
+                "_v.show()\n",
+                encoding='utf-8'
+            )
+            _kw = ({'creationflags': subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+                   if sys.platform == 'win32' else {'start_new_session': True})
+            subprocess.Popen([sys.executable, str(launcher)], **_kw)
+            print(" [8] WHTVisualizer 시작 (비동기 — Gooey 즉시 완료)")
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────────────
 
@@ -3188,10 +3207,11 @@ def main():
                     help="공간 필터 커널. linear=hat(기본) / gaussian=부드러운 덩어리 유도")
     # [4] 비드 연결 / 대칭 / 다양성 ─────────────────────────────────────────
     sym_group = g3.add_mutually_exclusive_group()
+    sym_group.gooey_options = {'initial_selection': 0}
     sym_group.add_argument("--sym-x",    dest="sym_x", action="store_const", const=True,  default=True, help="좌우 대칭 활성화 (기본)")
     sym_group.add_argument("--no-sym-x", dest="sym_x", action="store_const", const=False,               help="좌우 대칭 해제")
-    g3.add_argument("--bead-connect",          type=float, default=100.0,
-                    help="비드 자동 연결 최대 갭 mm (기본: 100.0, 0=비활성).\n"
+    g3.add_argument("--bead-connect",          type=float, default=220.0,
+                    help="비드 자동 연결 최대 갭 mm (기본: 220.0, 0=비활성).\n"
                          "인접 비드 섬을 브릿지로 연결. 너무 크면 과도하게 연결되어 패턴 왜곡.")
     g3.add_argument("--bead-connect-alg",      type=str,   default="geodesic",
                     choices=["closing", "mst", "geodesic", "hybrid"],
