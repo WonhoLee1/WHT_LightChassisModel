@@ -985,7 +985,7 @@ class WHTMonitorWindow(QMainWindow):
                 self.height_iter_combo.blockSignals(True)
                 self.height_iter_combo.clear()
                 self.height_iter_combo.addItem("Latest")
-                for sn in self.height_snapshots:
+                for sn in reversed(self.height_snapshots):   # 최신→구 순서 (insertItem(1) 패턴과 일치)
                     self.height_iter_combo.addItem(f"Iter {sn['iter']}")
                 self.height_iter_combo.blockSignals(False)
             if self.height_slider and self.height_snapshots:
