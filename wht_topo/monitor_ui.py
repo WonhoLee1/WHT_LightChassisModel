@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QSizePolicy,
     QMenu, QDialog, QFormLayout, QDialogButtonBox,
     QSplitter, QTextEdit,
-    QCheckBox, QListWidget, QDoubleSpinBox,
+    QCheckBox, QListWidget, QDoubleSpinBox, QSpinBox, QAbstractItemView,
 )
 from PySide6.QtCore import Signal, QObject, QThread, Qt
 from PySide6.QtGui import QPixmap, QAction
@@ -866,6 +866,9 @@ class WHTMonitorWindow(QMainWindow):
         self._settings_table: "QTableWidget | None" = None
         self.table = self.modal_table = None
         self.metric_combo = self.height_iter_combo = None
+        self.metric_list: "QListWidget | None" = None
+        self._show_legend_check: "QCheckBox | None" = None
+        self._subplot_cols_spin = None
         self._height_colorbar = None
         self.status_label = self.stop_btn = self.top_btn = self.reset_btn = None
         self.height_slider = self.btn_prev_h = self.btn_next_h = None
@@ -1139,9 +1142,9 @@ class WHTMonitorWindow(QMainWindow):
                     if not self.case_names and cases_data:
                         self.case_names = sorted(cases_data.keys())
                         for name in self.case_names:
-                            if self.metric_combo:
+                            if self.metric_list:
                                 for pfx in ("U_", "Disp_", "Stress_"):
-                                    self.metric_combo.addItem(f"{pfx}{name}")
+                                    self.metric_list.addItem(f"{pfx}{name}")
                             self.history["cases"][name] = {
                                 "U": [], "max_disp": [], "max_stress": []
                             }
@@ -1485,30 +1488,76 @@ class WHTMonitorWindow(QMainWindow):
         lay.addWidget(self.table)
         self.tabs.addTab(tab, "Summary Table")
 
+    # 기본 메트릭 항목 목록
+    _BASE_METRICS = [
+        "ALL (Normalized)", "Compliance", "Avg_h", "Max_h",
+        "dx", "Area_Ratio", "Min_Width", "Natural Frequencies",
+    ]
+
     def _build_tab_curve(self):
-        tab = QWidget(); lay = QVBoxLayout(tab)
-        
+        tab = QWidget()
+        tab_lay = QVBoxLayout(tab)
+        tab_lay.setContentsMargins(2, 2, 2, 2); tab_lay.setSpacing(2)
+
         self.curve_canvas = PlotCanvas(tab)
         self.curve_toolbar = NavigationToolbar(self.curve_canvas, tab)
         from PySide6.QtCore import QSize
         _sz = self.curve_toolbar.iconSize()
         self.curve_toolbar.setIconSize(QSize(int(_sz.width() * 0.6), int(_sz.height() * 0.6)))
-        lay.addWidget(self.curve_toolbar)
-        
-        ctrl = QHBoxLayout()
-        self.metric_combo = QComboBox()
-        self.metric_combo.setMaxVisibleItems(25)
-        self.metric_combo.addItems([
-            "ALL (Normalized)", "Compliance", "Avg_h", "Max_h",
-            "dx", "Area_Ratio", "Min_Width", "Natural Frequencies",
-        ])
-        self.metric_combo.currentTextChanged.connect(self._update_curves)
-        ctrl.addWidget(QLabel("Select Metric:"))
-        ctrl.addWidget(self.metric_combo)
-        ctrl.addStretch()
-        lay.addLayout(ctrl)
-        lay.addWidget(self.curve_canvas)
+
+        # ── 가로 Splitter: 왼쪽 리스트 / 오른쪽 플롯 ────────────────────────
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        # ── 왼쪽: 메트릭 리스트 + 컨트롤 ────────────────────────────────────
+        left_w = QWidget()
+        left_w.setMinimumWidth(120)
+        left_w.setMaximumWidth(200)
+        left_lay = QVBoxLayout(left_w)
+        left_lay.setContentsMargins(4, 4, 4, 4); left_lay.setSpacing(4)
+
+        left_lay.addWidget(QLabel("Metrics  (Ctrl+클릭=복수):"))
+        self.metric_list = QListWidget()
+        self.metric_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.metric_list.addItems(self._BASE_METRICS)
+        self.metric_list.setCurrentRow(0)
+        self.metric_list.selectionModel().selectionChanged.connect(self._update_curves)
+        left_lay.addWidget(self.metric_list, stretch=1)
+
+        self._show_legend_check = QCheckBox("Legend 표시")
+        self._show_legend_check.setChecked(True)
+        self._show_legend_check.stateChanged.connect(self._update_curves)
+        left_lay.addWidget(self._show_legend_check)
+
+        cols_row = QHBoxLayout()
+        cols_row.addWidget(QLabel("Subplot 열:"))
+        self._subplot_cols_spin = QSpinBox()
+        self._subplot_cols_spin.setRange(1, 6)
+        self._subplot_cols_spin.setValue(2)
+        self._subplot_cols_spin.setToolTip("복수 선택 시 subplot 최대 열 수")
+        self._subplot_cols_spin.valueChanged.connect(self._update_curves)
+        cols_row.addWidget(self._subplot_cols_spin)
+        cols_row.addStretch()
+        left_lay.addLayout(cols_row)
+
+        splitter.addWidget(left_w)
+
+        # ── 오른쪽: toolbar + canvas ──────────────────────────────────────
+        right_w = QWidget()
+        right_lay = QVBoxLayout(right_w)
+        right_lay.setContentsMargins(0, 0, 0, 0); right_lay.setSpacing(0)
+        right_lay.addWidget(self.curve_toolbar)
+        right_lay.addWidget(self.curve_canvas, stretch=1)
+        splitter.addWidget(right_w)
+
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        tab_lay.addWidget(splitter)
         self.tabs.addTab(tab, "Convergence Curve")
+
+        # compat: metric_combo는 None으로 유지 (addItem 호출 코드는 metric_list로 대체)
+        self.metric_combo = None
 
     def _build_tab_height(self):
         tab = QWidget()
@@ -1874,9 +1923,9 @@ class WHTMonitorWindow(QMainWindow):
             if not self.case_names and cases_data:
                 self.case_names = sorted(cases_data.keys())
                 for name in self.case_names:
-                    if self.metric_combo:
+                    if self.metric_list:
                         for pfx in ("U_", "Disp_", "Stress_"):
-                            self.metric_combo.addItem(f"{pfx}{name}")
+                            self.metric_list.addItem(f"{pfx}{name}")
                     self.history["cases"][name] = {
                         "U": [], "max_disp": [], "max_stress": []
                     }
@@ -2051,14 +2100,12 @@ class WHTMonitorWindow(QMainWindow):
         self.ref_freqs        = None
         self.case_names       = []
 
-        if self.metric_combo:
-            self.metric_combo.blockSignals(True)
-            self.metric_combo.clear()
-            self.metric_combo.addItems([
-                "ALL (Normalized)", "Compliance", "Avg_h", "Max_h",
-                "dx", "Area_Ratio", "Min_Width", "Natural Frequencies",
-            ])
-            self.metric_combo.blockSignals(False)
+        if self.metric_list:
+            self.metric_list.blockSignals(True)
+            self.metric_list.clear()
+            self.metric_list.addItems(self._BASE_METRICS)
+            self.metric_list.setCurrentRow(0)
+            self.metric_list.blockSignals(False)
         if self.table:
             self.table.setRowCount(0); self.table.setColumnCount(0)
         if self.modal_table:
@@ -2116,16 +2163,16 @@ class WHTMonitorWindow(QMainWindow):
             arr[i, :len(r)] = r
         return arr
 
-    def _update_curves(self):
-        if not self.curve_canvas or not self.history["iter"]:
-            return
-        metric = self.metric_combo.currentText()
-        ax     = self.curve_canvas.ax
-        ax.clear()
-        iters  = self.history["iter"]
+    def _get_selected_metrics(self) -> list:
+        if not self.metric_list:
+            return []
+        return [item.text() for item in self.metric_list.selectedItems()]
 
+    def _plot_single_metric(self, ax, metric: str):
+        """단일 axes에 하나의 metric을 그립니다."""
+        iters = self.history["iter"]
         if metric == "ALL (Normalized)":
-            metrics = [
+            entries = [
                 ("Compliance", self.history["compliance"], 'o-'),
                 ("Avg_h",      self.history["avg_h"],      's-'),
                 ("Max_h",      self.history["max_h"],      '^-'),
@@ -2137,21 +2184,20 @@ class WHTMonitorWindow(QMainWindow):
             for i, name in enumerate(self.case_names):
                 u = self.history["cases"][name]["U"]
                 if u:
-                    metrics.append((f"U_{name}", u, fmts[i % len(fmts)]))
+                    entries.append((f"U_{name}", u, fmts[i % len(fmts)]))
             RIGID = 0.5
             fa = self._freq_array(self.history["frequencies"])
             if fa.ndim == 2 and fa.shape[0] > 0 and fa.shape[1] > 0:
                 cols = np.where(fa[-1] >= RIGID)[0]
                 if len(cols) > 0:
-                    metrics.append(("Freq_1", list(fa[:, cols[0]]), 'P-'))
-            for label, lst, fmt in metrics:
+                    entries.append(("Freq_1", list(fa[:, cols[0]]), 'P-'))
+            for label, lst, fmt in entries:
                 arr = np.array(lst)
                 if len(arr) > 0:
                     mx = np.max(np.abs(arr))
-                    ax.plot(iters, arr / mx if mx > 1e-12 else arr,
+                    ax.plot(iters, arr / (mx if mx > 1e-12 else 1.0),
                             fmt, label=label, markersize=3, linewidth=1)
-            ax.set_ylabel("Normalized Value")
-            pass  # legend 제거
+            ax.set_ylabel("Normalized")
         elif metric == "Natural Frequencies":
             RIGID = 0.5
             fa = self._freq_array(self.history["frequencies"])
@@ -2160,12 +2206,11 @@ class WHTMonitorWindow(QMainWindow):
                 for rank, col in enumerate(cols[:10]):
                     ax.plot(iters, fa[:, col],
                             label=f"M{rank+1}({fa[-1, col]:.1f}Hz)")
-                pass  # legend 제거
-            ax.set_ylabel("Frequency (Hz)")
+            ax.set_ylabel("Freq (Hz)")
         elif metric == "Area_Ratio":
             ax.plot(iters, self.history["area_ratio"], 'D-',
                     color='darkorange', label="Area Ratio")
-            ax.set_ylabel("Bead Area Ratio")
+            ax.set_ylabel("Area Ratio")
             ax.set_ylim(0, 1.05)
         elif metric in ("Compliance", "Avg_h", "Max_h", "dx", "Min_Width"):
             ax.plot(iters, self.history[metric.lower()], 'o-', label=metric)
@@ -2177,13 +2222,63 @@ class WHTMonitorWindow(QMainWindow):
                     key = {"U": "U", "Disp": "max_disp", "Stress": "max_stress"}.get(pfx, "U")
                     ax.plot(iters, self.history["cases"][name][key], 's-', label=metric)
                     break
-
-        ax.set_title(f"Optimization Trend: {metric}")
-        ax.set_xlabel("Iteration")
+        ax.set_title(metric, fontsize=9, pad=3)
+        ax.set_xlabel("Iter", fontsize=8)
         ax.minorticks_on()
-        ax.grid(True, which='major', linestyle='-', alpha=0.5)
-        ax.grid(True, which='minor', linestyle=':', alpha=0.2)
-        self.curve_canvas.fig.tight_layout()
+        ax.grid(True, which='major', linestyle='-', alpha=0.4)
+        ax.grid(True, which='minor', linestyle=':', alpha=0.15)
+        ax.tick_params(labelsize=7)
+
+    def _add_legend_auto(self, ax):
+        """legend 항목 수에 따라 폰트를 자동 축소하여 axes 안에 표시합니다."""
+        handles, labels = ax.get_legend_handles_labels()
+        if not handles:
+            return
+        n = len(handles)
+        fontsize = max(5, min(9, 10 - max(0, n - 4)))
+        ax.legend(handles, labels, fontsize=fontsize, loc='best',
+                  framealpha=0.7, handlelength=1.5, borderpad=0.4,
+                  labelspacing=0.3)
+
+    def _update_curves(self):
+        if not self.curve_canvas or not self.history["iter"]:
+            return
+        metrics = self._get_selected_metrics()
+        if not metrics:
+            return
+
+        show_legend = self._show_legend_check.isChecked() if self._show_legend_check else True
+        max_cols    = self._subplot_cols_spin.value() if self._subplot_cols_spin else 2
+
+        fig = self.curve_canvas.fig
+        fig.clf()
+
+        if len(metrics) == 1:
+            ax = fig.add_subplot(111)
+            self.curve_canvas.ax = ax
+            self._plot_single_metric(ax, metrics[0])
+            if show_legend:
+                self._add_legend_auto(ax)
+        else:
+            n      = len(metrics)
+            ncols  = min(n, max_cols)
+            nrows  = (n + ncols - 1) // ncols
+            axes   = fig.subplots(nrows, ncols, squeeze=False)
+            self.curve_canvas.ax = axes[0][0]
+            for idx, metric in enumerate(metrics):
+                r, c = divmod(idx, ncols)
+                self._plot_single_metric(axes[r][c], metric)
+                if show_legend:
+                    self._add_legend_auto(axes[r][c])
+            # 남는 axes 숨기기
+            for idx in range(len(metrics), nrows * ncols):
+                r, c = divmod(idx, ncols)
+                axes[r][c].set_visible(False)
+
+        try:
+            fig.tight_layout(pad=1.2)
+        except Exception:
+            pass
         self.curve_canvas.draw()
 
     # ────────────────────────────────────────────────────────────────────────
