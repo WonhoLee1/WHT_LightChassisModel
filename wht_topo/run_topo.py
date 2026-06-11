@@ -2004,6 +2004,14 @@ class TopographyPipeline:
                     daemon=False,  # 메인 프로세스 종료 시 창이 유지되도록 설정
                 )
                 p.start()
+                # Python atexit에서 이 자식 프로세스를 기다리지 않도록 추적 해제.
+                # 덕분에 최적화 완료 후 Gooey가 즉시 재활성화되고
+                # 모니터 창은 독립적으로 계속 열려 있을 수 있다.
+                try:
+                    import multiprocessing.process as _mp_proc
+                    _mp_proc._children.discard(p)
+                except Exception:
+                    pass
                 _process_holder[0] = p
                 return p
 

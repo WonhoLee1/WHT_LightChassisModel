@@ -888,6 +888,170 @@ class WHTMonitorWindow(QMainWindow):
         self._setup_shortcuts()
         self._restore_history()
 
+    # ── File: Save / Load monitor state ──────────────────────────────────────
+
+    def _save_monitor_state(self):
+        """현재 모니터 히스토리와 설정을 .whtmon 파일로 저장합니다."""
+        import pickle
+        from PySide6.QtWidgets import QFileDialog
+        default_dir = self.results_dir or str(Path.home())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Monitor State", default_dir,
+            "WHT Monitor State (*.whtmon);;All Files (*)"
+        )
+        if not path:
+            return
+        if not path.endswith(".whtmon"):
+            path += ".whtmon"
+        state = {
+            "history":          self.history,
+            "height_snapshots": self.height_snapshots,
+            "snap_dir":         self.snap_dir,
+            "results_dir":      self.results_dir,
+            "ref_freqs":        self.ref_freqs,
+            "case_names":       self.case_names,
+        }
+        try:
+            with open(path, "wb") as f:
+                pickle.dump(state, f)
+            QMessageBox.information(self, "저장 완료", f"모니터 상태가 저장되었습니다:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "저장 실패", str(e))
+
+    def _load_monitor_state(self):
+        """저장된 .whtmon 파일을 불러와 히스토리와 플롯을 복원합니다."""
+        import pickle
+        from PySide6.QtWidgets import QFileDialog
+        default_dir = self.results_dir or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Monitor State", default_dir,
+            "WHT Monitor State (*.whtmon);;All Files (*)"
+        )
+        if not path or not Path(path).exists():
+            return
+        try:
+            with open(path, "rb") as f:
+                state = pickle.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "로드 실패", str(e))
+            return
+
+        self._clear_history()
+        self.history          = state.get("history", self.history)
+        self.height_snapshots = state.get("height_snapshots", [])
+        snap_dir              = state.get("snap_dir", "")
+        results_dir           = state.get("results_dir", "")
+        self.ref_freqs        = state.get("ref_freqs")
+        self.case_names       = state.get("case_names", [])
+
+        if snap_dir:
+            self.snap_dir = snap_dir
+        if results_dir:
+            self.results_dir = results_dir
+
+        # snap_dir가 살아 있으면 init.pkl에서 메시 등 복원
+        snap_path = Path(self.snap_dir) if self.snap_dir else None
+        if snap_path and (snap_path / "init.pkl").exists():
+            try:
+                with open(snap_path / "init.pkl", "rb") as f:
+                    init_data = pickle.load(f)
+                if "mesh_edge_segs" in init_data:
+                    self.mesh_edge_segs = init_data["mesh_edge_segs"]
+                if "run_settings" in init_data:
+                    self._update_settings_tab(init_data["run_settings"])
+            except Exception:
+                pass
+
+        # 히스토리 기반 UI 재렌더링
+        self._rebuild_history_ui()
+
+        if self.status_label:
+            self.status_label.setText(f"Status: Loaded — {Path(path).name}")
+            self.status_label.setStyleSheet("color:#6af;font-weight:bold;font-size:14px;")
+
+    def _rebuild_history_ui(self):
+        """히스토리 데이터가 교체된 후 모든 그래프/테이블을 다시 그립니다."""
+        # iter_combo / slider 재구성을 포함한 전체 복원은 기존 _restore_history와
+        # 동일 로직을 활용한다. history가 이미 채워진 상태이므로 파일 읽기 없이
+        # UI 갱신 부분만 실행하면 된다.
+        try:
+            # 케이스 히스토리 재등록
+            for case_name, vals in self.history.get("cases", {}).items():
+                if case_name not in self.case_names:
+                    self.case_names.append(case_name)
+
+            # height_snapshots → slider/combo 복원
+            if self.height_snapshots and self.height_iter_combo:
+                self.height_iter_combo.blockSignals(True)
+                self.height_iter_combo.clear()
+                self.height_iter_combo.addItem("Latest")
+                for sn in self.height_snapshots:
+                    self.height_iter_combo.addItem(f"Iter {sn['iter']}")
+                self.height_iter_combo.blockSignals(False)
+            if self.height_slider and self.height_snapshots:
+                self.height_slider.setMaximum(len(self.height_snapshots))
+
+            # 곡선 및 비드 높이 플롯 업데이트
+            if self.history["iter"]:
+                self._update_curves()
+                if self.height_snapshots:
+                    self._update_height_plot()
+
+            # modal 테이블 복원
+            if self.modal_table and self.history.get("frequencies"):
+                self.modal_table.setColumnCount(1)
+                self.modal_table.setHorizontalHeaderLabels(["Ref. (Hz)"])
+                if self.ref_freqs:
+                    for idx_f, f in enumerate(self.ref_freqs):
+                        if idx_f < self.modal_table.rowCount():
+                            self.modal_table.setItem(
+                                idx_f, 0, QTableWidgetItem(f"{f:.2f}"))
+                for idx_i, it in enumerate(self.history["iter"]):
+                    freqs = self.history["frequencies"][idx_i]
+                    if freqs:
+                        n_needed = len(freqs)
+                        if self.modal_table.rowCount() < n_needed:
+                            self.modal_table.setRowCount(n_needed)
+                            self.modal_table.setVerticalHeaderLabels(
+                                [f"Mode {i+1}" for i in range(n_needed)])
+                        col = self.modal_table.columnCount()
+                        self.modal_table.insertColumn(col)
+                        self.modal_table.setColumnWidth(col, 80)
+                        self.modal_table.setHorizontalHeaderItem(
+                            col, QTableWidgetItem(f"Iter {it}"))
+                        for idx_f, f in enumerate(freqs):
+                            if idx_f < self.modal_table.rowCount():
+                                self.modal_table.setItem(
+                                    idx_f, col, QTableWidgetItem(f"{f:.2f}"))
+
+            # iteration 결과 테이블 복원
+            if self.table and self.history.get("iter"):
+                self._rebuild_iter_table()
+        except Exception as e:
+            print(f"[Monitor] _rebuild_history_ui 오류: {e}", flush=True)
+
+    def _rebuild_iter_table(self):
+        """iteration 결과 테이블을 history 데이터로 재구성합니다."""
+        try:
+            iters = self.history["iter"]
+            for idx, it in enumerate(iters):
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                def _set(c, v):
+                    self.table.setItem(row, c, QTableWidgetItem(str(v)))
+                _set(0, it)
+                _set(1, f"{self.history['compliance'][idx]:.6e}"
+                     if idx < len(self.history['compliance']) else "")
+                _set(2, f"{self.history['area_ratio'][idx]:.4f}"
+                     if idx < len(self.history['area_ratio']) else "")
+                _set(3, f"{self.history['max_h'][idx]:.4f}"
+                     if idx < len(self.history['max_h']) else "")
+                _set(4, f"{self.history['dx'][idx]:.6e}"
+                     if idx < len(self.history['dx']) else "")
+            self.table.scrollToBottom()
+        except Exception as e:
+            print(f"[Monitor] _rebuild_iter_table 오류: {e}", flush=True)
+
     def _restore_history(self):
         """재시작 시 기존 이터레이션 pkl 파일들을 읽어들여 그래프 히스토리를 자동 복원합니다."""
         import glob
@@ -1112,6 +1276,16 @@ class WHTMonitorWindow(QMainWindow):
     # ────────────────────────────────────────────────────────────────────────
 
     def _init_ui(self):
+        # ── 메뉴바 ────────────────────────────────────────────────────────────
+        mb = self.menuBar()
+        file_menu = mb.addMenu("File")
+        act_save = file_menu.addAction("Save State...")
+        act_save.setShortcut("Ctrl+S")
+        act_save.triggered.connect(self._save_monitor_state)
+        act_load = file_menu.addAction("Load State...")
+        act_load.setShortcut("Ctrl+O")
+        act_load.triggered.connect(self._load_monitor_state)
+
         central    = QWidget()
         self.setCentralWidget(central)
         root_lay   = QVBoxLayout(central)
@@ -1637,6 +1811,14 @@ class WHTMonitorWindow(QMainWindow):
     def update_data(self, data: dict):
         if "run_settings" in data:
             self._update_settings_tab(data["run_settings"])
+        if data.get("status") == "DISCONNECTED":
+            if self.status_label:
+                self.status_label.setText("Status: Optimization process exited — monitor active")
+                self.status_label.setStyleSheet("color:#aaaaaa;font-weight:bold;font-size:14px;")
+            if self.stop_btn:
+                self.stop_btn.setEnabled(False)
+            return
+
         if data.get("status") == "STOP":
             if self.status_label:
                 self.status_label.setText("Status: Optimization Completed / Stopped")
@@ -3468,6 +3650,11 @@ def start_monitor_ui(queue, stop_event=None, results_dir: str = "",
                     self.handler.data_received.emit(data)
                 except _queue.Empty:
                     continue
+                except (EOFError, OSError):
+                    # 메인 프로세스(최적화)가 종료돼 큐가 끊어진 경우.
+                    # 모니터 창은 계속 열려 있으므로 그냥 수신 스레드만 종료.
+                    self.handler.data_received.emit({"status": "DISCONNECTED"})
+                    return
                 except Exception:
                     return
 
