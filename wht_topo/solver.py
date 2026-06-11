@@ -27,11 +27,20 @@ Topography Optimization Solver — wht_solver 기반 정밀 구현.
        · 민감도: df/dh = (Σ w_i · ∂C_i/∂h) / C_0
        · 주의: 하중 크기가 케이스마다 크게 다르면 큰 케이스가 목적함수를 지배.
 
-  ② 케이스별 정규화 가중 합산 (normalize_obj=True)
+  ② 케이스별 정규화 가중 합산 (normalize_obj=True, --normalize-obj 플래그)
        f = Σ w_i · (C_i / C_i0)
-       · C_i0 = 이터레이션 0에서 케이스 i의 컴플라이언스 (케이스별 정규화)
-       · 서로 다른 크기의 정적·동적 ESL 케이스를 균등하게 반영할 때 사용.
+       · C_i0 = 이터레이션 0의 평면 상태(_C_0_cases_flat)에서 케이스 i의 컴플라이언스
        · 민감도: df/dh = Σ (w_i/C_i0) · ∂C_i/∂h
+
+       [정하중 vs 동하중 ESL 간 노말라이즈]
+       · ① 기본 모드에서는 정하중(예: 굽힘·비틀림 ~1e3 J)과 ESL(~수 J~수십 kJ)의
+         컴플라이언스 절대값 차이가 그대로 목적함수에 반영됨.
+         ESL 크기가 정하중보다 훨씬 크면 --w-dynamic 수동 조절 없이는 ESL이 지배.
+       · ② 이 모드에서는 각 케이스를 자신의 평면 기준값으로 나누므로
+         정하중/ESL 모두 "평면 대비 개선율(무차원)"로 균등 비교됨.
+         → 정하중 + 반복 ESL(--iterative-esl) 조합 시 권장.
+       · ESL 이름은 매 이터마다 t값·SE값이 바뀌므로 get_C0_safe()에서
+         케이스 rank 번호(ESL_01 등)로 이름 매칭 후 C_i0를 조회.
 
   ③ Softmax 최악 케이스 (obj_type='max')
        f = (1/α) · log(Σ exp(α · w_i · C_i/C_i0))
@@ -1221,7 +1230,11 @@ class WHTopographySolver:
         from wht_solver.wht_stress_recovery import ElementStressRecovery
         from wht_solver.wht_result import WHTSolverResult
 
-        ndof           = len(self.sorted_nids) * 6
+        # 정적 ESL 해석 및 최적화 루프 내 해석을 위해 마스터 노드가 추가되어 ndof가 변경될 수 있으므로,
+        # 고정된 self.sorted_nids 대신 현재 모델의 노드를 기준으로 동적 정렬 노드 목록과 ndof를 재계산합니다.
+        current_nids = self.model.sorted_node_ids()
+        current_nid_to_idx = {nid: i for i, nid in enumerate(current_nids)}
+        ndof           = len(current_nids) * 6
         total_C        = 0.0
         case_responses = {}
         total_sens     = np.zeros(self._n_design)
@@ -1272,11 +1285,11 @@ class WHTopographySolver:
 
         def _extract_result(u_aug_np, lc, jm_lc):
             """u_aug 벡터 → displacement, cell_data, u_full, f_full, C_i."""
-            n_nodes = len(self.sorted_nids)
+            n_nodes = len(current_nids)
             displacement = np.zeros((n_nodes, 6))
-            for ii, nid in enumerate(self.sorted_nids):
-                displacement[ii, :] = u_aug_np[self.nid_to_idx[nid] * 6:
-                                                self.nid_to_idx[nid] * 6 + 6]
+            for ii, nid in enumerate(current_nids):
+                displacement[ii, :] = u_aug_np[current_nid_to_idx[nid] * 6:
+                                                current_nid_to_idx[nid] * 6 + 6]
 
             # Lagrange multiplier 방식에서 prescribed DOF는 u_aug에 반영되지 않을 수 있음.
             # known_val(강제변위)이 있으면 해당 DOF의 변위를 명시적으로 복원한다.
@@ -1292,18 +1305,18 @@ class WHTopographySolver:
                     if 0 <= nidx_local < n_nodes:
                         displacement[nidx_local, dof_local] = known_vals[k]
 
-            rd_q = ElementStressRecovery.recover_quad4(solver.model, displacement, self.sorted_nids)
-            rd_t = ElementStressRecovery.recover_tria3(solver.model, displacement, self.sorted_nids)
+            rd_q = ElementStressRecovery.recover_quad4(solver.model, displacement, current_nids)
+            rd_t = ElementStressRecovery.recover_tria3(solver.model, displacement, current_nids)
             cell_data = {k: (rd_q[k] + rd_t[k])[np.newaxis, :, :] for k in rd_q}
 
             u_full = np.zeros(ndof)
-            for ii, nid in enumerate(self.sorted_nids):
-                u_full[self.nid_to_idx[nid] * 6:
-                       self.nid_to_idx[nid] * 6 + 6] = displacement[ii, :]
+            for ii, nid in enumerate(current_nids):
+                u_full[current_nid_to_idx[nid] * 6:
+                       current_nid_to_idx[nid] * 6 + 6] = displacement[ii, :]
 
             f_full = np.zeros(ndof)
             for force in lc.forces:
-                idx = self.nid_to_idx.get(force.node_id)
+                idx = current_nid_to_idx.get(force.node_id)
                 if idx is None: continue
                 for d, fval in enumerate(force.load_vector):
                     if abs(fval) > 1e-12:
@@ -1316,7 +1329,7 @@ class WHTopographySolver:
             else:
                 C_i = float(u_full @ (K_base @ u_full))
 
-            result = WHTSolverResult("static", self.sorted_nids)
+            result = WHTSolverResult("static", current_nids)
             result.displacement = displacement
             result.cell_data    = cell_data
             result._u_aug       = u_aug_np
@@ -1408,6 +1421,36 @@ class WHTopographySolver:
 
         return total_C, case_responses, total_sens, per_case_sens
 
+    def _get_run_settings(self, max_iter: int) -> dict:
+        """모니터 UI Settings 탭에 표시할 최적화 옵션 메타 딕셔너리를 반환합니다."""
+        return {
+            "max_iter":               max_iter,
+            "h_max":                  float(self.h_max),
+            "bead_area":              float(self.h_ratio),
+            "bead_area_ramp":         int(self.vol_ramp_iters),
+            "min_width":              float(self._rmin_final),
+            "min_width_init":         float(self._rmin_start),
+            "min_width_ramp":         int(self._rmin_ramp_n),
+            "max_width":              float(self.max_width),
+            "max_width_weight":       float(self.max_width_weight),
+            "height_steps":           int(self.bead_steps),
+            "beta_init":              float(self.beta_init),
+            "beta_max":               float(self.beta_max),
+            "beta_start_iter":        int(self.beta_delay),
+            "projection":             bool(self.use_projection),
+            "filter_type":            str(self.filter_type),
+            "bidirectional":          bool(self.bidirectional),
+            "sym_x":                  bool(self.sym_x),
+            "bead_connect":           float(self.bead_connect),
+            "bead_connect_alg":       str(self.bead_connect_alg),
+            "bead_connect_start_iter":int(self.bead_connect_start_iter),
+            "obj_type":               str(self.obj_type),
+            "freq_weight":            float(self.freq_weight),
+            "freq_target":            float(self.freq_target),
+            "n_nodes":                len(self.model.nodes),
+            "n_design_elems":         len(self._design_elems),
+        }
+
     # ─────────────── 메인 최적화 루프 ───────────────
 
     def solve(self, max_iter: int = 30, tol: float = 1e-4, callback=None, stop_event=None) -> np.ndarray:
@@ -1495,6 +1538,7 @@ class WHTopographySolver:
                                    for nid in self._design_nids},
             "mesh_edge_segs":     mesh_edge_segs,
             "dynamic_scenarios":  list(self.dynamic_scenarios),
+            "run_settings":       self._get_run_settings(max_iter),
         }
         try:
             with open(_snap_dir / "init.pkl", "wb") as _f:
@@ -1552,23 +1596,26 @@ class WHTopographySolver:
             
             # ── Iter 0 모달 해석 (Ref. 주파수) ──────────────────────────────
             _ref_freqs = []
+            _orig_spcs = list(fea_solver.model.spc_conditions)
             try:
-                _orig_spcs = list(fea_solver.model.spc_conditions)
                 _spcd_nids = [nid for nid in fea_solver.model.nodes if nid >= 900000]
                 _temp_spcs = [WHTSPCEntry(nid, (0,1,2,3,4,5), 0.0) for nid in _spcd_nids]
                 # SPCD 노드가 있으면 해당 노드만 고정(free-free + SPCD 고정),
                 # SPCD 노드가 없으면 원래 SPC 유지(강체 모드 방지)
                 fea_solver.model.spc_conditions = _temp_spcs if _spcd_nids else _orig_spcs
+                
+                # 구속 모달 해석이므로 exclude_rigid_body=False로 강체 모드 제외 비활성화 및 shift_hz=0.0 설정
                 _ref_modal = fea_solver.solve_modal(
-                    num_modes=self.modal_modes, exclude_rigid_body=False
+                    num_modes=self.modal_modes, exclude_rigid_body=False, shift_hz=0.0
                 )
-                fea_solver.model.spc_conditions = _orig_spcs
                 _ref_freqs = _ref_modal.frequencies.tolist()
                 print(f"   [Iter 0] 초기 고유진동수: "
                       f"{', '.join(f'{f:.2f}Hz' for f in _ref_freqs[:6])}"
                       f"{'...' if len(_ref_freqs) > 6 else ''}")
             except Exception as _e:
                 print(f"   [경고] Iter 0 모달 해석 실패: {_e}")
+            finally:
+                fea_solver.model.spc_conditions = _orig_spcs
 
             data_0 = {
                 "iter": 0,
@@ -1587,6 +1634,7 @@ class WHTopographySolver:
                 "snap_dir": str(_snap_dir),
                 "min_width": float(self.rmin),
                 "mesh_edge_segs": mesh_edge_segs,
+                "run_settings": self._get_run_settings(max_iter),
             }
             callback(data_0)
             _mesh_edge_segs_sent = True
@@ -1597,6 +1645,14 @@ class WHTopographySolver:
                         "iter": 0,
                         "h_elem": h_phys_flat.copy(),
                         "load_cases": [(lc.name, w, lc) for lc, w in self._load_cases],
+                        "compliance": float(C_total_0),
+                        "avg_h": 0.0,
+                        "max_h": 0.0,
+                        "dx": 0.0,
+                        "area_ratio": 0.0,
+                        "min_width": float(self.rmin),
+                        "frequencies": _ref_freqs,
+                        "cases": case_data,
                     }, _f)
             except Exception:
                 pass
@@ -1700,6 +1756,7 @@ class WHTopographySolver:
                 self._C_0_cases = dict(self._C_0_cases_flat)
 
             # ── 고유진동수 해석 (--modal-modes로 모드 수 제어) ──
+            orig_spcs = list(fea_solver.model.spc_conditions)
             try:
                 # [WHT] 실제 모델의 코너(마운트부) 노드 및 SPCD 마스터 노드를 구속하여 모달 해석
                 from wht_modeler.wht_mesh_model import WHTSPCEntry
@@ -1711,38 +1768,42 @@ class WHTopographySolver:
                     # 반경 50mm 이내의 코너 노드 선택 (너무 넓게 잡히지 않도록 조절)
                     corner_nids.update(lm.get_corner_nodes(corner_idx, radius=50.0))
                 
-                orig_spcs = list(fea_solver.model.spc_conditions)
                 _spcd_nids = [nid for nid in fea_solver.model.nodes if nid >= 900000 or nid in corner_nids]
                 # 코너부는 병진(Translation: 0,1,2)만 구속하여 과구속(over-constraint) 방지
                 _temp_spcs = [WHTSPCEntry(nid, (0,1,2), 0.0) for nid in _spcd_nids]
                 fea_solver.model.spc_conditions = _temp_spcs if _spcd_nids else orig_spcs
 
-                modal_results = fea_solver.solve_modal(num_modes=self.modal_modes, exclude_rigid_body=False)
-
-                # [WHT] 모달 해석 이후 SPC 원상 복구
-                fea_solver.model.spc_conditions = orig_spcs
+                # 코너부 구속 모드 해석: exclude_rigid_body=False 및 shift_hz=0.0 설정으로 탄성 모드 보존
+                modal_results = fea_solver.solve_modal(
+                    num_modes=self.modal_modes, exclude_rigid_body=False, shift_hz=0.0
+                )
                 freqs = modal_results.frequencies  # Hz
-                
-                # 모드 해석 결과 터미널 출력 (주파수 및 질량 기여도)
-                eff_mass, total_mass_cg = modal_results.calculate_effective_mass()
-                if eff_mass is not None and total_mass_cg is not None:
-                    print(f"\n{'='*60}")
-                    print(f" [Internal Solver Modal Analysis Summary] : Iter {i}")
-                    print(f"{'='*60}")
-                    print(" MODE NO.   FREQUENCY(Hz)   X-MASS(%)   Y-MASS(%)   Z-MASS(%)")
-                    total_mass_sum = total_mass_cg[:3].copy()
-                    total_mass_sum[total_mass_sum < 1e-12] = 1.0 # prevent div by zero
-                    for m_idx, f in enumerate(freqs):
-                        x_pct = (eff_mass[m_idx, 0] / total_mass_sum[0]) * 100.0
-                        y_pct = (eff_mass[m_idx, 1] / total_mass_sum[1]) * 100.0
-                        z_pct = (eff_mass[m_idx, 2] / total_mass_sum[2]) * 100.0
-                        print(f" {m_idx+1:7d}   {f:13.4f}   {x_pct:9.2f}   {y_pct:9.2f}   {z_pct:9.2f}")
-                    print(f"{'='*60}\n")
-                    
             except Exception as e:
                 print(f"    [경고] 고유진동수 해석 실패 (Iter {i}): {e}")
                 modal_results = None
                 freqs = np.zeros(10)
+            finally:
+                fea_solver.model.spc_conditions = orig_spcs
+                
+            # 모드 해석 결과 터미널 출력 (주파수 및 질량 기여도)
+            if modal_results is not None:
+                try:
+                    eff_mass, total_mass_cg = modal_results.calculate_effective_mass()
+                    if eff_mass is not None and total_mass_cg is not None:
+                        print(f"\n{'='*60}")
+                        print(f" [Internal Solver Modal Analysis Summary] : Iter {i}")
+                        print(f"{'='*60}")
+                        print(" MODE NO.   FREQUENCY(Hz)   X-MASS(%)   Y-MASS(%)   Z-MASS(%)")
+                        total_mass_sum = total_mass_cg[:3].copy()
+                        total_mass_sum[total_mass_sum < 1e-12] = 1.0 # prevent div by zero
+                        for m_idx, f in enumerate(freqs):
+                            x_pct = (eff_mass[m_idx, 0] / total_mass_sum[0]) * 100.0
+                            y_pct = (eff_mass[m_idx, 1] / total_mass_sum[1]) * 100.0
+                            z_pct = (eff_mass[m_idx, 2] / total_mass_sum[2]) * 100.0
+                            print(f" {m_idx+1:7d}   {f:13.4f}   {x_pct:9.2f}   {y_pct:9.2f}   {z_pct:9.2f}")
+                        print(f"{'='*60}\n")
+                except Exception as _mass_err:
+                    print(f"    [경고] 질량 기여도 계산 실패: {_mass_err}")
             elastic_freqs = [f for f in freqs if f > 0.01]
 
             # ── 이터레이션 결과 저장 (ParaView 호환 VTKHDF) ──
@@ -1760,9 +1821,11 @@ class WHTopographySolver:
                 h_node_sum_e = np.zeros(len(self._design_nids))
                 np.add.at(h_node_sum_e, self._aggr_src, h_filtered[self._aggr_dst])
                 h_node_arr = h_node_sum_e / (self._node_adj_count_arr + 1e-12)
-                h_current_full = np.zeros(len(self.sorted_nids))
+                current_nids = self.model.sorted_node_ids()
+                current_nid_to_idx = {nid: i for i, nid in enumerate(current_nids)}
+                h_current_full = np.zeros(len(current_nids))
                 for i_dn, nid in enumerate(self._design_nids):
-                    h_current_full[self.nid_to_idx[nid]] = h_node_arr[i_dn]
+                    h_current_full[current_nid_to_idx[nid]] = h_node_arr[i_dn]
                 wht_data.point_data["Bead_Height"] = h_current_full.reshape(1, -1, 1).astype(np.float32)
 
                 # 2. 하중 케이스별 결과 병합
@@ -1819,27 +1882,54 @@ class WHTopographySolver:
                 dC_dh = dC_dh_base / C_0
 
             elif self.obj_type == 'sum' and self.normalize_obj:
-                # ② 케이스별 정규화 가중 합산: f = Σ w_i·(C_i/C_i0)
-                #    C_i0 = 케이스 i의 Iter 0 컴플라이언스 → 케이스 간 크기 차이 보정
-                #    하중이 서로 다른 정적·동적 ESL 케이스를 동등하게 최적화할 때 사용
+                def get_C0_safe(n):
+                    if n in C0_cases:
+                        return C0_cases[n]
+                    import re
+                    match = re.search(r'(.*ESL_\d+)', n)
+                    if match:
+                        base = match.group(1)
+                        for old_n, old_val in C0_cases.items():
+                            if old_n.startswith(base):
+                                return old_val
+                    if '_t' in n:
+                        base = n.split('_t')[0]
+                        for old_n, old_val in C0_cases.items():
+                            if old_n.startswith(base + '_t'):
+                                return old_val
+                    return 1.0
+
                 f0val = sum(
-                    weights_map.get(n, 1.0) * (C_responses[n]['C'] / C0_cases.get(n, 1.0))
+                    weights_map.get(n, 1.0) * (C_responses[n]['C'] / get_C0_safe(n))
                     for n in C_responses
                 )
                 dC_dh = np.zeros(self._n_design)
                 for n, cs in per_case_sens.items():
-                    # df/dh = Σ (w_i/C_i0) · ∂C_i/∂h
-                    dC_dh += weights_map.get(n, 1.0) / C0_cases.get(n, 1.0) * cs
+                    dC_dh += weights_map.get(n, 1.0) / get_C0_safe(n) * cs
 
             else:  # 'max' or 'sum+max' — softmax approximation
-                # ③ Softmax 최악 케이스: f = (1/α)·log(Σ exp(α·w_i·C_i/C_i0))
-                #    α→∞ : hard-max (최악 케이스만 반영)
-                #    α→0 : 단순 합산에 수렴
-                #    log-sum-exp max-trick으로 exp 오버플로 방지
                 alpha     = self.obj_alpha
                 names_ord = list(C_responses.keys())
+                
+                def get_C0_safe(n):
+                    if n in C0_cases:
+                        return C0_cases[n]
+                    import re
+                    match = re.search(r'(.*ESL_\d+)', n)
+                    if match:
+                        base = match.group(1)
+                        for old_n, old_val in C0_cases.items():
+                            if old_n.startswith(base):
+                                return old_val
+                    if '_t' in n:
+                        base = n.split('_t')[0]
+                        for old_n, old_val in C0_cases.items():
+                            if old_n.startswith(base + '_t'):
+                                return old_val
+                    return 1.0
+
                 vals      = np.array([
-                    weights_map.get(n, 1.0) * C_responses[n]['C'] / C0_cases.get(n, 1.0)
+                    weights_map.get(n, 1.0) * C_responses[n]['C'] / (get_C0_safe(n) if self.normalize_obj else 1.0)
                     for n in names_ord
                 ])
                 v_shift = np.max(vals)                           # 수치 안정용 shift
@@ -1847,25 +1937,24 @@ class WHTopographySolver:
                 sum_exp = np.sum(exps)
                 f0_max  = float(v_shift + (1.0 / alpha) * np.log(sum_exp + 1e-300))
 
-                # 민감도: df/dh = Σ softmax_w_i · (w_i/C_i0) · ∂C_i/∂h
-                #   softmax_w_i = exp(α·val_i) / Σ exp(α·val_j)
                 sens_max = np.zeros(self._n_design)
                 for k, n in enumerate(names_ord):
                     sw = exps[k] / (sum_exp + 1e-300)   # softmax weight for case i
-                    sens_max += (weights_map.get(n, 1.0) / C0_cases.get(n, 1.0)) * sw * per_case_sens[n]
+                    c0_val = get_C0_safe(n) if self.normalize_obj else 1.0
+                    sens_max += (weights_map.get(n, 1.0) / c0_val) * sw * per_case_sens[n]
 
                 if self.obj_type == 'max':
                     f0val = f0_max
                     dC_dh = sens_max
                 else:  # ④ 'sum+max': f = 0.5·f_sum + 0.5·f_max
-                    #    평균 성능(sum)과 최악 케이스 방어(max) 동시 고려
                     f0_sum = float(sum(
-                        weights_map.get(n, 1.0) * (C_responses[n]['C'] / C0_cases.get(n, 1.0))
+                        weights_map.get(n, 1.0) * (C_responses[n]['C'] / (get_C0_safe(n) if self.normalize_obj else 1.0))
                         for n in C_responses
                     ))
                     sens_sum = np.zeros(self._n_design)
                     for n, cs in per_case_sens.items():
-                        sens_sum += weights_map.get(n, 1.0) / C0_cases.get(n, 1.0) * cs
+                        c0_val = get_C0_safe(n) if self.normalize_obj else 1.0
+                        sens_sum += weights_map.get(n, 1.0) / c0_val * cs
                     f0val = 0.5 * f0_sum + 0.5 * f0_max
                     dC_dh = 0.5 * sens_sum + 0.5 * sens_max
 
@@ -2181,6 +2270,7 @@ class WHTopographySolver:
                     "bead_dir_sign": 0 if self.bidirectional else int(np.sign(self.bead_dir[int(np.argmax(np.abs(self.bead_dir)))])),
                     "snap_dir":   str(_snap_dir),
                     "min_width":  float(self.rmin),
+                    "run_settings": self._get_run_settings(max_iter),
                 }
                 if not _mesh_edge_segs_sent:
                     data["mesh_edge_segs"] = mesh_edge_segs
@@ -2195,6 +2285,14 @@ class WHTopographySolver:
                             "h_elem":     h_phys.copy(),
                             "load_cases": [(lc.name, w, lc)
                                            for lc, w in self._load_cases],
+                            "compliance": float(C_total),
+                            "avg_h":      float(np.mean(h_phys)),
+                            "max_h":      float(np.max(h_phys)),
+                            "dx":         change,
+                            "area_ratio": float(np.mean(_area_density)),
+                            "min_width":  float(self.rmin),
+                            "frequencies": freqs.tolist(),
+                            "cases":      case_data,
                         }, _f)
                 except Exception:
                     pass
@@ -2244,8 +2342,25 @@ class WHTopographySolver:
             print(f"     Vol: {vol_cur*100:.1f}% / target {vol_tgt*100:.1f}%  [{vol_mark}]"
                   f"   Avg_h={np.mean(x_proj_in*self.h_max):.2f}mm"
                   f"   {f1_str}")
+            def get_C0_safe(n):
+                if n in self._C_0_cases:
+                    return self._C_0_cases[n]
+                import re
+                match = re.search(r'(.*ESL_\d+)', n)
+                if match:
+                    base = match.group(1)
+                    for old_n, old_val in self._C_0_cases.items():
+                        if old_n.startswith(base):
+                            return old_val
+                if '_t' in n:
+                    base = n.split('_t')[0]
+                    for old_n, old_val in self._C_0_cases.items():
+                        if old_n.startswith(base + '_t'):
+                            return old_val
+                return 1.0
+
             for name, res in C_responses.items():
-                c_ratio = res['C'] / max(self._C_0_cases.get(name, 1e-10), 1e-10)
+                c_ratio = res['C'] / max(get_C0_safe(name), 1e-10)
                 print(f"     [{name:28s}]  U={0.5*res['C']:.3e}J"
                       f"  u={res['max_disp']:.1f}mm  sv={res['max_stress']:.0f}MPa"
                       f"  ({c_ratio*100:.0f}%)")

@@ -311,10 +311,23 @@ def calculate_chassis_deformation(
         if free.sum() >= min_fit_points:
             H         = Q_c[free].T @ P_c[free]
             U, _S, Vt = np.linalg.svd(H)
-            d         = np.linalg.det(Vt.T @ U.T)
-            D         = np.diag([1.0, 1.0, float(np.sign(d))])
-            R         = Vt.T @ D @ U.T
-            R_prev    = R
+
+            # branch 일관성: U 열 부호 4가지 변종 중 R_prev에 가장 가까운 것 선택
+            best_R    = None
+            best_cos  = -np.inf
+            for s1, s2 in ((1, 1), (-1, -1), (-1, 1), (1, -1)):
+                U_v       = U.copy()
+                U_v[:, 0] *= s1
+                U_v[:, 1] *= s2
+                d_v       = np.linalg.det(Vt.T @ U_v.T)
+                D_v       = np.diag([1.0, 1.0, float(np.sign(d_v))])
+                R_v       = Vt.T @ D_v @ U_v.T
+                cos_v     = (np.trace(R_v @ R_prev.T) - 1.0) / 2.0
+                if cos_v > best_cos:
+                    best_cos = cos_v
+                    best_R   = R_v
+            R      = best_R
+            R_prev = R
         else:
             R = R_prev   # fallback: 직전 R 유지
 

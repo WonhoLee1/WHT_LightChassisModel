@@ -1624,7 +1624,10 @@ class WHTVisualizer:
                     self.plotter.scalar_bar.SetMaximumWidthInPixels(60)
 
             # Update existing bar's range and title
-            self.plotter.update_scalar_bar_range(rng)
+            try:
+                self.plotter.update_scalar_bar_range(rng)
+            except AttributeError:
+                return
             if self.plotter.scalar_bar:
                 display_title = field.replace(" ", "\n").replace("_", "\n") if len(field) > 8 else field
                 self.plotter.scalar_bar.SetTitle(display_title)

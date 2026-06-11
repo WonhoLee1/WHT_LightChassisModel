@@ -44,9 +44,8 @@ run_topo.py — WHT 산업용 섀시 비드 최적화(Topography) 통합 도구
   모드 B | CSV 단독 동적 응답 해석 (최적화 생략)
     실측 4코너 위치 데이터로 과도 응답 해석 후 ParaView HDF 저장.
     하중: 각 코너 마스터 노드(#900000~#900003)에 로컬 Z-SPCD 적용(RBE3 연결).
-    실행: python wht_topo/run_topo.py \
-      --pos-data wht_topo/structural_dynamics_rear.csv \
-      --t-start 0.4 --t-end 0.6
+    실행: python wht_topo/run_topo.py --pos-data wht_topo/structural_dynamics_rear.csv  --t-start 0.4 --t-end 0.6
+    python wht_topo/run_topo.py --pos-data wht_topo/structural_dynamics_c235.csv --add-inertia
 
   모드 C | 동적 충격 통합 최적화 — 반복 ESL (기본)
     매 이터레이션 현재 비드 형상에서 동해석을 재실행하여 ESL을 갱신.
@@ -742,6 +741,7 @@ class ESLExtractor:
         self._dyn_solver  : Optional[WHTDynamicSolver] = None
         self._dyn_res     : Optional[DynamicResult]    = None
         self._esl_cases   : Optional[list]             = None
+        self._kabsch      = None
 
     # ── 공개 진입점 ──────────────────────────────────────────────────────────
 
@@ -777,7 +777,9 @@ class ESLExtractor:
         self._run_dynamic()
         self._extract_esl_cases()
         self._print_se_tables()
-        self._cleanup_master_nodes()
+        # 정적 ESL 해석 시 RBE3 강성 및 마스터 노드가 보존되어야 국부 대발산이 발생하지 않으므로,
+        # 최적화 루프 내 해석을 위해 마스터 노드 제거를 최종 단계로 이관합니다.
+        # self._cleanup_master_nodes()
         snapshots = self._build_snapshots()
         if self.w_peak > 0.0:
             _section("요소별 피크 SE 등가 하중 생성", "ESL-4")
@@ -1185,10 +1187,13 @@ class ESLExtractor:
 
     def _build_snapshots(self) -> List[Tuple[WHTLoadCase, float]]:
         """ESL 케이스에 안정화 BC를 추가하고 (lc, esl_weight) 리스트를 반환합니다."""
-        stab_nid  = self._bot_groups[0][1][0]
         snapshots = []
         for lc in self._esl_cases:
-            lc.add_bc([stab_nid], dofs=(0, 1))
+            # 동해석 구속조건 재현: 4개 마스터 노드 모두 X, Y, Z (0, 1, 2) 구속
+            for idx, (name, nids) in enumerate(self._bot_groups):
+                mnid = 900000 + idx
+                if mnid in self.model.nodes:
+                    lc.add_bc([mnid], dofs=(0, 1, 2))
             snapshots.append((lc, self.esl_weight))
         _section("ESL 스냅샷 확정", "ESL-3")
         _row("시간분할 스냅샷 수", f"{len(snapshots)}개  (가중치 w={self.esl_weight})")
@@ -1280,9 +1285,11 @@ class ESLExtractor:
             if mag > 1e-10:
                 f_eq_mag[nid] = mag
 
-        # 안정화 BC (시간분할 ESL과 동일)
-        stab_nid = self._bot_groups[0][1][0]
-        lc.add_bc([stab_nid], dofs=(0, 1))
+        # 안정화 BC (동해석 구속조건 재현: 4개 마스터 노드 모두 XYZ 구속)
+        for idx, (name, nids) in enumerate(self._bot_groups):
+            mnid = 900000 + idx
+            if mnid in self.model.nodes:
+                lc.add_bc([mnid], dofs=(0, 1, 2))
 
         _row("처리 요소 / 비영 노드", f"{len(elem_se_peak):,}개  /  {len(lc.forces):,}개")
 
@@ -1566,26 +1573,6 @@ class PosDynamicPipeline:
         )
         self.wht_data = self.dyn_res.to_wht_result_data(meta, self.model)
         
-        if self._kabsch is not None and "Displacement" in self.wht_data.point_data:
-            print(" [5-2] Kabsch 강체 변환 적용하여 VTKHDF용 Displacement 전역 복원...")
-            u_fem = self.wht_data.point_data["Displacement"]
-            nodes = self.wht_data.nodes
-            T_len = u_fem.shape[0]
-            kabsch_time = self._kabsch.time_arr
-            
-            disp_global = np.zeros_like(u_fem)
-            for ti in range(T_len):
-                t_val = self.dyn_res.t_saved[ti]
-                if kabsch_time is not None:
-                    k_idx = int(np.searchsorted(kabsch_time, t_val, side='left').clip(0, len(kabsch_time) - 1))
-                else:
-                    k_idx = 0
-                
-                pts = self._kabsch.apply_rigid_body(nodes, u_fem[ti], k_idx, scale=1.0)
-                disp_global[ti] = pts - nodes
-                
-            self.wht_data.point_data["Displacement"] = disp_global
-
         paraview_dir = self.out_dir / "paraview"
         paraview_dir.mkdir(parents=True, exist_ok=True)
         self.hdf_path = str(paraview_dir / "dynamic_result.hdf")
@@ -1733,7 +1720,7 @@ class TopographyPipeline:
             static_cases = []
             for lc in self.model.load_cases:
                 w = custom_weights.get(lc.name, 1.0)
-                static_cases.append((lc.name, w, lc))
+                static_cases.append((lc, w))
                 _row(f"Loadcase", f"{lc.name} (w={w})")
             _endsec()
             return static_cases, None
@@ -2057,6 +2044,12 @@ class TopographyPipeline:
                     # 각 설계를 별도 파일로 저장
                     self._discretize()
                     self._apply_shape()
+                    # 저장 전 동해석용 임시 마스터 노드/RBE3 제거
+                    for mnid in range(900000, 900004):
+                        if mnid in self.model.nodes:
+                            del self.model.nodes[mnid]
+                    self.model.rbe3s = {k: v for k, v in self.model.rbe3s.items() if k < 900000}
+                    
                     _stem = Path(self.cfg.export or "final.k").stem if self.cfg.export else "design"
                     _out  = (self.out_dir / f"{_stem}_d{design_idx+1:02d}.k") if self.out_dir \
                             else Path(f"{_stem}_d{design_idx+1:02d}.k")
@@ -2094,6 +2087,12 @@ class TopographyPipeline:
         self.solver.apply_final_shape(skip_filter=(self.cfg.height_steps >= 2))
 
     def _export(self) -> None:
+        # 최종 파일 저장 전, 동해석용으로 추가했던 마스터 노드와 RBE3 제거
+        for mnid in range(900000, 900004):
+            if mnid in self.model.nodes:
+                del self.model.nodes[mnid]
+        self.model.rbe3s = {k: v for k, v in self.model.rbe3s.items() if k < 900000}
+
         # LS-DYNA .k 파일: out_dir 아래 저장 (--export 미지정 시 기본 파일명 사용)
         export_name = self.cfg.export or "final.k"
         export_path = Path(export_name)

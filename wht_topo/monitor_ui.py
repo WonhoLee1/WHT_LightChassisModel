@@ -896,14 +896,37 @@ class WHTMonitorWindow(QMainWindow):
 
         # init.pkl 읽기 (mesh_edge_segs 복원)
         init_file = snap_dir / "init.pkl"
+        self._design_centroids = None
+        init_data = {}
         if init_file.exists():
             try:
                 with open(init_file, "rb") as f:
                     init_data = pickle.load(f)
                 if "mesh_edge_segs" in init_data:
                     self.mesh_edge_segs = init_data["mesh_edge_segs"]
+                if "run_settings" in init_data:
+                    self._update_settings_tab(init_data["run_settings"])
+                
+                # 설계 요소 도심 좌표 계산하여 저장
+                model = init_data.get("model")
+                design_elems = init_data.get("design_elems", [])
+                orig_coords = init_data.get("orig_coords", {})
+                if model and design_elems and orig_coords:
+                    self._design_centroids = np.array([
+                        np.mean([orig_coords[nid] for nid in model.elements[eid].node_ids], axis=0)
+                        for eid in design_elems
+                    ], dtype=np.float32)
             except Exception as e:
                 print(f"[Monitor] init.pkl 로드 실패: {e}")
+
+        def get_hist_name(n, h_dict):
+            if n in h_dict: return n
+            if '_t' in n:
+                base = n.split('_t')[0]
+                for old_n in h_dict:
+                    if old_n.startswith(base + '_t'):
+                        return old_n
+            return n
 
         # iter_XXX.pkl 읽어서 히스토리 재구성 (주요 지표 추출)
         iter_files = sorted(glob.glob(os.path.join(str(snap_dir), "iter_*.pkl")))
@@ -926,23 +949,147 @@ class WHTMonitorWindow(QMainWindow):
                     self.history["area_ratio"].append(snap.get("area_ratio", 0.0))
                     self.history["min_width"].append(snap.get("min_width", 0.0))
                     
-                    if "frequencies" in snap:
-                        self.history["frequencies"].append(snap["frequencies"])
-                    else:
-                        self.history["frequencies"].append([])
-                        
-                    if "load_cases" in snap:
-                        cases_dict = {lc.name: {"compliance": 0.0} for lc, w in snap["load_cases"]}
-                        self.history["cases"][iter_num] = cases_dict
+                    freqs = snap.get("frequencies", [])
+                    self.history["frequencies"].append(freqs)
+
+                    if self.ref_freqs is None and freqs:
+                        self.ref_freqs = freqs
+
+                    # 케이스 명칭 및 개별 데이터 복원
+                    cases_data = snap.get("cases", {})
+                    if not cases_data and "load_cases" in snap:
+                        # 구버전 스냅샷 파일 폴백
+                        cases_data = {lc_name: {"U": 0.0, "max_disp": 0.0, "max_stress": 0.0}
+                                      for lc_name, w, lc in snap["load_cases"]}
+
+                    if not self.case_names and cases_data:
+                        self.case_names = sorted(cases_data.keys())
+                        for name in self.case_names:
+                            if self.metric_combo:
+                                for pfx in ("U_", "Disp_", "Stress_"):
+                                    self.metric_combo.addItem(f"{pfx}{name}")
+                            self.history["cases"][name] = {
+                                "U": [], "max_disp": [], "max_stress": []
+                            }
+                            if self.iter_case_combo:
+                                self.iter_case_combo.addItem(name)
+
+                    # 각 케이스별 데이터 누적
+                    n_iters = len(self.history["iter"])
+                    for raw_name, res in cases_data.items():
+                        name = get_hist_name(raw_name, self.history["cases"])
+                        if name not in self.history["cases"]:
+                            self.history["cases"][name] = {
+                                "U": [0.0] * (n_iters - 1),
+                                "max_disp": [0.0] * (n_iters - 1),
+                                "max_stress": [0.0] * (n_iters - 1)
+                            }
+                            if self.iter_case_combo:
+                                existing = [self.iter_case_combo.itemText(idx_c)
+                                            for idx_c in range(self.iter_case_combo.count())]
+                                if name not in existing:
+                                    self.iter_case_combo.addItem(name)
+                        self.history["cases"][name]["U"].append(res.get("U", 0.0))
+                        self.history["cases"][name]["max_disp"].append(res.get("max_disp", 0.0))
+                        self.history["cases"][name]["max_stress"].append(res.get("max_stress", 0.0))
+
+                    # 누락된 케이스 패딩
+                    for name, hist in self.history["cases"].items():
+                        if len(hist["U"]) < n_iters:
+                            hist["U"].append(0.0)
+                            hist["max_disp"].append(0.0)
+                            hist["max_stress"].append(0.0)
                     
                     # 3D 뷰용 높이/좌표 스냅샷 복원
+                    coords_data = snap.get("coords")
+                    if coords_data is None or len(coords_data) == 0:
+                        coords_data = self._design_centroids
+                    
                     self.height_snapshots.append({
                         "iter": iter_num,
-                        "coords": snap.get("coords", []),
-                        "heights": snap.get("h_elem", [])
+                        "coords": coords_data,
+                        "heights": snap.get("h_elem", []),
+                        "h_max": float(init_data.get("h_max", 15.0)) if init_file.exists() else 15.0,
+                        "bead_steps": int(init_data.get("run_settings", {}).get("height_steps", 0)) if init_file.exists() else 0
                     })
             except Exception as e:
                 print(f"[Monitor] {pkl_path} 로드 실패: {e}")
+
+        # ── Summary Table 전체 복원 빌드 ──────────────────────────────────────────
+        if self.table and self.history["iter"]:
+            self.table.setRowCount(0)
+            if self.case_names:
+                headers = ["Iter", "C_total", "Avg_h", "Max_h", "dx", "Area_Ratio", "Min_Width"]
+                for name in self.case_names:
+                    headers += [f"U_{name}", f"D_{name}", f"S_{name}"]
+                self.table.setColumnCount(len(headers))
+                self.table.setHorizontalHeaderLabels(headers)
+                
+                for idx_i, it in enumerate(self.history["iter"]):
+                    row = self.table.rowCount()
+                    self.table.insertRow(row)
+                    vals = [str(it),
+                            f"{self.history['compliance'][idx_i]:.3e}",
+                            f"{self.history['avg_h'][idx_i]:.2f}",
+                            f"{self.history['max_h'][idx_i]:.2f}",
+                            f"{self.history['dx'][idx_i]:.4f}",
+                            f"{self.history['area_ratio'][idx_i]:.3f}",
+                            f"{self.history['min_width'][idx_i]:.1f}"]
+                    for col_idx, v in enumerate(vals):
+                        self.table.setItem(row, col_idx, QTableWidgetItem(v))
+                        
+                    c_off = len(vals)
+                    for name in self.case_names:
+                        u_val    = self.history["cases"][name]["U"][idx_i]
+                        d_val    = self.history["cases"][name]["max_disp"][idx_i]
+                        s_val    = self.history["cases"][name]["max_stress"][idx_i]
+                        self.table.setItem(row, c_off,   QTableWidgetItem(f"{u_val:.2e}"))
+                        self.table.setItem(row, c_off+1, QTableWidgetItem(f"{d_val:.2f}"))
+                        self.table.setItem(row, c_off+2, QTableWidgetItem(f"{s_val:.1f}"))
+                        c_off += 3
+                self.table.scrollToBottom()
+
+        # ── Modal Table 전체 복원 빌드 ────────────────────────────────────────────
+        if self.modal_table and self.history["iter"]:
+            self.modal_table.setColumnCount(1)
+            self.modal_table.setHorizontalHeaderLabels(["Ref. (Hz)"])
+            if self.ref_freqs:
+                for idx_f, f in enumerate(self.ref_freqs):
+                    if idx_f < self.modal_table.rowCount():
+                        self.modal_table.setItem(idx_f, 0, QTableWidgetItem(f"{f:.2f}"))
+                        
+            for idx_i, it in enumerate(self.history["iter"]):
+                freqs = self.history["frequencies"][idx_i]
+                if freqs:
+                    col = self.modal_table.columnCount()
+                    self.modal_table.insertColumn(col)
+                    self.modal_table.setColumnWidth(col, 80)
+                    self.modal_table.setHorizontalHeaderItem(col, QTableWidgetItem(f"Iter {it}"))
+                    for idx_f, f in enumerate(freqs):
+                        if idx_f < self.modal_table.rowCount():
+                            self.modal_table.setItem(idx_f, col, QTableWidgetItem(f"{f:.2f}"))
+            self.modal_table.scrollToBottom()
+
+        # ── 콤보박스 및 슬라이더 복원 ─────────────────────────────────────────────
+        if self.height_iter_combo and self.history["iter"]:
+            self.height_iter_combo.blockSignals(True)
+            self.height_iter_combo.clear()
+            self.height_iter_combo.addItem("Latest")
+            for it in reversed(self.history["iter"]):
+                self.height_iter_combo.addItem(f"Iter {it:03d}")
+            self.height_iter_combo.blockSignals(False)
+            
+        if self.height_slider and self.history["iter"]:
+            self.height_slider.blockSignals(True)
+            max_it = max(self.history["iter"])
+            self.height_slider.setMinimum(0)
+            self.height_slider.setMaximum(max_it)
+            self.height_slider.setValue(max_it)
+            self.height_slider.blockSignals(False)
+
+        # ── 그래프 및 시각화 갱신 ────────────────────────────────────────────────
+        self._update_curves()
+        self._update_height_plot()
 
 
     # ────────────────────────────────────────────────────────────────────────
@@ -1546,7 +1693,17 @@ class WHTMonitorWindow(QMainWindow):
                     self.table.setColumnCount(len(headers))
                     self.table.setHorizontalHeaderLabels(headers)
 
-            for name, res in cases_data.items():
+            def get_hist_name(n, h_dict):
+                if n in h_dict: return n
+                if '_t' in n:
+                    base = n.split('_t')[0]
+                    for old_n in h_dict:
+                        if old_n.startswith(base + '_t'):
+                            return old_n
+                return n
+
+            for raw_name, res in cases_data.items():
+                name = get_hist_name(raw_name, self.history["cases"])
                 if name not in self.history["cases"]:
                     self.history["cases"][name] = {
                         "U":          [0.0] * (n_iters - 1),
@@ -1605,9 +1762,18 @@ class WHTMonitorWindow(QMainWindow):
                         f"{data.get('min_width', 0):.1f}"]
                 for col, v in enumerate(vals):
                     self.table.setItem(row, col, QTableWidgetItem(v))
+                def get_case_res(n, c_dict):
+                    if n in c_dict: return c_dict[n]
+                    if '_t' in n:
+                        base = n.split('_t')[0]
+                        for new_n, val in c_dict.items():
+                            if new_n.startswith(base + '_t'):
+                                return val
+                    return {"U": 0, "max_disp": 0, "max_stress": 0}
+
                 c_off = len(vals)
                 for name in self.case_names:
-                    res = cases_data.get(name, {"U": 0, "max_disp": 0, "max_stress": 0})
+                    res = get_case_res(name, cases_data)
                     self.table.setItem(row, c_off,   QTableWidgetItem(f"{res.get('U',0):.2e}"))
                     self.table.setItem(row, c_off+1, QTableWidgetItem(f"{res.get('max_disp',0):.2f}"))
                     self.table.setItem(row, c_off+2, QTableWidgetItem(f"{res.get('max_stress',0):.1f}"))

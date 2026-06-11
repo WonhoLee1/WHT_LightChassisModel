@@ -297,43 +297,33 @@ class StochasticLoadManager:
               f"반대 2코너에 ±{abs(twisting_load_z):.0f}N 비틀림 하중")
         load_cases.append((lc_twisting, weights["twisting"]))
 
-        # ── Case 3: Bending X-span (X 스팬 순수 굽힘) ──────────────────────────
-        # 양 X단(x_min/x_max) edge를 잡고(병진 고정) Y축 내측 모멘트 커플(±M)을 부여
-        # → X 방향 스팬에 걸친 단일 곡률 순수 굽힘. 점하중 없음.
-        # M = W·L/8 (자중 분포하중을 받는 단순지지 보의 최대모멘트 등가, W=자중 스케일 힘).
-        L_x = self.x_max - self.x_min
-        M_x = abs(bx_load_z) * L_x / 8.0
-        xmin_nids = self.get_edge_flange_nodes('X', 'min', mesh_size_z)
-        xmax_nids = self.get_edge_flange_nodes('X', 'max', mesh_size_z)
-        lc_bending_x = WHTLoadCase(name="bending_xspan")
-        # 양단 병진 고정(= 양끝을 잡음)
-        lc_bending_x.add_bc(xmin_nids + xmax_nids, dofs=(0, 1, 2), value=0.0)
-        # 내측 모멘트 커플: x_min은 +M, x_max는 -M (My, dof=4) → sagging(중앙 하향)
-        if xmin_nids:
-            lc_bending_x.add_force(xmin_nids, dofs=(4,), values=(+M_x,), distribute=True)
-        if xmax_nids:
-            lc_bending_x.add_force(xmax_nids, dofs=(4,), values=(-M_x,), distribute=True)
-        print(f" -> [LoadCase] Bending_Xspan: X단 고정 x_min({len(xmin_nids)})/x_max({len(xmax_nids)}), "
-              f"Y축 ±{M_x:.0f}N·mm 모멘트 커플(W·L/8), X스팬 {L_x:.0f}mm 순수굽힘")
-        load_cases.append((lc_bending_x, weights.get("bending_xspan", 0.8)))
-
-        # ── Case 4: Bending Y-span (Y 스팬 순수 굽힘) ──────────────────────────
-        # 양 Y단(y_min/y_max) edge를 잡고 X축 내측 모멘트 커플(±M)을 부여
-        # → Y 방향 스팬에 걸친 단일 곡률 순수 굽힘. 점하중 없음. M = W·L/8.
-        L_y = self.y_max - self.y_min
-        M_y = abs(by_load_z) * L_y / 8.0
+        # ── Case 3: Bending X-span (X 방향 스팬 굽힘) ──────────────────────────
+        # BC: Y-min 벽면 상단 + Y-max 플랜지만 고정 → X 방향 1800mm 스팬
+        # LOAD: 중앙 하향 하중 (현재 벤딩과 동일)
         ymin_nids = self.get_edge_flange_nodes('Y', 'min', mesh_size_z)
         ymax_nids = self.get_edge_flange_nodes('Y', 'max', mesh_size_z)
+        lc_bending_x = WHTLoadCase(name="bending_xspan")
+        lc_bending_x.add_bc(ymin_nids + ymax_nids, dofs=(0, 1, 2, 3, 4, 5))
+        center_nids = self.get_load_nodes()
+        if center_nids:
+            lc_bending_x.add_force(center_nids, dofs=(2,),
+                                    values=(bx_load_z,), distribute=True)
+        print(f" -> [LoadCase] Bending_Xspan: Y-min({len(ymin_nids)}) + Y-max({len(ymax_nids)})개 고정, "
+              f"X방향 {self.x_max - self.x_min:.0f}mm 스팬, 하중={bx_load_z:.0f}N")
+        load_cases.append((lc_bending_x, weights.get("bending_xspan", 0.8)))
+
+        # ── Case 4: Bending Y-span (Y 방향 스팬 굽힘) ──────────────────────────
+        # BC: X-min + X-max 플랜지만 고정 → Y 방향 1200mm 스팬
+        # LOAD: 중앙 하향 하중
+        xmin_nids = self.get_edge_flange_nodes('X', 'min', mesh_size_z)
+        xmax_nids = self.get_edge_flange_nodes('X', 'max', mesh_size_z)
         lc_bending_y = WHTLoadCase(name="bending_yspan")
-        # 양단 병진 고정(= 양끝을 잡음)
-        lc_bending_y.add_bc(ymin_nids + ymax_nids, dofs=(0, 1, 2), value=0.0)
-        # 내측 모멘트 커플: y_min은 -M, y_max는 +M (Mx, dof=3) → sagging(중앙 하향)
-        if ymin_nids:
-            lc_bending_y.add_force(ymin_nids, dofs=(3,), values=(-M_y,), distribute=True)
-        if ymax_nids:
-            lc_bending_y.add_force(ymax_nids, dofs=(3,), values=(+M_y,), distribute=True)
-        print(f" -> [LoadCase] Bending_Yspan: Y단 고정 y_min({len(ymin_nids)})/y_max({len(ymax_nids)}), "
-              f"X축 ±{M_y:.0f}N·mm 모멘트 커플(W·L/8), Y스팬 {L_y:.0f}mm 순수굽힘")
+        lc_bending_y.add_bc(xmin_nids + xmax_nids, dofs=(0, 1, 2, 3, 4, 5))
+        if center_nids:
+            lc_bending_y.add_force(center_nids, dofs=(2,),
+                                    values=(by_load_z,), distribute=True)
+        print(f" -> [LoadCase] Bending_Yspan: X-min({len(xmin_nids)}) + X-max({len(xmax_nids)})개 고정, "
+              f"Y방향 {self.y_max - self.y_min:.0f}mm 스팬, 하중={by_load_z:.0f}N")
         load_cases.append((lc_bending_y, weights.get("bending_yspan", 0.8)))
 
         # ── Case 5: Twisting Alt (반전 대각선 비틀림) ───────────────────────────

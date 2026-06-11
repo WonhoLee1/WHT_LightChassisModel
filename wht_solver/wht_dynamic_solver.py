@@ -137,7 +137,16 @@ class WHTDynamicSolver(WHTSolver):
         n_nodes = len(sorted_nids)
         K       = self._assemble_K_scipy(jm, sorted_nids, nid_to_idx, stabilize=True)
         M_diag  = self._assemble_lumped_mass(jm, ndof, sorted_nids, nid_to_idx)
-        free_id = np.array(jm.unknown_id, dtype=np.int64)
+        # SPCD DOF 제외 (direct_dynamic과 동일하게 반력 DOF 처리)
+        spcd_set = {
+            lg.dof + nid_to_idx[lg.node_ids[0]] * 6
+            for lg in load_groups
+            if lg.load_type.upper() == "SPCD" and lg.node_ids[0] in nid_to_idx
+        }
+        free_id = np.array(
+            [d for d in jm.unknown_id if d not in spcd_set], dtype=np.int64
+        )
+        self._last_free_id = free_id
         M_free  = M_diag[free_id]                    # (ndof_free,)
 
         # ── 3. 모드 행렬 구성 (자유 DOF 기준) ──────────────────────────────
@@ -310,6 +319,7 @@ class WHTDynamicSolver(WHTSolver):
         free_id  = np.array(
             [d for d in jm.unknown_id if d not in spcd_set], dtype=np.int64
         )
+        self._last_free_id = free_id
         n_free, n_spcd = len(free_id), len(spcd_id)
 
         if n_spcd:
@@ -941,20 +951,31 @@ class WHTDynamicSolver(WHTSolver):
 
         # 4. 로드케이스 생성
         load_cases = []
-        from .load_cases import WHTBCEntry
-        for si in selected_indices:
+        from .load_cases import WHTForceEntry
+        for esl_idx, si in enumerate(selected_indices):
             t_val  = float(dynamic_result.t_saved[si])
             se_val = strain_energies[si]
             u_snap = dynamic_result.u[si]
 
-            lc = WHTLoadCase(name=f"{prefix}ESL_t{t_val:.4f}s_SE{se_val:.1e}")
+            # 등가 외력 계산: f_esl = K @ u_flat
+            u_flat = u_snap.flatten()[:ndof]
+            f_esl  = K @ u_flat
+
+            # 동적 해석 구속(고정, 강제 변위) 자유도의 힘 성분은 0으로 처리 (Reaction force 제거)
+            if hasattr(self, '_last_free_id') and self._last_free_id is not None:
+                free_dofs = self._last_free_id
+            else:
+                free_dofs = jm.unknown_id
+
+            constrained_mask = np.ones(ndof, dtype=bool)
+            constrained_mask[free_dofs] = False
+            f_esl[constrained_mask] = 0.0
+
+            lc = WHTLoadCase(name=f"{prefix}ESL_{esl_idx+1:02d}_t{t_val:.4f}s_SE{se_val:.1e}")
             for i, nid in enumerate(sorted_nids):
-                u_node = u_snap[i]
-                lc.add_bc(nid, dofs=(0, 1, 2, 3, 4, 5), value=0.0)
-                for d in range(6):
-                    val = float(u_node[d])
-                    if abs(val) > 1e-15:
-                        lc.bcs.append(WHTBCEntry(nid, (d,), val))
+                f_node = f_esl[i * 6 : i * 6 + 6]
+                if np.max(np.abs(f_node)) > 1e-12:
+                    lc.forces.append(WHTForceEntry(nid, tuple(float(v) for v in f_node)))
 
             load_cases.append(lc)
             print(f"    - {lc.name}  SE={se_val:.3e}")
