@@ -610,7 +610,18 @@ class WHTSolver:
                 continue
 
             pid  = elem.pid
-            # ... (rest of beam assembly continues safely)
+            prop = self.model.properties.get(pid)
+            mat  = self.model.materials.get(prop.mid) if prop else None
+            E = mat.E if mat else 210000.0
+            nu = mat.nu if mat else 0.3
+            G = E / (2.0 * (1.0 + nu))
+            # 소프트 결합 및 일반 빔을 위한 표준 단면 특성 (A=100, I=833.33)
+            A = 100.0
+            Iy = Iz = J = 833.33
+            n1_idx = nid_to_idx.get(elem.node_ids[0])
+            n2_idx = nid_to_idx.get(elem.node_ids[1])
+            if n1_idx is not None and n2_idx is not None:
+                jm.add_beamcol(eid, n1_idx, n2_idx, E, G, Iy, Iz, J, A)
 
         # RBE2 → Stiff Beam conversion for dynamic/modal stability
         self._add_rbe2_beams(jm, nid_to_idx)

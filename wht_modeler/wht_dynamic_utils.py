@@ -55,7 +55,7 @@ def parse_csv_header(csv_path: str) -> Dict:
     Returns
     -------
     dict
-        'corner_positions': {name: (x_mm, y_mm, z_mm), ...}  — C1~C8
+        'corner_positions': {name: (x_mm, y_mm, z_mm), ...}  - C1~C8
         'start_time'      : float | None
     """
     corner_positions: Dict[str, Tuple[float, float, float]] = {}
@@ -253,7 +253,7 @@ def calculate_chassis_deformation(
     deformation  : {corner_name: (T, 3)} body-frame 변형량 [mm]
     R_arr        : (T, 3, 3) 회전 행렬 (body → world). world = R @ body + T
     T_arr        : (T, 3)   평균 이동 벡터 [mm]. T = Q_mean - R @ P_mean
-    contact_mask : (T, n_pts) bool — True = 해당 시간 Kabsch fit 제외
+    contact_mask : (T, n_pts) bool - True = 해당 시간 Kabsch fit 제외
     traj         : (T, n_pts, 3) 세계좌표 위치 [mm]
     vel_arr      : (T, n_pts, 3) 세계좌표 속도 [mm/s]
     accel_arr    : (T, n_pts, 3) 세계좌표 가속도 [mm/s²]
@@ -309,30 +309,22 @@ def calculate_chassis_deformation(
 
         free = ~contact_mask[t]
         if free.sum() >= min_fit_points:
-            H         = Q_c[free].T @ P_c[free]
+            # Textbook Kabsch for row vectors: Q = P @ R
+            H         = P_c[free].T @ Q_c[free]
             U, _S, Vt = np.linalg.svd(H)
 
-            # branch 일관성: U 열 부호 4가지 변종 중 R_prev에 가장 가까운 것 선택
-            best_R    = None
-            best_cos  = -np.inf
-            for s1, s2 in ((1, 1), (-1, -1), (-1, 1), (1, -1)):
-                U_v       = U.copy()
-                U_v[:, 0] *= s1
-                U_v[:, 1] *= s2
-                d_v       = np.linalg.det(Vt.T @ U_v.T)
-                D_v       = np.diag([1.0, 1.0, float(np.sign(d_v))])
-                R_v       = Vt.T @ D_v @ U_v.T
-                cos_v     = (np.trace(R_v @ R_prev.T) - 1.0) / 2.0
-                if cos_v > best_cos:
-                    best_cos = cos_v
-                    best_R   = R_v
-            R      = best_R
+            # Standard Kabsch rotation (with reflection check)
+            d_v = np.linalg.det(U @ Vt)
+            D_v = np.diag([1.0, 1.0, float(np.sign(d_v))])
+            R = U @ D_v @ Vt
             R_prev = R
         else:
             R = R_prev   # fallback: 직전 R 유지
 
         R_arr[t]    = R
-        T_arr[t]    = Q_mean - R @ P_mean
+        # T_arr must satisfy world = body @ R + T  => T = Q_mean - P_mean @ R
+        T_arr[t]    = Q_mean - P_mean @ R
+        # body_pos inverse mapping: body = Q_c @ R.T + P_mean
         body_pos[t] = Q_c @ R.T + P_mean   # (n_pts, 3)
 
     body_pos_0 = body_pos[0].copy()
@@ -427,7 +419,7 @@ def plot_kabsch_diagnostics(
     for ax_idx, ax_name in enumerate(['X', 'Y', 'Z']):
         fig, axes = plt.subplots(7, 1, figsize=(7, 12), sharex=True)
         fig.suptitle(
-            f"Kabsch Diagnostics — {loadcase_name}  [{ax_name}]",
+            f"Kabsch Diagnostics - {loadcase_name}  [{ax_name}]",
             fontsize=13, fontweight='bold',
         )
 
@@ -616,7 +608,8 @@ class KabschPreprocessor:
         R = self.R_arr[t_idx]   # (3, 3)
         T = self.T_arr[t_idx]   # (3,)
         deformed = base_pts + u_fem * scale
-        return (R @ deformed.T).T + T
+        # world = body @ R + T
+        return deformed @ R + T
 
 
 def run_kabsch_preprocessing(
@@ -883,7 +876,7 @@ def compute_inertia_scale_via_fem(
 
     sep = "     " + "-" * 58
     print(sep)
-    print("     [FEM 역산 보정 — 코너 Z 고정 정해석]")
+    print("     [FEM 역산 보정 - 코너 Z 고정 정해석]")
     print(f"     peak 관성가속도  : {a_peak/9806.65:.2f} g")
     print(f"     FEM 정해석 최대 Z변위  : w_FEM  = {w_FEM:.2f} mm")
     print(f"     VK 비선형 목표 처짐    : w_NL   = {w_NL_target:.2f} mm")

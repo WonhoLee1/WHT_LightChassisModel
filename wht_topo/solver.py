@@ -651,6 +651,8 @@ class WHTopographySolver:
         extended_boundary_nids = set(flange_nids)
         for eid in self.elem_ids:
             elem = self.model.elements[eid]
+            if elem.pid in (2, 3):
+                continue
             if elem.type.upper() not in self._SHELL_TYPES:
                 continue
             nids = elem.node_ids
@@ -668,6 +670,8 @@ class WHTopographySolver:
 
         for eid in self.elem_ids:
             elem = self.model.elements[eid]
+            if elem.pid in (2, 3):
+                continue
             if elem.type.upper() not in self._SHELL_TYPES:
                 continue
             nids = elem.node_ids
@@ -1321,6 +1325,9 @@ class WHTopographySolver:
         n_cases  = len(lc_data)
         print(f" -> [Solver] {n_cases}개 케이스 → {n_groups}개 BC 그룹으로 LU 공유 분해")
 
+        c_list_all = [[nodes[nid].x, nodes[nid].y, nodes[nid].z] for nid in current_nids]
+        c_all_np = np.array(c_list_all, dtype=np.float64)
+
         def _extract_result(u_aug_np, lc, jm_lc):
             """u_aug 벡터 → displacement, cell_data, u_full, f_full, C_i."""
             n_nodes = len(current_nids)
@@ -1343,8 +1350,8 @@ class WHTopographySolver:
                     if 0 <= nidx_local < n_nodes:
                         displacement[nidx_local, dof_local] = known_vals[k]
 
-            rd_q = ElementStressRecovery.recover_quad4(solver.model, displacement, current_nids)
-            rd_t = ElementStressRecovery.recover_tria3(solver.model, displacement, current_nids)
+            rd_q = ElementStressRecovery.recover_quad4(solver.model, displacement, current_nids, c_all=c_all_np)
+            rd_t = ElementStressRecovery.recover_tria3(solver.model, displacement, current_nids, c_all=c_all_np)
             cell_data = {k: (rd_q[k] + rd_t[k])[np.newaxis, :, :] for k in rd_q}
 
             u_full = np.zeros(ndof)

@@ -1043,10 +1043,13 @@ class WHTDynamicSolver(WHTSolver):
 
         node_count_safe = np.maximum(node_count, 1)[:, None]
 
+        c_list_all = [[self.model.nodes[nid].x, self.model.nodes[nid].y, self.model.nodes[nid].z] for nid in sorted_nids]
+        c_all_np = np.array(c_list_all, dtype=np.float64)
+
         # 첫 스텝으로 필드 파악
         u0 = dynamic_result.u[0]
-        quad_0 = ElementStressRecovery.recover_quad4_nodal(self.model, u0, sorted_nids)
-        ElementStressRecovery.recover_tria3_nodal(self.model, u0, sorted_nids)
+        quad_0 = ElementStressRecovery.recover_quad4_nodal(self.model, u0, sorted_nids, c_all=c_all_np, fields=fields)
+        ElementStressRecovery.recover_tria3_nodal(self.model, u0, sorted_nids, c_all=c_all_np, fields=fields)
 
         stress_data: dict = {}
         for fld in fields:
@@ -1082,10 +1085,27 @@ class WHTDynamicSolver(WHTSolver):
         quad_nodes_mapped = quad_to_node[q_mask]
         tria_nodes_mapped = tria_to_node[t_mask]
 
+        from scipy.sparse import csr_matrix
+        S_quad = None
+        if np.any(q_mask):
+            q_nodes_flat = quad_nodes_mapped.reshape(-1)
+            S_quad = csr_matrix(
+                (np.ones(len(q_nodes_flat), dtype=np.float32), (q_nodes_flat, np.arange(len(q_nodes_flat)))),
+                shape=(n_nodes, len(q_nodes_flat))
+            )
+        S_tria = None
+        if np.any(t_mask):
+            t_nodes_flat = tria_nodes_mapped.reshape(-1)
+            S_tria = csr_matrix(
+                (np.ones(len(t_nodes_flat), dtype=np.float32), (t_nodes_flat, np.arange(len(t_nodes_flat)))),
+                shape=(n_nodes, len(t_nodes_flat))
+            )
+
+        req_fields = list(stress_data.keys())
         for ti in range(n_save):
             u_frame = dynamic_result.u[ti]
-            quad = ElementStressRecovery.recover_quad4_nodal(self.model, u_frame, sorted_nids)
-            tria = ElementStressRecovery.recover_tria3_nodal(self.model, u_frame, sorted_nids)
+            quad = ElementStressRecovery.recover_quad4_nodal(self.model, u_frame, sorted_nids, c_all=c_all_np, fields=req_fields)
+            tria = ElementStressRecovery.recover_tria3_nodal(self.model, u_frame, sorted_nids, c_all=c_all_np, fields=req_fields)
 
             for fld in stress_data:
                 if fld.startswith("Von Mises"):
@@ -1095,10 +1115,12 @@ class WHTDynamicSolver(WHTSolver):
                     q_val = quad[fld]
                     t_val = tria[fld]
                     
-                    if np.any(q_mask):
-                        np.add.at(nodal_val, quad_nodes_mapped, q_val[q_mask])
-                    if np.any(t_mask):
-                        np.add.at(nodal_val, tria_nodes_mapped, t_val[t_mask])
+                    if S_quad is not None:
+                        q_flat = q_val[q_mask].reshape(-1, 6)
+                        nodal_val += S_quad.dot(q_flat)
+                    if S_tria is not None:
+                        t_flat = t_val[t_mask].reshape(-1, 6)
+                        nodal_val += S_tria.dot(t_flat)
                         
                     nodal_val /= node_count_safe
                     stress_data[fld][ti] = nodal_val

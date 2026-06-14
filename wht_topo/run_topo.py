@@ -505,6 +505,130 @@ def _build_tray(
     return model, node_db
 
 
+def _build_chassis_with_glass_assembly(
+    width: float       = TRAY_W,
+    length: float      = TRAY_L,
+    height: float      = TRAY_H,
+    mesh_xy: float     = MESH_XY,
+    mesh_z: float      = MESH_Z,
+    draft_angle: float = DRAFT_ANGLE,
+    E: float           = MAT['E'],
+    nu: float          = MAT['nu'],
+    rho: float         = MAT['rho'],
+    t: float           = MAT['t'],
+    glass_t: float     = 1.0,
+    glass_E: float     = 40000.0,
+    sealant_E: float   = 1.0,
+) -> Tuple[WHTMeshModel, dict]:
+    """
+    섀시 트레이 메시를 생성하고, 플랜지 영역에 맞게 글라스 패널을 메싱한 뒤 
+    소프트 빔 요소(BEAM2)로 연결하여 결합된 단일 WHTMeshModel을 빌드합니다.
+    """
+    # 1. 섀시 기본 쉘 생성 (기존 _build_tray 활용)
+    model, chassis_nodes = _build_tray(
+        width=width, length=length, height=height,
+        mesh_xy=mesh_xy, mesh_z=mesh_z, draft_angle=draft_angle,
+        E=E, nu=nu, rho=rho, t=t
+    )
+    
+    # 2. 플랜지 최종단 노드 자동 검색 (Z_max 기준)
+    coords_arr = np.array(list(chassis_nodes.values()))
+    z_max = float(coords_arr[:, 2].max())
+    
+    flange_nids = []
+    for nid, coords in chassis_nodes.items():
+        if abs(coords[2] - z_max) < 0.5:
+            flange_nids.append(nid)
+
+    # 3. 글라스 패널 생성 범위를 위한 플랜지 노드의 X, Y 바운딩 박스 계산
+    flange_coords = np.array([chassis_nodes[nid] for nid in flange_nids])
+    x_min, x_max = flange_coords[:, 0].min(), flange_coords[:, 0].max()
+    y_min, y_max = flange_coords[:, 1].min(), flange_coords[:, 1].max()
+    
+    glass_w = x_max - x_min
+    glass_l = y_max - y_min
+    z_glass = z_max + 10.0  # 10mm 시각적 갭 부여 (실란트 연결부 가시화 극대화)
+
+    # 4. 글라스 패널(평판) 메싱
+    nx = int(round(glass_w / mesh_xy))
+    ny = int(round(glass_l / mesh_xy))
+    dx = glass_w / nx if nx > 0 else glass_w
+    dy = glass_l / ny if ny > 0 else glass_l
+
+    # 글라스 노드 생성 (노드 ID 200,000번 대 오프셋)
+    glass_node_offset = 200000
+    glass_node_db = {}
+    for i in range(nx + 1):
+        x = x_min + i * dx
+        for j in range(ny + 1):
+            y = y_min + j * dy
+            nid = glass_node_offset + i * (ny + 1) + j
+            model.add_node(nid, x, y, z_glass)
+            glass_node_db[nid] = np.array([x, y, z_glass])
+
+    # 글라스 요소 생성 (QUAD4, 요소 ID 200,000번 대 오프셋)
+    glass_elem_offset = 200000
+    model.add_material(3, E=glass_E, nu=0.2, rho=2.5e-9)  # 글라스 밀도 ~2.5 g/cm³
+    model.add_property(3, "PSHELL", t=glass_t, mid=3)
+    
+    for i in range(nx):
+        for j in range(ny):
+            n1 = glass_node_offset + i * (ny + 1) + j
+            n2 = glass_node_offset + (i + 1) * (ny + 1) + j
+            n3 = glass_node_offset + (i + 1) * (ny + 1) + (j + 1)
+            n4 = glass_node_offset + i * (ny + 1) + (j + 1)
+            
+            eid = glass_elem_offset + i * ny + j
+            model.add_element(eid, [n1, n2, n3, n4], elem_type="QUAD4", pid=3)
+
+    # 5. 소프트 빔 결합 생성 (BEAM2, 요소 ID 300,000번 대 오프셋)
+    beam_elem_offset = 300000
+    model.add_material(2, E=sealant_E, nu=0.49, rho=1e-15)  # 질량 영향이 없는 소프트 접착제 물성
+    model.add_property(2, "PBEAM", t=0.0, mid=2)  # BEAM2용 pid=2 등록 (PBEAM 속성)
+    
+    # 글라스 평판의 경계(가장자리) 노드들 추출
+    glass_boundary_nids = []
+    for nid, coords in glass_node_db.items():
+        # X나 Y가 외곽 경계선에 있는 노드 식별 (Y-min은 체결에서 제외)
+        on_boundary = (abs(coords[0] - x_min) < 0.1 or abs(coords[0] - x_max) < 0.1 or
+                       abs(coords[1] - y_max) < 0.1)
+        if on_boundary:
+            glass_boundary_nids.append(nid)
+
+    beam_count = 0
+    max_link_dist = 1.5 * mesh_xy  # 플랜지가 없는 전면부에 연결이 생성되지 않도록 거리 임계치 설정
+    
+    for fnid in flange_nids:
+        fc = chassis_nodes[fnid]
+        best_gnid = None
+        min_d_sq = 1e9
+        for gnid in glass_boundary_nids:
+            gc = glass_node_db[gnid]
+            d_sq = (fc[0] - gc[0])**2 + (fc[1] - gc[1])**2
+            if d_sq < min_d_sq:
+                min_d_sq = d_sq
+                best_gnid = gnid
+                
+        if best_gnid is not None and np.sqrt(min_d_sq) < max_link_dist:
+            eid = beam_elem_offset + beam_count
+            model.add_element(eid, [fnid, best_gnid], elem_type="BEAM2", pid=2)
+            beam_count += 1
+
+    # 6. 전체 노드 딕셔너리 병합
+    node_db_combined = {**chassis_nodes, **glass_node_db}
+    
+    # 시각화 검증을 위한 파트 분할용 Element Set 정의
+    chassis_shell_eids = [eid for eid in model.elements if eid < glass_elem_offset]
+    glass_eids = [glass_elem_offset + i * ny + j for i in range(nx) for j in range(ny)]
+    beam_eids = [beam_elem_offset + b for b in range(beam_count)]
+    
+    model.add_elem_set_by_name("ChassisShells", chassis_shell_eids)
+    model.add_elem_set_by_name("GlassPanel", glass_eids)
+    model.add_elem_set_by_name("SoftBeams", beam_eids)
+    
+    return model, node_db_combined
+
+
 def _parse_exclude_zones(
     rect_args: Optional[List[str]],
     poly_args: Optional[List[str]],
@@ -1460,18 +1584,38 @@ class PosDynamicPipeline:
 
     def _build_mesh(self) -> None:
         _section("메시 생성", "1")
-        self.model, self.node_db = _build_tray(
-            width       = self.cfg.tray_width,
-            length      = self.cfg.tray_length,
-            height      = self.cfg.tray_height,
-            mesh_xy     = self.cfg.mesh_xy,
-            mesh_z      = self.cfg.mesh_z,
-            draft_angle = self.cfg.draft_angle,
-            E           = self.cfg.mat_E,
-            nu          = self.cfg.mat_nu,
-            rho         = self.cfg.mat_rho,
-            t           = self.cfg.mat_t,
-        )
+        if getattr(self.cfg, 'add_glass', False):
+            self.model, self.node_db = _build_chassis_with_glass_assembly(
+                width       = self.cfg.tray_width,
+                length      = self.cfg.tray_length,
+                height      = self.cfg.tray_height,
+                mesh_xy     = self.cfg.mesh_xy,
+                mesh_z      = self.cfg.mesh_z,
+                draft_angle = self.cfg.draft_angle,
+                E           = self.cfg.mat_E,
+                nu          = self.cfg.mat_nu,
+                rho         = self.cfg.mat_rho,
+                t           = self.cfg.mat_t,
+                glass_t     = self.cfg.glass_t,
+                glass_E     = self.cfg.glass_E,
+                sealant_E   = self.cfg.sealant_E,
+            )
+            _row("글라스 패널 결합", "활성화")
+            _row("글라스 두께 / 탄성계수", f"{self.cfg.glass_t:.1f} mm / {self.cfg.glass_E:.1f} MPa")
+            _row("소프트 빔 탄성계수", f"{self.cfg.sealant_E:.1f} MPa")
+        else:
+            self.model, self.node_db = _build_tray(
+                width       = self.cfg.tray_width,
+                length      = self.cfg.tray_length,
+                height      = self.cfg.tray_height,
+                mesh_xy     = self.cfg.mesh_xy,
+                mesh_z      = self.cfg.mesh_z,
+                draft_angle = self.cfg.draft_angle,
+                E           = self.cfg.mat_E,
+                nu          = self.cfg.mat_nu,
+                rho         = self.cfg.mat_rho,
+                t           = self.cfg.mat_t,
+            )
         _row("섀시 치수 (W × L × H)",
              f"{self.cfg.tray_width:.0f} × {self.cfg.tray_length:.0f} × {self.cfg.tray_height:.0f} mm")
         _row("재료", f"E={self.cfg.mat_E:.0f} MPa  ν={self.cfg.mat_nu}  "
@@ -1667,18 +1811,38 @@ class TopographyPipeline:
             self.node_db = {nid: nd for nid, nd in self.model.nodes.items()}
             _row("입력 파일", Path(self.cfg.input_inp).name)
         else:
-            self.model, self.node_db = _build_tray(
-                width       = self.cfg.tray_width,
-                length      = self.cfg.tray_length,
-                height      = self.cfg.tray_height,
-                mesh_xy     = self.cfg.mesh_xy,
-                mesh_z      = self.cfg.mesh_z,
-                draft_angle = self.cfg.draft_angle,
-                E           = self.cfg.mat_E,
-                nu          = self.cfg.mat_nu,
-                rho         = self.cfg.mat_rho,
-                t           = self.cfg.mat_t,
-            )
+            if getattr(self.cfg, 'add_glass', False):
+                self.model, self.node_db = _build_chassis_with_glass_assembly(
+                    width       = self.cfg.tray_width,
+                    length      = self.cfg.tray_length,
+                    height      = self.cfg.tray_height,
+                    mesh_xy     = self.cfg.mesh_xy,
+                    mesh_z      = self.cfg.mesh_z,
+                    draft_angle = self.cfg.draft_angle,
+                    E           = self.cfg.mat_E,
+                    nu          = self.cfg.mat_nu,
+                    rho         = self.cfg.mat_rho,
+                    t           = self.cfg.mat_t,
+                    glass_t     = self.cfg.glass_t,
+                    glass_E     = self.cfg.glass_E,
+                    sealant_E   = self.cfg.sealant_E,
+                )
+                _row("글라스 패널 결합", "활성화")
+                _row("글라스 두께 / 탄성계수", f"{self.cfg.glass_t:.1f} mm / {self.cfg.glass_E:.1f} MPa")
+                _row("소프트 빔 탄성계수", f"{self.cfg.sealant_E:.1f} MPa")
+            else:
+                self.model, self.node_db = _build_tray(
+                    width       = self.cfg.tray_width,
+                    length      = self.cfg.tray_length,
+                    height      = self.cfg.tray_height,
+                    mesh_xy     = self.cfg.mesh_xy,
+                    mesh_z      = self.cfg.mesh_z,
+                    draft_angle = self.cfg.draft_angle,
+                    E           = self.cfg.mat_E,
+                    nu          = self.cfg.mat_nu,
+                    rho         = self.cfg.mat_rho,
+                    t           = self.cfg.mat_t,
+                )
             _row("섀시 치수 (W × L × H)",
                  f"{self.cfg.tray_width:.0f} × {self.cfg.tray_length:.0f} × {self.cfg.tray_height:.0f} mm")
             _row("재료", f"E={self.cfg.mat_E:.0f} MPa  ν={self.cfg.mat_nu}  "
@@ -3120,6 +3284,14 @@ def main():
     g2.add_argument("--mat-nu",  type=float, default=MAT['nu'],  help=f"포아송비 (기본: {MAT['nu']})")
     g2.add_argument("--mat-rho", type=float, default=MAT['rho'], help=f"밀도 tonne/mm³ (기본: {MAT['rho']:.2e})")
     g2.add_argument("--mat-t",   type=float, default=MAT['t'],   help=f"기본 판 두께 mm (기본: {MAT['t']})")
+    g2.add_argument("--add-glass", action="store_true", default=False,
+                    help="오픈셀 글라스 패널을 결합하여 어셈블리 상태로 해석 및 최적화를 수행합니다.")
+    g2.add_argument("--glass-t", type=float, default=1.0,
+                    help="글라스 패널의 두께 mm (기본: 1.0)")
+    g2.add_argument("--glass-E", type=float, default=40000.0,
+                    help="글라스 패널의 탄성계수 MPa (기본: 40000.0)")
+    g2.add_argument("--sealant-E", type=float, default=1.0,
+                    help="소프트 연결 빔의 탄성계수 MPa (기본: 1.0)")
 
     # [3] 최적화 & 비드 제약
     g3 = parser.add_argument_group(

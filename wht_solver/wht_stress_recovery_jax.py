@@ -14,6 +14,9 @@ Voigt Notation: (σ_xx, σ_yy, σ_zz, τ_xy, τ_xz, τ_yz)
 """
 
 import numpy as np
+import jax
+import jax.numpy as jnp
+from jax import jit, vmap
 from typing import Dict, Tuple, List, Optional
 
 
@@ -30,7 +33,7 @@ _cache_quad4_geom_nodal = {}
 _cache_tria3_geom = {}
 _cache_tria3_geom_nodal = {}
 
-class ElementStressRecovery:
+class ElementStressRecoveryJax:
     """
     Shell 요소 응력/변형률 복원 엔진.
 
@@ -196,11 +199,25 @@ class ElementStressRecovery:
         kappa_yy = -np.sum(dN_dy * th_x, axis=1)         # -∂θ_x/∂y
         kappa_xy = np.sum(dN_dy * th_y - dN_dx * th_x, axis=1)
 
-        res_p = _compute_all_layers(
-            M_total, row_arr, E_arr, nu_arr, t_arr, T,
+        s_upper, e_upper, s_mid, e_mid, s_lower, e_lower, s_max_env, e_max_env = _compute_all_layers_jax(
+            E_arr, nu_arr, t_arr, T,
             eps_xx_m, eps_yy_m, gamma_xy_m,
             kappa_xx, kappa_yy, kappa_xy,
         )
+        res_p = {}
+        res_p['Stress'] = s_upper
+        res_p['Strain'] = e_upper
+        res_p['Stress (Mid)'] = s_mid
+        res_p['Strain (Mid)'] = e_mid
+        res_p['Stress (Lower)'] = s_lower
+        res_p['Strain (Lower)'] = e_lower
+        res_p['Stress (Max Envelope)'] = s_max_env
+        res_p['Strain (Max Envelope)'] = e_max_env
+        res_p['Stress (Membrane)'] = s_mid
+        res_p['Strain (Membrane)'] = e_mid
+        res_p['Stress (Bending)'] = s_upper - s_mid
+        res_p['Strain (Bending)'] = e_upper - e_mid
+
         result_dict = _empty_result_dict(M_total)
         for k in res_p:
             result_dict[k][row_arr, :] = res_p[k]
@@ -347,12 +364,20 @@ class ElementStressRecovery:
             # U_rot_loc의 미분 (p번째 적분점)
             dN_dx, dN_dy = dN_dx_all[p], dN_dy_all[p]
 
-            res_p = _compute_all_layers(
-                M_total, row_arr, E_arr, nu_arr, t_arr, T,
+            s_upper, e_upper, s_mid, e_mid, s_lower, e_lower, s_max_env, e_max_env = _compute_all_layers_jax(
+                E_arr, nu_arr, t_arr, T,
                 eps_xx_m_all[:, p], eps_yy_m_all[:, p], gamma_xy_m_all[:, p],
                 kappa_xx_all[:, p], kappa_yy_all[:, p], kappa_xy_all[:, p],
-                fields=fields
             )
+            res_p_raw = {
+                'Stress': s_upper, 'Strain': e_upper,
+                'Stress (Mid)': s_mid, 'Strain (Mid)': e_mid,
+                'Stress (Lower)': s_lower, 'Strain (Lower)': e_lower,
+                'Stress (Max Envelope)': s_max_env, 'Strain (Max Envelope)': e_max_env,
+                'Stress (Membrane)': s_mid, 'Strain (Membrane)': e_mid,
+                'Stress (Bending)': s_upper - s_mid, 'Strain (Bending)': e_upper - e_mid
+            }
+            res_p = {k: v for k, v in res_p_raw.items() if fields is None or k in fields}
             
             if not result_dict:
                 for k in res_p:
@@ -377,7 +402,7 @@ class ElementStressRecovery:
         TRIA3 (CST) 요소의 3개 코너 노드 위치에서 응력/변형률을 복원합니다.
         CST는 곡률이 없으므로 Centroid 값을 복제하여 반환합니다.
         """
-        res_centroid = ElementStressRecovery.recover_tria3(wht_model, u_global_array, sorted_nids, c_all=c_all, fields=fields)
+        res_centroid = ElementStressRecoveryJax.recover_tria3(wht_model, u_global_array, sorted_nids, c_all=c_all, fields=fields)
         M_total = len(wht_model.elements)
         result_dict = {}
         for k, v in res_centroid.items():
@@ -516,12 +541,21 @@ class ElementStressRecovery:
         kappa_yy = -np.sum(dN_dy * th_x, axis=1)
         kappa_xy = np.sum(dN_dy * th_y - dN_dx * th_x, axis=1)
 
-        res_p = _compute_all_layers(
-            M_total, row_arr, E_arr, nu_arr, t_arr, T,
+        s_upper, e_upper, s_mid, e_mid, s_lower, e_lower, s_max_env, e_max_env = _compute_all_layers_jax(
+            E_arr, nu_arr, t_arr, T,
             eps_xx_m, eps_yy_m, gamma_xy_m,
             kappa_xx, kappa_yy, kappa_xy,
-            fields=fields
         )
+        res_p_raw = {
+            'Stress': s_upper, 'Strain': e_upper,
+            'Stress (Mid)': s_mid, 'Strain (Mid)': e_mid,
+            'Stress (Lower)': s_lower, 'Strain (Lower)': e_lower,
+            'Stress (Max Envelope)': s_max_env, 'Strain (Max Envelope)': e_max_env,
+            'Stress (Membrane)': s_mid, 'Strain (Membrane)': e_mid,
+            'Stress (Bending)': s_upper - s_mid, 'Strain (Bending)': e_upper - e_mid
+        }
+        res_p = {k: v for k, v in res_p_raw.items() if fields is None or k in fields}
+
         result_dict = {}
         for k in res_p:
             result_dict[k] = np.zeros((M_total, 6), dtype=np.float32)
@@ -533,7 +567,7 @@ class ElementStressRecovery:
 # Internal Helpers
 # ---------------------------------------------------------------------------
 
-def _empty_result_dict(M_total: int) -> Dict[str, np.ndarray]:
+def _empty_result_dict_jax(M_total: int) -> Dict[str, np.ndarray]:
     """빈 결과 딕셔너리를 반환합니다 (해당 요소 타입이 없을 때)."""
     z = np.zeros((M_total, 6))
     return {
@@ -546,99 +580,73 @@ def _empty_result_dict(M_total: int) -> Dict[str, np.ndarray]:
     }
 
 
-def _compute_at_z(
-    z_dist: np.ndarray,
-    E_arr: np.ndarray,
-    nu_arr: np.ndarray,
-    T: np.ndarray,
-    eps_xx_m: np.ndarray,
-    eps_yy_m: np.ndarray,
-    gamma_xy_m: np.ndarray,
-    kappa_xx: np.ndarray,
-    kappa_yy: np.ndarray,
-    kappa_xy: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    특정 두께 위치(z_dist)에서 로컬 응력/변형률을 계산하고 전역 Voigt로 변환합니다.
-
-    Parameters
-    ----------
-    z_dist : np.ndarray, shape (M,)
-        두께 방향 위치 (z = z_ratio * t/2).
-    E_arr : np.ndarray, shape (M,)
-        영 계수.
-    nu_arr : np.ndarray, shape (M,)
-        포아송 비.
-    T : np.ndarray, shape (M, 3, 3)
-        로컬→전역 변환 행렬.
-    eps_xx_m, eps_yy_m, gamma_xy_m : np.ndarray, shape (M,)
-        면내(Membrane) 변형률 성분.
-    kappa_xx, kappa_yy, kappa_xy : np.ndarray, shape (M,)
-        굽힘 곡률 성분.
-
-    Returns
-    -------
-    stress_voigt : np.ndarray, shape (M, 6)
-        전역 Voigt 응력.
-    strain_voigt : np.ndarray, shape (M, 6)
-        전역 Voigt 변형률 (Engineering Shear).
-    """
-    M = len(E_arr)
-
-    # Total strain at z = membrane + z * curvature
+@jax.jit
+def _compute_at_z_jax(
+    z_dist: jnp.ndarray,
+    E_arr: jnp.ndarray,
+    nu_arr: jnp.ndarray,
+    T: jnp.ndarray,
+    eps_xx_m: jnp.ndarray,
+    eps_yy_m: jnp.ndarray,
+    gamma_xy_m: jnp.ndarray,
+    kappa_xx: jnp.ndarray,
+    kappa_yy: jnp.ndarray,
+    kappa_xy: jnp.ndarray,
+):
     eps_xx = eps_xx_m + z_dist * kappa_xx
     eps_yy = eps_yy_m + z_dist * kappa_yy
     gamma_xy = gamma_xy_m + z_dist * kappa_xy
 
-    # Plane Stress 구성 방정식
     factor = E_arr / (1.0 - nu_arr ** 2)
     sig_xx = factor * (eps_xx + nu_arr * eps_yy)
     sig_yy = factor * (nu_arr * eps_xx + eps_yy)
     sig_xy = factor * ((1.0 - nu_arr) / 2.0) * gamma_xy
 
-    # Plane Stress: eps_zz = -nu/(1-nu) * (eps_xx + eps_yy)
     eps_zz = -(nu_arr / (1.0 - nu_arr)) * (eps_xx + eps_yy)
 
-    # 로컬 텐서(3x3) 구성
-    sig_loc = np.zeros((M, 3, 3))
-    sig_loc[:, 0, 0] = sig_xx
-    sig_loc[:, 1, 1] = sig_yy
-    sig_loc[:, 0, 1] = sig_xy
-    sig_loc[:, 1, 0] = sig_xy
+    z = jnp.zeros_like(sig_xx)
+    
+    # 3x3 matrices
+    sig_loc = jnp.stack([
+        jnp.stack([sig_xx, sig_xy, z], axis=-1),
+        jnp.stack([sig_xy, sig_yy, z], axis=-1),
+        jnp.stack([z,      z,      z], axis=-1)
+    ], axis=-2)
+    
+    eps_loc = jnp.stack([
+        jnp.stack([eps_xx, gamma_xy/2.0, z], axis=-1),
+        jnp.stack([gamma_xy/2.0, eps_yy, z], axis=-1),
+        jnp.stack([z,      z,     eps_zz], axis=-1)
+    ], axis=-2)
 
-    eps_loc = np.zeros((M, 3, 3))
-    eps_loc[:, 0, 0] = eps_xx
-    eps_loc[:, 1, 1] = eps_yy
-    eps_loc[:, 2, 2] = eps_zz
-    eps_loc[:, 0, 1] = gamma_xy / 2.0
-    eps_loc[:, 1, 0] = gamma_xy / 2.0
+    T_T = jnp.transpose(T, (0, 2, 1))
+    sig_glob = jnp.matmul(T_T, jnp.matmul(sig_loc, T))
+    eps_glob = jnp.matmul(T_T, jnp.matmul(eps_loc, T))
 
-    # 전역 공간으로 역회전: σ_glob = T^T · σ_loc · T
-    T_T = T.transpose(0, 2, 1)
-    sig_glob = np.matmul(T_T, np.matmul(sig_loc, T))
-    eps_glob = np.matmul(T_T, np.matmul(eps_loc, T))
+    stress_voigt = jnp.stack([
+        sig_glob[:, 0, 0],
+        sig_glob[:, 1, 1],
+        sig_glob[:, 2, 2],
+        sig_glob[:, 0, 1],
+        sig_glob[:, 0, 2],
+        sig_glob[:, 1, 2]
+    ], axis=-1)
 
-    # Voigt 패킹 (xx, yy, zz, xy, xz, yz)
-    stress_voigt = np.zeros((M, 6))
-    stress_voigt[:, 0] = sig_glob[:, 0, 0]
-    stress_voigt[:, 1] = sig_glob[:, 1, 1]
-    stress_voigt[:, 2] = sig_glob[:, 2, 2]
-    stress_voigt[:, 3] = sig_glob[:, 0, 1]
-    stress_voigt[:, 4] = sig_glob[:, 0, 2]
-    stress_voigt[:, 5] = sig_glob[:, 1, 2]
-
-    strain_voigt = np.zeros((M, 6))
-    strain_voigt[:, 0] = eps_glob[:, 0, 0]
-    strain_voigt[:, 1] = eps_glob[:, 1, 1]
-    strain_voigt[:, 2] = eps_glob[:, 2, 2]
-    strain_voigt[:, 3] = eps_glob[:, 0, 1] * 2.0  # Engineering shear
-    strain_voigt[:, 4] = eps_glob[:, 0, 2] * 2.0
-    strain_voigt[:, 5] = eps_glob[:, 1, 2] * 2.0
+    strain_voigt = jnp.stack([
+        eps_glob[:, 0, 0],
+        eps_glob[:, 1, 1],
+        eps_glob[:, 2, 2],
+        eps_glob[:, 0, 1] * 2.0,
+        eps_glob[:, 0, 2] * 2.0,
+        eps_glob[:, 1, 2] * 2.0
+    ], axis=-1)
 
     return stress_voigt, strain_voigt
 
 
-def _von_mises_voigt(voigt: np.ndarray) -> np.ndarray:
+
+@jax.jit
+def _von_mises_voigt_jax(voigt) -> np.ndarray:
     """
     Voigt 표기법 텐서로부터 Von Mises 등가 스칼라를 계산합니다.
 
@@ -655,96 +663,53 @@ def _von_mises_voigt(voigt: np.ndarray) -> np.ndarray:
     s = voigt
     diff_sq = (s[:, 0] - s[:, 1]) ** 2 + (s[:, 1] - s[:, 2]) ** 2 + (s[:, 2] - s[:, 0]) ** 2
     shear_sq = 6.0 * (s[:, 3] ** 2 + s[:, 4] ** 2 + s[:, 5] ** 2)
-    return np.sqrt(0.5 * (diff_sq + shear_sq))
+    return jnp.sqrt(0.5 * (diff_sq + shear_sq))
 
 
-def _compute_all_layers(
-    M_total: int,
-    row_arr: np.ndarray,
-    E_arr: np.ndarray,
-    nu_arr: np.ndarray,
-    t_arr: np.ndarray,
-    T: np.ndarray,
-    eps_xx_m: np.ndarray,
-    eps_yy_m: np.ndarray,
-    gamma_xy_m: np.ndarray,
-    kappa_xx: np.ndarray,
-    kappa_yy: np.ndarray,
-    kappa_xy: np.ndarray,
-    fields: Optional[list] = None
-) -> Dict[str, np.ndarray]:
+@jax.jit
+def _compute_all_layers_jax(
+    E_arr: jnp.ndarray,
+    nu_arr: jnp.ndarray,
+    t_arr: jnp.ndarray,
+    T: jnp.ndarray,
+    eps_xx_m: jnp.ndarray,
+    eps_yy_m: jnp.ndarray,
+    gamma_xy_m: jnp.ndarray,
+    kappa_xx: jnp.ndarray,
+    kappa_yy: jnp.ndarray,
+    kappa_xy: jnp.ndarray,
+):
     """
-    Upper/Mid/Lower 3개 적분점 및 Membrane/Bending 분리, Max Envelope을 계산합니다.
+    JAX version. Returns a tuple of all possible results (upper, mid, lower).
+    JIT compiling python control flow (if need_mid) isn't great because it requires static arguments, 
+    so we just compute everything and return it in a tuple, relying on XLA dead code elimination if possible, 
+    or just accepting the computation since it's fully fused and GPU accelerated anyway.
     """
-    result = {}
-
-    need_mid = fields is None or any("Mid" in f or "Membrane" in f or "Bending" in f for f in fields)
-    need_lower = fields is None or any("Lower" in f or "Max Envelope" in f for f in fields)
-
-    # --- Upper (+t/2) ---
     z_upper = t_arr / 2.0
-    s_upper, e_upper = _compute_at_z(
+    s_upper, e_upper = _compute_at_z_jax(
         z_upper, E_arr, nu_arr, T,
         eps_xx_m, eps_yy_m, gamma_xy_m,
         kappa_xx, kappa_yy, kappa_xy,
     )
-    if fields is None or "Stress" in fields:
-        result["Stress"] = s_upper
-    if fields is None or "Strain" in fields:
-        result["Strain"] = e_upper
 
-    # --- Mid (0) ---
-    s_mid, e_mid = None, None
-    if need_mid:
-        z_mid = np.zeros_like(t_arr)
-        s_mid, e_mid = _compute_at_z(
-            z_mid, E_arr, nu_arr, T,
-            eps_xx_m, eps_yy_m, gamma_xy_m,
-            kappa_xx, kappa_yy, kappa_xy,
-        )
-        if fields is None or "Stress (Mid)" in fields:
-            result["Stress (Mid)"] = s_mid
-        if fields is None or "Strain (Mid)" in fields:
-            result["Strain (Mid)"] = e_mid
-        if fields is None or "Stress (Membrane)" in fields:
-            result["Stress (Membrane)"] = s_mid
-        if fields is None or "Strain (Membrane)" in fields:
-            result["Strain (Membrane)"] = e_mid
-        if fields is None or "Stress (Bending)" in fields:
-            result["Stress (Bending)"] = s_upper - s_mid
-        if fields is None or "Strain (Bending)" in fields:
-            result["Strain (Bending)"] = e_upper - e_mid
+    z_mid = jnp.zeros_like(t_arr)
+    s_mid, e_mid = _compute_at_z_jax(
+        z_mid, E_arr, nu_arr, T,
+        eps_xx_m, eps_yy_m, gamma_xy_m,
+        kappa_xx, kappa_yy, kappa_xy,
+    )
 
-    # --- Lower (-t/2) ---
-    s_lower, e_lower = None, None
-    if need_lower:
-        z_lower = -t_arr / 2.0
-        s_lower, e_lower = _compute_at_z(
-            z_lower, E_arr, nu_arr, T,
-            eps_xx_m, eps_yy_m, gamma_xy_m,
-            kappa_xx, kappa_yy, kappa_xy,
-        )
-        if fields is None or "Stress (Lower)" in fields:
-            result["Stress (Lower)"] = s_lower
-        if fields is None or "Strain (Lower)" in fields:
-            result["Strain (Lower)"] = e_lower
+    z_lower = -t_arr / 2.0
+    s_lower, e_lower = _compute_at_z_jax(
+        z_lower, E_arr, nu_arr, T,
+        eps_xx_m, eps_yy_m, gamma_xy_m,
+        kappa_xx, kappa_yy, kappa_xy,
+    )
 
-    # --- Max Envelope ---
-    if fields is None or "Stress (Max Envelope)" in fields or "Strain (Max Envelope)" in fields:
-        if s_lower is not None:
-            vm_upper = _von_mises_voigt(s_upper)
-            vm_lower = _von_mises_voigt(s_lower)
-            pick_upper = vm_upper >= vm_lower
-            if fields is None or "Stress (Max Envelope)" in fields:
-                result["Stress (Max Envelope)"] = np.where(pick_upper[:, None], s_upper, s_lower)
-            if fields is None or "Strain (Max Envelope)" in fields:
-                result["Strain (Max Envelope)"] = np.where(pick_upper[:, None], e_upper, e_lower)
-        else:
-            if fields is None or "Stress (Max Envelope)" in fields:
-                result["Stress (Max Envelope)"] = s_upper
-            if fields is None or "Strain (Max Envelope)" in fields:
-                result["Strain (Max Envelope)"] = e_upper
+    vm_upper = _von_mises_voigt_jax(s_upper)
+    vm_lower = _von_mises_voigt_jax(s_lower)
+    pick_upper = vm_upper >= vm_lower
+    s_max_env = jnp.where(pick_upper[:, None], s_upper, s_lower)
+    e_max_env = jnp.where(pick_upper[:, None], e_upper, e_lower)
 
-    return result
-
-    return result
+    return s_upper, e_upper, s_mid, e_mid, s_lower, e_lower, s_max_env, e_max_env
