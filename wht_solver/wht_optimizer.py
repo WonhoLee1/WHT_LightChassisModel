@@ -50,36 +50,37 @@ class DesignBounds:
     z_min: float;   z_max: float
     E_min: float;   E_max: float
     rho_min: float; rho_max: float
+    free_node_mask: Optional[np.ndarray] = None  # (N,) bool, sorted_nids order;
+                                                  # False = node frozen at z=0
 
 
-# Register DesignVariables as a JAX pytree
-def _dv_flatten(dv: DesignVariables):
-    leaves  = [dv.t_field, dv.z_offsets,
-               jnp.array(dv.E), jnp.array(dv.rho)]
-    treedef = None   # placeholder
-    return leaves, treedef
-
-
-def _dv_unflatten(treedef, leaves):
-    t_field, z_offsets, E, rho = leaves
-    return DesignVariables(t_field, z_offsets, float(E), float(rho))
-
-
+# Register DesignVariables as a JAX pytree.
+# NOTE: unflatten must NOT call float() on the E/rho leaves — under
+# jax.grad/value_and_grad those leaves are abstract tracers during trace
+# construction, and float(tracer) raises ConcretizationTypeError. Keep them
+# as 0-d jnp arrays; they still behave like floats in eager (non-traced) use.
 jax.tree_util.register_pytree_node(
     DesignVariables,
     lambda dv: ([dv.t_field, dv.z_offsets,
                  jnp.array(dv.E), jnp.array(dv.rho)], None),
     lambda _, leaves: DesignVariables(
-        leaves[0], leaves[1], float(leaves[2]), float(leaves[3])
+        leaves[0], leaves[1], leaves[2], leaves[3]
     ),
 )
 
 
 def clip_to_bounds(dv: DesignVariables, bounds: DesignBounds) -> DesignVariables:
-    """Project design variables to feasible region."""
+    """Project design variables to feasible region.
+
+    Nodes outside ``bounds.free_node_mask`` are frozen at z_offset=0
+    (e.g. nodes outside the pre-formed bead region).
+    """
+    z_clipped = jnp.clip(dv.z_offsets, bounds.z_min, bounds.z_max)
+    if bounds.free_node_mask is not None:
+        z_clipped = jnp.where(jnp.asarray(bounds.free_node_mask), z_clipped, 0.0)
     return DesignVariables(
         t_field   = jnp.clip(dv.t_field,   bounds.t_min,   bounds.t_max),
-        z_offsets = jnp.clip(dv.z_offsets, bounds.z_min,   bounds.z_max),
+        z_offsets = z_clipped,
         E         = float(jnp.clip(jnp.array(dv.E),
                                    bounds.E_min,   bounds.E_max)),
         rho       = float(jnp.clip(jnp.array(dv.rho),
@@ -113,6 +114,7 @@ class WHTOptimizer:
         weights:         Dict[str, float] = None,
         monitor:         Optional["OptimizationMonitor"] = None,
         adjacency:       Optional[np.ndarray] = None,
+        target_node_coords: Optional[np.ndarray] = None,
     ):
         try:
             import optax
@@ -133,6 +135,10 @@ class WHTOptimizer:
         self.monitor    = monitor
         self.adjacency  = (jnp.array(adjacency) if adjacency is not None
                            else None)
+        self._free_mask = (jnp.asarray(bounds.free_node_mask)
+                           if bounds.free_node_mask is not None else None)
+        self.target_node_coords = (np.asarray(target_node_coords)
+                                   if target_node_coords is not None else None)
 
         # Pre-extract K_func static args (once)
         from .wht_solver import WHTSolver
@@ -172,9 +178,23 @@ class WHTOptimizer:
         target_modal = self.target_results.get("modal")
         freqs_target = (jnp.array(target_modal.frequencies[:self.num_modes])
                         if target_modal else None)
-        phis_target  = (jnp.array(target_modal.mode_shapes[:self.num_modes, :, :3]
-                                  .reshape(self.num_modes, -1))
-                        if target_modal else None)
+
+        phis_target = None
+        if target_modal is not None:
+            raw_target_shapes = target_modal.mode_shapes[:self.num_modes, :, :3]  # (n_modes, N_tgt, 3)
+            if self.target_node_coords is not None:
+                # Target result lives on a different mesh (different node count /
+                # ordering) than base_model — RBF-map each mode's displacement
+                # field onto base_model's node coordinates so MAC compares
+                # vectors of matching length/order. One-time cost (not per-step).
+                base_crds = self._k_args["base_crds"]
+                mapped = self.mapper.map_modes(
+                    self.target_node_coords, raw_target_shapes, base_crds
+                )
+                phis_target = jnp.array(mapped.reshape(self.num_modes, -1))
+            else:
+                # Same mesh / matching node ordering assumed.
+                phis_target = jnp.array(raw_target_shapes.reshape(self.num_modes, -1))
 
         def loss_fn(dv: DesignVariables) -> jnp.ndarray:
             freqs_opt = freq_fn(
@@ -183,9 +203,14 @@ class WHTOptimizer:
                 jnp.array(dv.E),
                 jnp.array(dv.rho),
             )
-            # Dummy mode shapes placeholder (MAC requires actual shapes;
-            # for frequency-only optimization set mac weight to 0)
-            phis_opt = jnp.zeros_like(phis_target) if phis_target is not None else None
+            # Real mode shapes from the forward solve, used only for MAC-based
+            # mode soft-assignment (stop_gradient: avoids costly eigenvector
+            # sensitivity — gradient still flows through freqs_opt).
+            if phis_target is not None:
+                shapes_np = freq_fn.get_last_mode_shapes()
+                phis_opt = jax.lax.stop_gradient(jnp.array(shapes_np))
+            else:
+                phis_opt = None
 
             return multi_objective_loss(
                 freqs_opt    = freqs_opt,
@@ -202,6 +227,13 @@ class WHTOptimizer:
         print(f"WHT Optimizer: {n_steps} steps, lr={self.lr}")
         for step in range(1, n_steps + 1):
             loss_val, grads = loss_and_grad(current)
+            if self._free_mask is not None:
+                grads = DesignVariables(
+                    t_field   = grads.t_field,
+                    z_offsets = grads.z_offsets * self._free_mask,
+                    E         = grads.E,
+                    rho       = grads.rho,
+                )
             updates, opt_state = optimizer.update(grads, opt_state, current)
             current = optax.apply_updates(current, updates)
             current = clip_to_bounds(current, self.bounds)
@@ -213,7 +245,7 @@ class WHTOptimizer:
                 print(f"  Step {step:4d}/{n_steps}  loss={loss_f:.6e}")
 
                 if self.monitor is not None:
-                    base_crds = k_args["base_crds"].copy()
+                    base_crds = self._k_args["base_crds"].copy()
                     nodes_now = base_crds.copy()
                     nodes_now[:, 2] += np.array(current.z_offsets)
                     self.monitor.update(

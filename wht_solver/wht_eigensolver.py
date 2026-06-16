@@ -71,6 +71,10 @@ def make_modal_freq_fn(
     sorted_nids = sorted(base_model.nodes.keys())
     n_nodes     = len(sorted_nids)
 
+    # Side-channel: forward-pass mode shapes (flattened (num_modes, 3*n_nodes)),
+    # captured for MAC-based mode soft-assignment. Not part of the JAX trace.
+    _last_mode_shapes = {"val": None}
+
     def _apply_design(t_np, dz_np, E_val, rho_val) -> "WHTMeshModel":
         """Return a shallow-copy model with updated design variables."""
         model = copy.deepcopy(base_model)
@@ -103,6 +107,9 @@ def make_modal_freq_fn(
         model  = _apply_design(t_np, dz_np, E_val, rho_val)
         solver = WHTSolver(model, stiffness_scale=1e3)
         result = solver.solve_modal(num_modes=num_modes, method=solver_method)
+        _last_mode_shapes["val"] = np.array(
+            result.mode_shapes[:num_modes, :, :3].reshape(num_modes, -1)
+        )
         return jnp.array(result.frequencies[:num_modes])
 
     def _fwd(t_field, z_offsets, E, rho):
@@ -149,4 +156,5 @@ def make_modal_freq_fn(
         return g_t, g_z, g_E, g_rho
 
     modal_frequencies.defvjp(_fwd, _bwd)
+    modal_frequencies.get_last_mode_shapes = lambda: _last_mode_shapes["val"]
     return modal_frequencies

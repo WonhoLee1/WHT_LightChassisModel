@@ -59,14 +59,31 @@ class WHTMapper:
         if self.epsilon is not None:
             kw["epsilon"] = self.epsilon
 
-        self._interp = RBFInterpolator(
-            self._source_nodes,
-            source_data,
-            kernel=self.kernel,
-            smoothing=self.smoothing,
-            **kw,
+        # thin_plate_spline's default affine polynomial term (degree=1) is
+        # rank-deficient when the source points are (near-)coplanar/collinear
+        # (e.g. a flat plate with no Z variation) -> scipy raises LinAlgError.
+        # Fall back to a lower polynomial degree, which only needs a smaller
+        # subset of the coordinates to be independent.
+        for degree in (kw.get("degree", None), 0, -1):
+            try:
+                attempt_kw = dict(kw)
+                if degree is not None:
+                    attempt_kw["degree"] = degree
+                self._interp = RBFInterpolator(
+                    self._source_nodes,
+                    source_data,
+                    kernel=self.kernel,
+                    smoothing=self.smoothing,
+                    **attempt_kw,
+                )
+                return self
+            except np.linalg.LinAlgError:
+                continue
+        raise np.linalg.LinAlgError(
+            "WHTMapper.fit(): RBF interpolant is singular even with degree=-1 "
+            "(no polynomial term) — source points may be degenerate "
+            "(duplicated or fully coincident)."
         )
-        return self
 
     def transform(self, target_nodes: np.ndarray) -> np.ndarray:
         """
