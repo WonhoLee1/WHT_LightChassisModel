@@ -65,10 +65,11 @@ def _mesh_plate(Lx, Ly, nx, ny, quads=True):
     return nodes, elems
 
 class PatchTestRunner:
-    def __init__(self):
+    def __init__(self, k_backend: str = 'auto'):
         self.E = 210000.0
         self.nu = 0.3
         self.rho = 7.85e-9
+        self.k_backend = k_backend
 
     def build_wht_model(self, nodes, elems, etype, t):
         model = WHTMeshModel(name=f"Test_{etype}")
@@ -99,7 +100,7 @@ class PatchTestRunner:
         mid_node_id = int(np.argmin(np.abs(nodes[:, 0] - L/2.0) + np.abs(nodes[:, 1] - w/2.0)))
         lc.add_force(mid_node_id, (2,), (-P,))
         
-        solver = WHTSolver(model)
+        solver = WHTSolver(model, k_backend=self.k_backend)
         t0 = time.perf_counter()
         result = solver.solve_static(lc)
         t_ms = (time.perf_counter() - t0) * 1000.0
@@ -131,7 +132,7 @@ class PatchTestRunner:
             if nid == 0:
                 model.spc_conditions.append(WHTSPCEntry(nid, (0, 1, 5)))
         
-        solver = WHTSolver(model)
+        solver = WHTSolver(model, k_backend=self.k_backend)
         
         # Diagnostic: Total Mass
         ndof = len(model.nodes) * 6
@@ -220,7 +221,7 @@ class PatchTestRunner:
                 lc.add_force(nid, (0,), (force_per_seg * weight,))
         
         # 3. Solve
-        solver = WHTSolver(model)
+        solver = WHTSolver(model, k_backend=self.k_backend)
         t0 = time.perf_counter()
         result = solver.solve_static(lc)
         t_ms = (time.perf_counter() - t0) * 1000.0
@@ -264,7 +265,7 @@ class PatchTestRunner:
         for nid in load_nodes:
             lc.add_force(nid, (2,), (-P/n,))
             
-        solver = WHTSolver(model)
+        solver = WHTSolver(model, k_backend=self.k_backend)
         t0 = time.perf_counter()
         result = solver.solve_static(lc)
         t_ms = (time.perf_counter() - t0) * 1000.0
@@ -305,7 +306,7 @@ class PatchTestRunner:
         # Also fix rigid body in XY
         lc.add_bc(n_corner[(0,0)], (0, 1, 5))
         
-        solver = WHTSolver(model)
+        solver = WHTSolver(model, k_backend=self.k_backend)
         t0 = time.perf_counter()
         result = solver.solve_static(lc)
         t_ms = (time.perf_counter() - t0) * 1000.0
@@ -319,3 +320,191 @@ class PatchTestRunner:
         return [
             TestResult("Plate Twisting", "Corner Deflection", etype, th_w, fe_w, t_ms, tol_pct=5.0)
         ]
+
+
+# ---------------------------------------------------------------------------
+# 백엔드 비교 실행
+# ---------------------------------------------------------------------------
+
+def run_benchmark(backends=('jax', 'numpy', 'numba')) -> List[dict]:
+    """
+    고유진동수 해석 벤치마크: 규모가 있는 shell 모델에 대해
+    각 백엔드별 K 조립 시간 + 고유해 시간을 측정한다.
+
+    모델: 1000x1000mm, t=5mm 평판, simply-supported, QUAD4 51x51 mesh
+          (50x50 = 2500 elements, 2601 nodes, 15606 DOF)
+    측정 항목:
+      - K assembly time [ms]
+      - Modal solve time [ms] (10 modes, ARPACK)
+      - First 5 frequencies [Hz]
+    """
+    from wht_solver.wht_quad4_element import _NUMBA_OK
+    try:
+        from wht_solver.wht_quad4_element_jax import K_quad4_jax  # noqa
+        _jax_ok = True
+    except Exception:
+        _jax_ok = False
+
+    # Build benchmark model once
+    L, t_plate = 1000.0, 5.0
+    nx, ny = 51, 51
+    E_b, nu_b, rho_b = 210000.0, 0.3, 7.85e-9
+
+    nodes, elems = _mesh_plate(L, L, nx, ny, quads=True)
+    runner = PatchTestRunner()
+    model = runner.build_wht_model(nodes, elems, 'QUAD4', t_plate)
+    model.materials[1].E   = E_b
+    model.materials[1].nu  = nu_b
+    model.materials[1].rho = rho_b
+
+    # Simply supported on all 4 edges
+    for nid, node in model.nodes.items():
+        if (abs(node.x) < 1e-5 or abs(node.x - L) < 1e-5 or
+                abs(node.y) < 1e-5 or abs(node.y - L) < 1e-5):
+            model.spc_conditions.append(WHTSPCEntry(nid, (2,)))
+    model.spc_conditions.append(WHTSPCEntry(0, (0, 1, 5)))
+
+    n_nodes = len(model.nodes)
+    n_elems = len(model.elements)
+    ndof    = n_nodes * 6
+
+    print(f"\n{'='*60}")
+    print(f"  Benchmark: {nx-1}x{ny-1} QUAD4 plate  "
+          f"({n_nodes} nodes / {n_elems} elems / ~{ndof} DOF)")
+    print(f"{'='*60}")
+    print(f"  {'Backend':>8}  {'K assemble [ms]':>16}  "
+          f"{'Modal solve [ms]':>16}  {'Total [ms]':>10}  Freq 1-5 [Hz]")
+    print(f"  {'-'*8}  {'-'*16}  {'-'*16}  {'-'*10}  {'-'*30}")
+
+    records = []
+    for backend in backends:
+        if backend == 'jax'   and not _jax_ok:
+            print(f"  {backend:>8}  [SKIP - JAX unavailable]")
+            continue
+        if backend == 'numba' and not _NUMBA_OK:
+            print(f"  {backend:>8}  [SKIP - Numba unavailable]")
+            continue
+
+        solver = WHTSolver(model, k_backend=backend)
+
+        # Warm-up call for Numba JIT (first call compiles)
+        if backend == 'numba':
+            _ = WHTSolver(runner.build_wht_model(*_mesh_plate(100, 100, 5, 5),
+                                                  'QUAD4', t_plate),
+                          k_backend='numba').solve_modal(num_modes=6)
+
+        # --- K assembly only ---
+        sorted_nids  = sorted(model.nodes.keys())
+        nid_to_idx   = {nid: i for i, nid in enumerate(sorted_nids)}
+        t0_k = time.perf_counter()
+        if backend == 'jax':
+            from wht_solver.wht_quad4_element_jax import K_quad4_jax as _K_jax
+            K_q = _K_jax(model, sorted_nids, nid_to_idx, None)
+        elif backend == 'numba':
+            from wht_solver.wht_quad4_element import K_quad4_scipy
+            K_q = K_quad4_scipy(model, sorted_nids, nid_to_idx, None, backend='numba')
+        else:
+            from wht_solver.wht_quad4_element import K_quad4_scipy
+            K_q = K_quad4_scipy(model, sorted_nids, nid_to_idx, None, backend='numpy')
+        t_k_ms = (time.perf_counter() - t0_k) * 1000.0
+
+        # --- full modal solve ---
+        t0_m = time.perf_counter()
+        result = solver.solve_modal(num_modes=10)
+        t_m_ms = (time.perf_counter() - t0_m) * 1000.0
+
+        freqs5 = result.frequencies[1:6]  # skip rigid-body mode 0
+        freq_str = "  ".join(f"{f:.1f}" for f in freqs5)
+
+        print(f"  {backend:>8}  {t_k_ms:>16.1f}  {t_m_ms:>16.1f}  "
+              f"{t_k_ms+t_m_ms:>10.1f}  {freq_str}")
+
+        records.append({
+            'backend':       backend,
+            'n_nodes':       n_nodes,
+            'n_elems':       n_elems,
+            'ndof':          ndof,
+            't_k_ms':        t_k_ms,
+            't_modal_ms':    t_m_ms,
+            't_total_ms':    t_k_ms + t_m_ms,
+            'frequencies':   result.frequencies[:10].tolist(),
+        })
+
+    return records
+
+
+def _run_backend(backend: str, etypes=('QUAD4', 'TRIA3')) -> List[TestResult]:
+    runner = PatchTestRunner(k_backend=backend)
+    results = []
+    for etype in etypes:
+        results += runner.test_3pt_bending(etype)
+        results += runner.test_membrane_uniaxial(etype)
+        results += runner.test_4pt_bending(etype)
+        results += runner.test_twisting(etype)
+        results += runner.test_frequency(etype)
+    return results
+
+
+def run_all_backends(backends=('jax', 'numpy', 'numba')) -> dict:
+    """
+    jax / numpy / numba 세 백엔드에 대해 전체 패치 테스트를 실행하고
+    결과를 비교 출력한다.
+
+    Returns
+    -------
+    dict[str, List[TestResult]]
+    """
+    from wht_solver.wht_quad4_element import _NUMBA_OK
+    try:
+        from wht_solver.wht_quad4_element_jax import K_quad4_jax  # noqa
+        _jax_ok = True
+    except Exception:
+        _jax_ok = False
+
+    all_results = {}
+    for backend in backends:
+        if backend == 'jax' and not _jax_ok:
+            print(f"\n[SKIP] backend=jax — JAX 미설치")
+            continue
+        if backend == 'numba' and not _NUMBA_OK:
+            print(f"\n[SKIP] backend=numba — Numba 미설치")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"  Backend: {backend.upper()}")
+        print(f"{'='*60}")
+        results = _run_backend(backend)
+        all_results[backend] = results
+
+        passed = sum(1 for r in results if r.passed)
+        total  = len(results)
+        for r in results:
+            status = "PASS" if r.passed else "FAIL"
+            print(f"  [{status}] {r.name} | {r.quantity} | {r.element_type}"
+                  f" | theory={r.theory:.4g}  fem={r.fem:.4g}  err={r.error_pct:.2f}%")
+        print(f"\n  결과: {passed}/{total} 통과")
+
+    # 백엔드 간 비교 요약
+    if len(all_results) > 1:
+        print(f"\n{'='*60}")
+        print("  백엔드 비교 요약")
+        print(f"{'='*60}")
+        ref_backend = next(iter(all_results))
+        ref = {(r.name, r.quantity, r.element_type): r for r in all_results[ref_backend]}
+        for backend, results in all_results.items():
+            if backend == ref_backend:
+                continue
+            max_diff = 0.0
+            for r in results:
+                key = (r.name, r.quantity, r.element_type)
+                if key in ref and abs(ref[key].theory) > 1e-15:
+                    diff = abs(r.fem - ref[key].fem) / abs(ref[key].fem) * 100
+                    max_diff = max(max_diff, diff)
+            print(f"  {ref_backend.upper()} vs {backend.upper()} 최대 편차: {max_diff:.4f}%")
+
+    return all_results
+
+
+if __name__ == '__main__':
+    run_all_backends()
+    run_benchmark()

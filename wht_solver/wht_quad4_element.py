@@ -136,7 +136,7 @@ def _element_K_mitc4_plus_np(c1, c2, c3, c4, t, E, nu, beta):
 
     K_loc = np.zeros((24, 24))
     K_drill = np.zeros((24, 24))
-    # gp = [-1.0/np.sqrt(3), 1.0/np.sqrt(3)]
+    gp = [-1.0/np.sqrt(3), 1.0/np.sqrt(3)]
 
     # Membrane locking fix: Selective Reduced Integration (SRI)
     Bm_0, Bb_0, detJ_0 = _get_mb_matrices(0.0, 0.0, coords_2d)
@@ -188,10 +188,24 @@ def _element_K_mitc4_plus_np(c1, c2, c3, c4, t, E, nu, beta):
             Kb_full += (Bb.T @ Db @ Bb) * detJ
             Ks_full += (Bs.T @ Ds @ Bs) * detJ
 
-    # Apply 5% stabilization for Hourglass control
-    alpha = 1e-4
-    Km_eff = Km_full
-    K_loc = Km_eff + Kb_full + Ks_full + K_drill
+    # Rigid Body Projection — JAX 버전과 동일 (membrane+drill spurious stiffness 제거)
+    coords = np.vstack([c1, c2, c3, c4])
+    coords_loc = (coords - coords[0]) @ T_mat.T
+
+    R_rbm = np.zeros((24, 6))
+    for i in range(4):
+        px, py, pz = coords_loc[i]
+        R_rbm[6*i+0, 0] = 1.0; R_rbm[6*i+1, 1] = 1.0; R_rbm[6*i+2, 2] = 1.0
+        R_rbm[6*i+0, 4] = pz;  R_rbm[6*i+0, 5] = -py
+        R_rbm[6*i+1, 3] = -pz; R_rbm[6*i+1, 5] = px
+        R_rbm[6*i+2, 3] = py;  R_rbm[6*i+2, 4] = -px
+        R_rbm[6*i+3, 3] = 1.0; R_rbm[6*i+4, 4] = 1.0; R_rbm[6*i+5, 5] = 1.0
+
+    Q, _ = np.linalg.qr(R_rbm)
+    P_proj = np.eye(24) - Q @ Q.T
+
+    K_md_proj = P_proj.T @ (Km_full + K_drill) @ P_proj
+    K_loc = K_md_proj + Kb_full + Ks_full
 
     T_24 = np.zeros((24, 24))
     for i in range(4):
@@ -472,11 +486,31 @@ def _element_K_mitc4_plus_nb(c1, c2, c3, c4, t, E, nu, beta):
                     Kb_full[i, j] += Kb[i, j] * detJ
                     Ks_full[i, j] += Ks[i, j] * detJ
 
-    alpha = 1e-4
+    # Rigid Body Projection — 3D local coords (pz non-zero for warped elements)
+    coords_pz = np.zeros(4)
+    coords_pz[1] = p2[0]*z_loc[0] + p2[1]*z_loc[1] + p2[2]*z_loc[2]
+    coords_pz[2] = p3[0]*z_loc[0] + p3[1]*z_loc[1] + p3[2]*z_loc[2]
+    coords_pz[3] = p4[0]*z_loc[0] + p4[1]*z_loc[1] + p4[2]*z_loc[2]
+    R_rbm = np.zeros((24, 6))
+    for i in range(4):
+        px = coords_2d[i, 0]
+        py = coords_2d[i, 1]
+        pz = coords_pz[i]
+        R_rbm[6*i+0, 0] = 1.0; R_rbm[6*i+1, 1] = 1.0; R_rbm[6*i+2, 2] = 1.0
+        R_rbm[6*i+0, 4] = pz;  R_rbm[6*i+0, 5] = -py
+        R_rbm[6*i+1, 3] = -pz; R_rbm[6*i+1, 5] = px
+        R_rbm[6*i+2, 3] = py;  R_rbm[6*i+2, 4] = -px
+        R_rbm[6*i+3, 3] = 1.0; R_rbm[6*i+4, 4] = 1.0; R_rbm[6*i+5, 5] = 1.0
+
+    Q, _ = np.linalg.qr(R_rbm)
+    P_proj = np.eye(24) - Q @ Q.T
+
+    K_md = Km_full + K_drill
+    K_md_proj = P_proj.T @ K_md @ P_proj
+
     for i in range(24):
         for j in range(24):
-            Km_eff = Km_1pt[i, j] + alpha * (Km_full[i, j] - Km_1pt[i, j])
-            K_loc[i, j] += Km_eff + Kb_full[i, j] + Ks_full[i, j] + K_drill[i, j]
+            K_loc[i, j] = K_md_proj[i, j] + Kb_full[i, j] + Ks_full[i, j]
 
     # ── 전역 좌표 변환 T_24ᵀ @ K_loc @ T_24 ──────────────────────────────
     T_24 = np.zeros((24, 24))
@@ -515,7 +549,17 @@ def _element_K_mitc4_plus(c1, c2, c3, c4, t, E, nu, beta=None):
 # 어셈블리
 # ─────────────────────────────────────────────────────────────────────────────
 
-def K_quad4_scipy(wht_model, sorted_nids, nid_to_idx, node_beta=None) -> csr_matrix:
+def K_quad4_scipy(wht_model, sorted_nids, nid_to_idx, node_beta=None, backend: str = 'auto') -> csr_matrix:
+    """backend: 'auto'(numba우선) | 'numpy' | 'numba'"""
+    if backend == 'numpy':
+        _elem_fn = _element_K_mitc4_plus_np
+    elif backend == 'numba':
+        if not _NUMBA_OK:
+            raise RuntimeError("Numba를 사용할 수 없습니다.")
+        _elem_fn = _element_K_mitc4_plus_nb
+    else:  # 'auto'
+        _elem_fn = _element_K_mitc4_plus
+
     ndof = len(sorted_nids) * 6
     rows, cols, data = [], [], []
     nid_arr = list(sorted_nids)
@@ -534,7 +578,7 @@ def K_quad4_scipy(wht_model, sorted_nids, nid_to_idx, node_beta=None) -> csr_mat
         else:
             elem_beta = np.ones(4) * 1e-4
 
-        K_e = _element_K_mitc4_plus(
+        K_e = _elem_fn(
             np.array(nid_to_crds[nids[0]]), np.array(nid_to_crds[nids[1]]),
             np.array(nid_to_crds[nids[2]]), np.array(nid_to_crds[nids[3]]),
             t, E, nu, elem_beta

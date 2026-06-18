@@ -72,10 +72,16 @@ class WHTSolver:
         self,
         model: "WHTMeshModel",
         stiffness_scale: float = 1e3,
+        k_backend: str = 'auto',
+        fold_alpha: float = 0.0,
+        fold_phi_min_deg: float = 3.0,
     ):
-        self.model           = model
-        self.stiffness_scale = stiffness_scale
-        self._jax_model      = None   # lazy build
+        self.model            = model
+        self.stiffness_scale  = stiffness_scale
+        self.k_backend        = k_backend        # 'auto' | 'jax' | 'numpy' | 'numba'
+        self._fold_alpha       = fold_alpha       # 0 = disabled; >0 = hinge spring scale
+        self._fold_phi_min_deg = fold_phi_min_deg # minimum fold angle to add spring
+        self._jax_model       = None   # lazy build
 
     # ------------------------------------------------------------------
     # Public API
@@ -451,13 +457,23 @@ class WHTSolver:
         # 꺾임각 연동 드릴링 강성 조율을 위한 노드별 beta 계산 및 전달
         node_beta = self._compute_folding_angles(sorted_nids, nid_to_idx)
 
-        if _JAX_VMAP_OK:
+        use_jax = (self.k_backend == 'auto' and _JAX_VMAP_OK) or self.k_backend == 'jax'
+        if use_jax:
             K_q = _K_quad4_jax(self.model, sorted_nids, nid_to_idx, node_beta)
         else:
-            K_q = K_quad4_scipy(self.model, sorted_nids, nid_to_idx, node_beta)
+            scipy_backend = self.k_backend if self.k_backend in ('numpy', 'numba') else 'auto'
+            K_q = K_quad4_scipy(self.model, sorted_nids, nid_to_idx, node_beta, backend=scipy_backend)
         K_t = K_tria3_scipy(self.model, sorted_nids, nid_to_idx)
         K_out = K_out + K_q + K_t
         print(f"    - [Assembly] Stiffness Audit: {K_q.nnz} non-zeros from shells.")
+
+        # Fold-line hinge spring (disabled when fold_alpha=0)
+        if self._fold_alpha > 0.0:
+            K_out = self._add_fold_hinge_stiffness(
+                K_out, sorted_nids, nid_to_idx,
+                alpha=self._fold_alpha,
+                phi_min_deg=self._fold_phi_min_deg,
+            )
 
         if stabilize:
             # [WHT] AUTOSPC: Automatically patch zero or near-zero diagonal stiffness DOFs
@@ -912,6 +928,131 @@ class WHTSolver:
             sin_val = np.sqrt(max(0.0, 1.0 - min_dot**2))
             amplified_factor = np.tanh(15.0 * sin_val)
             beta[idx] = 1e-4 + (1.0 - 1e-4) * amplified_factor
-            
+
         return beta
+
+    def _add_fold_hinge_stiffness(
+        self,
+        K: "csr_matrix",
+        sorted_nids: List[int],
+        nid_to_idx: Dict[int, int],
+        alpha: float = 1.0,
+        phi_min_deg: float = 3.0,
+    ) -> "csr_matrix":
+        """
+        Add torsional hinge spring stiffness along fold-line edges.
+
+        For each shared edge between two adjacent shell elements with dihedral
+        angle φ > phi_min_deg, a torsional spring is added between the two
+        edge nodes that resists relative rotation about the fold axis e_hat.
+
+        Spring stiffness per edge:
+            k = alpha * D_avg * sin²(φ)   [N·mm/rad]
+
+        where D_avg = E*t³/(12*(1-ν²)) is the average plate bending stiffness.
+
+        Assembled as a torsional beam into global rotational DOFs [rx,ry,rz]
+        of the two edge nodes:
+            K_rot = k * [[ e⊗e, -e⊗e],
+                         [-e⊗e,  e⊗e]]   (6×6 block)
+
+        Parameters
+        ----------
+        K           : assembled shell K (CSR, ndof×ndof)
+        alpha       : calibration factor  (tune against reference)
+        phi_min_deg : minimum fold angle in degrees to activate spring
+        """
+        from scipy.sparse import coo_matrix
+
+        ndof    = K.shape[0]
+        phi_min = np.deg2rad(phi_min_deg)
+        nodes_arr = self.model.nodes_array()
+
+        def _elem_data(elem):
+            prop = self.model.properties.get(elem.pid)
+            mat  = self.model.materials.get(prop.mid) if prop else None
+            t    = prop.t  if (prop and hasattr(prop, 't')) else 1.0
+            E    = mat.E   if mat else 210000.0
+            nu   = mat.nu  if mat else 0.3
+            idx  = [nid_to_idx[n] for n in elem.node_ids]
+            c    = nodes_arr[idx]
+            if elem.type.upper() in ('QUAD4', 'QUAD'):
+                v1, v2 = c[2] - c[0], c[3] - c[1]
+            else:
+                v1, v2 = c[1] - c[0], c[2] - c[0]
+            n    = np.cross(v1, v2)
+            nm   = np.linalg.norm(n)
+            n    = n / nm if nm > 1e-12 else np.array([0., 0., 1.])
+            return n, E, nu, t
+
+        # Build edge → [elem, elem] adjacency
+        edge_to_elems: dict = {}
+        for elem in self.model.elements.values():
+            if elem.type.upper() not in ('QUAD4', 'QUAD', 'TRIA3', 'TRIA'):
+                continue
+            nids = elem.node_ids
+            ne   = len(nids)
+            for k in range(ne):
+                edge = frozenset((nids[k], nids[(k + 1) % ne]))
+                edge_to_elems.setdefault(edge, []).append(elem)
+
+        rows, cols, vals = [], [], []
+        n_springs = 0
+
+        for edge, elems in edge_to_elems.items():
+            if len(elems) != 2:
+                continue
+
+            n_A, E_A, nu_A, t_A = _elem_data(elems[0])
+            n_B, E_B, nu_B, t_B = _elem_data(elems[1])
+
+            dot     = float(np.clip(np.dot(n_A, n_B), -1.0, 1.0))
+            sin_phi = np.sqrt(max(0.0, 1.0 - dot * dot))
+            phi     = np.arcsin(sin_phi)
+            if phi < phi_min:
+                continue
+
+            na, nb = tuple(edge)
+            ia, ib = nid_to_idx[na], nid_to_idx[nb]
+            pa, pb = nodes_arr[ia], nodes_arr[ib]
+            ev     = pb - pa
+            L_edge = np.linalg.norm(ev)
+            if L_edge < 1e-12:
+                continue
+            e_hat = ev / L_edge
+
+            E_avg  = 0.5 * (E_A + E_B)
+            nu_avg = 0.5 * (nu_A + nu_B)
+            t_avg  = 0.5 * (t_A + t_B)
+            D_avg  = E_avg * t_avg**3 / (12.0 * (1.0 - nu_avg**2))
+
+            k_spring = alpha * D_avg * sin_phi**2  # N·mm/rad
+
+            ee  = np.outer(e_hat, e_hat)   # 3×3 outer product
+            r_a = 6 * ia + 3               # first rotational DOF of node ia
+            r_b = 6 * ib + 3
+
+            for di in range(3):
+                for dj in range(3):
+                    v = k_spring * ee[di, dj]
+                    if abs(v) < 1e-30:
+                        continue
+                    # diagonal blocks: +v
+                    rows += [r_a + di, r_b + di]
+                    cols += [r_a + dj, r_b + dj]
+                    vals += [v, v]
+                    # off-diagonal blocks: -v
+                    rows += [r_a + di, r_b + di]
+                    cols += [r_b + dj, r_a + dj]
+                    vals += [-v, -v]
+
+            n_springs += 1
+
+        if rows:
+            K_h = coo_matrix((vals, (rows, cols)), shape=(ndof, ndof)).tocsr()
+            K   = K + K_h
+
+        print(f"    - [FoldHinge] {n_springs} fold springs added "
+              f"(phi_min={phi_min_deg}°, alpha={alpha:.4f})")
+        return K
 
