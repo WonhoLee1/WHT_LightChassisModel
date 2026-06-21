@@ -138,17 +138,32 @@ def _element_K_mitc4_plus_np(c1, c2, c3, c4, t, E, nu, beta):
     K_drill = np.zeros((24, 24))
     gp = [-1.0/np.sqrt(3), 1.0/np.sqrt(3)]
 
-    # Membrane locking fix: Selective Reduced Integration (SRI)
-    Bm_0, Bb_0, detJ_0 = _get_mb_matrices(0.0, 0.0, coords_2d)
-    Km_1pt = (Bm_0.T @ Dm @ Bm_0) * (4.0 * detJ_0)
-    
+    # ── MITC4+ 막 타잉 사전 계산 (Ko-Lee-Bathe 2016) ──────────────────────
+    _c = coords_2d
+    X_R = 0.25*np.array([-_c[0,0]+_c[1,0]+_c[2,0]-_c[3,0],
+                          -_c[0,1]+_c[1,1]+_c[2,1]-_c[3,1]])
+    X_S = 0.25*np.array([-_c[0,0]-_c[1,0]+_c[2,0]+_c[3,0],
+                          -_c[0,1]-_c[1,1]+_c[2,1]+_c[3,1]])
+    X_D = 0.25*np.array([ _c[0,0]-_c[1,0]+_c[2,0]-_c[3,0],
+                           _c[0,1]-_c[1,1]+_c[2,1]-_c[3,1]])
+    det_RS = X_R[0]*X_S[1] - X_R[1]*X_S[0]
+    c_r_m = (X_D[0]*X_S[1] - X_D[1]*X_S[0]) / (det_RS + 1e-300)
+    c_s_m = (X_D[1]*X_R[0] - X_D[0]*X_R[1]) / (det_RS + 1e-300)
+    d_m   = c_r_m**2 + c_s_m**2 - 1.0
+    _use_m4p = (abs(d_m) > 1e-10) and (abs(det_RS) > 1e-12)
+    BmA, _, _ = _get_mb_matrices(0.0,  1.0, coords_2d); BmA_exx = BmA[0, :]
+    BmB, _, _ = _get_mb_matrices(0.0, -1.0, coords_2d); BmB_exx = BmB[0, :]
+    BmC, _, _ = _get_mb_matrices( 1.0, 0.0, coords_2d); BmC_eyy = BmC[1, :]
+    BmD, _, _ = _get_mb_matrices(-1.0, 0.0, coords_2d); BmD_eyy = BmD[1, :]
+    BmE, _, _ = _get_mb_matrices(0.0,  0.0, coords_2d); BmE_exy = BmE[2, :]
+
     Km_full = np.zeros((24, 24))
     Kb_full = np.zeros((24, 24))
     Ks_full = np.zeros((24, 24))
 
     for xi_g in gp:
         for eta_g in gp:
-            Bm, Bb, detJ = _get_mb_matrices(xi_g, eta_g, coords_2d)
+            Bm_std, Bb, detJ = _get_mb_matrices(xi_g, eta_g, coords_2d)
 
             N_list = _get_shape_functions(xi_g, eta_g)
             dN_dxi, dN_deta = _get_shape_derivatives(xi_g, eta_g)
@@ -184,6 +199,27 @@ def _element_K_mitc4_plus_np(c1, c2, c3, c4, t, E, nu, beta):
 
             Bs = np.vstack([Bs13, Bs23])
 
+            if _use_m4p:
+                R_, S_ = xi_g, eta_g
+                a_A_ = c_r_m*(c_r_m-1.0)/(2.0*d_m); a_B_ = c_r_m*(c_r_m+1.0)/(2.0*d_m)
+                a_C_ = c_s_m*(c_s_m-1.0)/(2.0*d_m); a_D_ = c_s_m*(c_s_m+1.0)/(2.0*d_m)
+                a_E_ = 2.0*c_r_m*c_s_m/d_m
+                Bm = np.zeros((3, 24))
+                Bm[0] = ((0.5*(1-2*a_A_+S_+2*a_A_*S_**2))*BmA_exx
+                        +(0.5*(1-2*a_B_-S_+2*a_B_*S_**2))*BmB_exx
+                        +a_C_*(-1+S_**2)*BmC_eyy + a_D_*(-1+S_**2)*BmD_eyy
+                        +a_E_*(-1+S_**2)*BmE_exy)
+                Bm[1] = (a_A_*(-1+R_**2)*BmA_exx + a_B_*(-1+R_**2)*BmB_exx
+                        +(0.5*(1-2*a_C_+R_+2*a_C_*R_**2))*BmC_eyy
+                        +(0.5*(1-2*a_D_-R_+2*a_D_*R_**2))*BmD_eyy
+                        +a_E_*(-1+R_**2)*BmE_exy)
+                Bm[2] = (0.25*(R_+4*a_A_*R_*S_)*BmA_exx
+                        +0.25*(-R_+4*a_B_*R_*S_)*BmB_exx
+                        +0.25*(S_+4*a_C_*R_*S_)*BmC_eyy
+                        +0.25*(-S_+4*a_D_*R_*S_)*BmD_eyy
+                        +(1+a_E_*R_*S_)*BmE_exy)
+            else:
+                Bm = Bm_std
             Km_full += (Bm.T @ Dm @ Bm) * detJ
             Kb_full += (Bb.T @ Db @ Bb) * detJ
             Ks_full += (Bs.T @ Ds @ Bs) * detJ
@@ -290,6 +326,70 @@ def _nb_Bs13(xi, eta, coords):
         Bs[6*i + 2] = dN_dx[i]
         Bs[6*i + 4] = N[i]
     return Bs
+
+@_njit(cache=True)
+def _nb_dN_dx_dy_only(xi, eta, coords):
+    """(xi, eta)에서 dN/dx, dN/dy만 반환 (Jacobian 포함)."""
+    dN_dxi, dN_deta = _nb_shape_dN(xi, eta)
+    J = _nb_jacobian(dN_dxi, dN_deta, coords)
+    invJ, _ = _nb_inv2x2(J)
+    dN_dx = np.empty(4)
+    dN_dy = np.empty(4)
+    for k in range(4):
+        dN_dx[k] = invJ[0,0]*dN_dxi[k] + invJ[0,1]*dN_deta[k]
+        dN_dy[k] = invJ[1,0]*dN_dxi[k] + invJ[1,1]*dN_deta[k]
+    return dN_dx, dN_dy
+
+
+@_njit(cache=True)
+def _nb_Bm_rows_at(xi, eta, coords):
+    """(xi, eta)에서 막 B 행렬의 세 행: exx(24,), eyy(24,), exy(24,)."""
+    dN_dx, dN_dy = _nb_dN_dx_dy_only(xi, eta, coords)
+    exx = np.zeros(24)
+    eyy = np.zeros(24)
+    exy = np.zeros(24)
+    for i in range(4):
+        exx[6*i]     = dN_dx[i]
+        eyy[6*i + 1] = dN_dy[i]
+        exy[6*i]     = dN_dy[i]
+        exy[6*i + 1] = dN_dx[i]
+    return exx, eyy, exy
+
+
+@_njit(cache=True)
+def _nb_Bm_mitc4plus_assemble(R, S, BmA_exx, BmB_exx, BmC_eyy, BmD_eyy, BmE_exy,
+                               c_r, c_s, d):
+    """Ko-Lee-Bathe (2016) Eqn 27a/b/c: MITC4+ 막 B 행렬 조립 (3×24).
+
+    |d| < 1e-10인 특이 케이스는 호출 전에 검사하여 표준 B로 대체할 것.
+    """
+    a_A = c_r * (c_r - 1.0) / (2.0 * d)
+    a_B = c_r * (c_r + 1.0) / (2.0 * d)
+    a_C = c_s * (c_s - 1.0) / (2.0 * d)
+    a_D = c_s * (c_s + 1.0) / (2.0 * d)
+    a_E = 2.0 * c_r * c_s / d
+    Bm = np.zeros((3, 24))
+    for k in range(24):
+        # Eqn 27a: exx
+        Bm[0, k] = (0.5*(1.0 - 2.0*a_A + S + 2.0*a_A*S*S)) * BmA_exx[k] \
+                 + (0.5*(1.0 - 2.0*a_B - S + 2.0*a_B*S*S)) * BmB_exx[k] \
+                 + a_C*(-1.0 + S*S) * BmC_eyy[k] \
+                 + a_D*(-1.0 + S*S) * BmD_eyy[k] \
+                 + a_E*(-1.0 + S*S) * BmE_exy[k]
+        # Eqn 27b: eyy
+        Bm[1, k] = a_A*(-1.0 + R*R) * BmA_exx[k] \
+                 + a_B*(-1.0 + R*R) * BmB_exx[k] \
+                 + (0.5*(1.0 - 2.0*a_C + R + 2.0*a_C*R*R)) * BmC_eyy[k] \
+                 + (0.5*(1.0 - 2.0*a_D - R + 2.0*a_D*R*R)) * BmD_eyy[k] \
+                 + a_E*(-1.0 + R*R) * BmE_exy[k]
+        # Eqn 27c: exy
+        Bm[2, k] = 0.25*(R + 4.0*a_A*R*S) * BmA_exx[k] \
+                 + 0.25*(-R + 4.0*a_B*R*S) * BmB_exx[k] \
+                 + 0.25*(S + 4.0*a_C*R*S) * BmC_eyy[k] \
+                 + 0.25*(-S + 4.0*a_D*R*S) * BmD_eyy[k] \
+                 + (1.0 + a_E*R*S) * BmE_exy[k]
+    return Bm
+
 
 @_njit(cache=True)
 def _nb_Bs23(xi, eta, coords):
@@ -412,21 +512,25 @@ def _element_K_mitc4_plus_nb(c1, c2, c3, c4, t, E, nu, beta):
     K_loc   = np.zeros((24, 24))
     K_drill = np.zeros((24, 24))
 
-    # Membrane locking fix: Selective Reduced Integration (SRI)
-    dN_dxi_0, dN_deta_0 = _nb_shape_dN(0.0, 0.0)
-    J_0 = _nb_jacobian(dN_dxi_0, dN_deta_0, coords_2d)
-    invJ_0, detJ_0 = _nb_inv2x2(J_0)
-    dN_dx_0 = np.empty(4)
-    dN_dy_0 = np.empty(4)
-    for k in range(4):
-        dN_dx_0[k] = invJ_0[0,0]*dN_dxi_0[k] + invJ_0[0,1]*dN_deta_0[k]
-        dN_dy_0[k] = invJ_0[1,0]*dN_dxi_0[k] + invJ_0[1,1]*dN_deta_0[k]
-    Bm_0, _ = _nb_Bm_Bb(dN_dx_0, dN_dy_0)
-    Km_1pt_loc = _nb_BtDB(Bm_0, Dm)
-    Km_1pt = np.zeros((24, 24))
-    for i in range(24):
-        for j in range(24):
-            Km_1pt[i, j] = Km_1pt_loc[i, j] * (4.0 * detJ_0)
+    # ── MITC4+ 막 타잉 사전 계산 (Ko-Lee-Bathe 2016, Eqn 11, 24) ──────────────
+    # 특성 기하 벡터: 노드 (xi, eta) = [(-1,-1),(1,-1),(1,1),(-1,1)]
+    X_Rx = 0.25*(-coords_2d[0,0] + coords_2d[1,0] + coords_2d[2,0] - coords_2d[3,0])
+    X_Ry = 0.25*(-coords_2d[0,1] + coords_2d[1,1] + coords_2d[2,1] - coords_2d[3,1])
+    X_Sx = 0.25*(-coords_2d[0,0] - coords_2d[1,0] + coords_2d[2,0] + coords_2d[3,0])
+    X_Sy = 0.25*(-coords_2d[0,1] - coords_2d[1,1] + coords_2d[2,1] + coords_2d[3,1])
+    X_Dx = 0.25*( coords_2d[0,0] - coords_2d[1,0] + coords_2d[2,0] - coords_2d[3,0])
+    X_Dy = 0.25*( coords_2d[0,1] - coords_2d[1,1] + coords_2d[2,1] - coords_2d[3,1])
+    det_RS = X_Rx*X_Sy - X_Ry*X_Sx
+    c_r_m = (X_Dx*X_Sy - X_Dy*X_Sx) / (det_RS + 1e-300)
+    c_s_m = (X_Dy*X_Rx - X_Dx*X_Ry) / (det_RS + 1e-300)
+    d_m   = c_r_m*c_r_m + c_s_m*c_s_m - 1.0
+    _use_mitc4p = (abs(d_m) > 1e-10) and (abs(det_RS) > 1e-12)
+    # 5개 타잉점 B 행 사전 계산 (A=(0,1), B=(0,-1), C=(1,0), D=(-1,0), E=(0,0))
+    BmA_exx, _dummy, _dummy2 = _nb_Bm_rows_at(0.0,  1.0, coords_2d)
+    BmB_exx, _dummy, _dummy2 = _nb_Bm_rows_at(0.0, -1.0, coords_2d)
+    _dummy, BmC_eyy, _dummy2 = _nb_Bm_rows_at( 1.0, 0.0, coords_2d)
+    _dummy, BmD_eyy, _dummy2 = _nb_Bm_rows_at(-1.0, 0.0, coords_2d)
+    _dummy, _dummy2, BmE_exy = _nb_Bm_rows_at(0.0,  0.0, coords_2d)
 
     Km_full = np.zeros((24, 24))
     Kb_full = np.zeros((24, 24))
@@ -452,7 +556,15 @@ def _element_K_mitc4_plus_nb(c1, c2, c3, c4, t, E, nu, beta):
                 dN_dx[k] = invJ[0,0]*dN_dxi[k] + invJ[0,1]*dN_deta[k]
                 dN_dy[k] = invJ[1,0]*dN_dxi[k] + invJ[1,1]*dN_deta[k]
 
-            Bm, Bb = _nb_Bm_Bb(dN_dx, dN_dy)
+            # MITC4+ 막 B 행렬 (왜곡 요소) 또는 표준 B (직사각 요소)
+            if _use_mitc4p:
+                Bm = _nb_Bm_mitc4plus_assemble(
+                    xi_g, eta_g,
+                    BmA_exx, BmB_exx, BmC_eyy, BmD_eyy, BmE_exy,
+                    c_r_m, c_s_m, d_m)
+            else:
+                Bm, _ = _nb_Bm_Bb(dN_dx, dN_dy)
+            _, Bb = _nb_Bm_Bb(dN_dx, dN_dy)
 
             # Drilling B (1×24 → 벡터로 처리)
             N = _nb_shape_N(xi_g, eta_g)

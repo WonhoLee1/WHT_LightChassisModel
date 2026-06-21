@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">
+	<Collection>
+		<DataSet file="ccx_modal.01.vtu" timestep="0.0"/>
+		<DataSet file="ccx_modal.02.vtu" timestep="0.0"/>
+		<DataSet file="ccx_modal.03.vtu" timestep="0.0"/>
+		<DataSet file="ccx_modal.04.vtu" timestep="0.00722037"/>
+		<DataSet file="ccx_modal.05.vtu" timestep="0.00741376"/>
+		<DataSet file="ccx_modal.06.vtu" timestep="0.00882311"/>
+		<DataSet file="ccx_modal.07.vtu" timestep="0.825956"/>
+		<DataSet file="ccx_modal.08.vtu" timestep="2.231117561"/>
+		<DataSet file="ccx_modal.09.vtu" timestep="4.221225834"/>
+		<DataSet file="ccx_modal.10.vtu" timestep="5.465963534"/>
+		<DataSet file="ccx_modal.11.vtu" timestep="6.378528048"/>
+		<DataSet file="ccx_modal.12.vtu" timestep="8.265732301"/>
+		<DataSet file="ccx_modal.13.vtu" timestep="9.760401279"/>
+		<DataSet file="ccx_modal.14.vtu" timestep="11.00021079"/>
+		<DataSet file="ccx_modal.15.vtu" timestep="11.4471843"/>
+		<DataSet file="ccx_modal.16.vtu" timestep="14.71276433"/>
+		<DataSet file="ccx_modal.17.vtu" timestep="15.78937684"/>
+		<DataSet file="ccx_modal.18.vtu" timestep="17.18652338"/>
+		<DataSet file="ccx_modal.19.vtu" timestep="18.39342031"/>
+		<DataSet file="ccx_modal.20.vtu" timestep="19.24439352"/>
+		<DataSet file="ccx_modal.21.vtu" timestep="21.23994389"/>
+		<DataSet file="ccx_modal.22.vtu" timestep="22.63391648"/>
+		<DataSet file="ccx_modal.23.vtu" timestep="23.46120018"/>
+		<DataSet file="ccx_modal.24.vtu" timestep="24.01845898"/>
+		<DataSet file="ccx_modal.25.vtu" timestep="28.03545623"/>
+		<DataSet file="ccx_modal.26.vtu" timestep="28.29538559"/>
+	</Collection>
+</VTKFile>

@@ -112,19 +112,33 @@ def _element_K_mitc4_plus_jax(c1, c2, c3, c4, t, E, nu, beta):
     K_loc = jnp.zeros((24, 24))
     K_drill = jnp.zeros((24, 24))
     gp = jnp.array([-1.0/jnp.sqrt(3), 1.0/jnp.sqrt(3)])
-    # Ktt = 1.0 * G * t 
 
-    # Membrane locking fix: Selective Reduced Integration (SRI)
-    Bm_0, Bb_0, detJ_0 = _get_mb_matrices(0.0, 0.0, coords_2d)
-    Km_1pt = (Bm_0.T @ Dm @ Bm_0) * (4.0 * detJ_0)
-    
+    # ── MITC4+ 막 타잉 사전 계산 (Ko-Lee-Bathe 2016) ──────────────────────
+    _c = coords_2d
+    X_R = 0.25*jnp.array([-_c[0,0]+_c[1,0]+_c[2,0]-_c[3,0],
+                           -_c[0,1]+_c[1,1]+_c[2,1]-_c[3,1]])
+    X_S = 0.25*jnp.array([-_c[0,0]-_c[1,0]+_c[2,0]+_c[3,0],
+                           -_c[0,1]-_c[1,1]+_c[2,1]+_c[3,1]])
+    X_D = 0.25*jnp.array([ _c[0,0]-_c[1,0]+_c[2,0]-_c[3,0],
+                            _c[0,1]-_c[1,1]+_c[2,1]-_c[3,1]])
+    det_RS = X_R[0]*X_S[1] - X_R[1]*X_S[0]
+    c_r_m = (X_D[0]*X_S[1] - X_D[1]*X_S[0]) / (det_RS + 1e-300)
+    c_s_m = (X_D[1]*X_R[0] - X_D[0]*X_R[1]) / (det_RS + 1e-300)
+    d_m   = c_r_m**2 + c_s_m**2 - 1.0
+    # 5개 타잉점 B 행 (jit 호환: 항상 계산, 선택은 jnp.where)
+    BmA_full, _, _ = _get_mb_matrices(0.0,  1.0, coords_2d); BmA_exx = BmA_full[0, :]
+    BmB_full, _, _ = _get_mb_matrices(0.0, -1.0, coords_2d); BmB_exx = BmB_full[0, :]
+    BmC_full, _, _ = _get_mb_matrices( 1.0, 0.0, coords_2d); BmC_eyy = BmC_full[1, :]
+    BmD_full, _, _ = _get_mb_matrices(-1.0, 0.0, coords_2d); BmD_eyy = BmD_full[1, :]
+    BmE_full, _, _ = _get_mb_matrices(0.0,  0.0, coords_2d); BmE_exy = BmE_full[2, :]
+
     Km_full = jnp.zeros((24, 24))
     Kb_full = jnp.zeros((24, 24))
     Ks_full = jnp.zeros((24, 24))
 
     for xi_g in gp:
         for eta_g in gp:
-            Bm, Bb, detJ_mb = _get_mb_matrices(xi_g, eta_g, coords_2d)
+            Bm_std, Bb, detJ_mb = _get_mb_matrices(xi_g, eta_g, coords_2d)
             
             N_list = _get_shape_functions(xi_g, eta_g)
             dN_dxi, dN_deta = _get_shape_derivatives(xi_g, eta_g)
@@ -162,13 +176,35 @@ def _element_K_mitc4_plus_jax(c1, c2, c3, c4, t, E, nu, beta):
             
             Bs = jnp.vstack([Bs13, Bs23])
             
+            # MITC4+ 막 B: jnp.where로 왜곡/직사각 케이스 선택 (jit 호환)
+            R_, S_ = xi_g, eta_g
+            a_A_ = c_r_m*(c_r_m-1.0)/(2.0*d_m + 1e-300)
+            a_B_ = c_r_m*(c_r_m+1.0)/(2.0*d_m + 1e-300)
+            a_C_ = c_s_m*(c_s_m-1.0)/(2.0*d_m + 1e-300)
+            a_D_ = c_s_m*(c_s_m+1.0)/(2.0*d_m + 1e-300)
+            a_E_ = 2.0*c_r_m*c_s_m/(d_m + 1e-300)
+            bm_row0 = ((0.5*(1-2*a_A_+S_+2*a_A_*S_**2))*BmA_exx
+                      +(0.5*(1-2*a_B_-S_+2*a_B_*S_**2))*BmB_exx
+                      +a_C_*(-1+S_**2)*BmC_eyy + a_D_*(-1+S_**2)*BmD_eyy
+                      +a_E_*(-1+S_**2)*BmE_exy)
+            bm_row1 = (a_A_*(-1+R_**2)*BmA_exx + a_B_*(-1+R_**2)*BmB_exx
+                      +(0.5*(1-2*a_C_+R_+2*a_C_*R_**2))*BmC_eyy
+                      +(0.5*(1-2*a_D_-R_+2*a_D_*R_**2))*BmD_eyy
+                      +a_E_*(-1+R_**2)*BmE_exy)
+            bm_row2 = (0.25*(R_+4*a_A_*R_*S_)*BmA_exx
+                      +0.25*(-R_+4*a_B_*R_*S_)*BmB_exx
+                      +0.25*(S_+4*a_C_*R_*S_)*BmC_eyy
+                      +0.25*(-S_+4*a_D_*R_*S_)*BmD_eyy
+                      +(1+a_E_*R_*S_)*BmE_exy)
+            Bm_m4p = jnp.stack([bm_row0, bm_row1, bm_row2])
+            use_m4p = (jnp.abs(d_m) > 1e-10) & (jnp.abs(det_RS) > 1e-12)
+            Bm = jnp.where(use_m4p, Bm_m4p, Bm_std)
+
             Km_full += valid_mask * ((Bm.T @ Dm @ Bm) * detJ_mb)
             Kb_full += valid_mask * ((Bb.T @ Db @ Bb) * detJ_mb)
             Ks_full += valid_mask * ((Bs.T @ Ds @ Bs) * detJ_mb)
 
-    alpha = 1e-4
-    Km_eff = Km_full
-    K_md = Km_eff + K_drill
+    K_md = Km_full + K_drill
 
     # [WHT] Exact Rigid Body Projection for Warped Elements
     coords = jnp.vstack([c1, c2, c3, c4])

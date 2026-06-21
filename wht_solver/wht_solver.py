@@ -32,6 +32,20 @@ try:
 except Exception:
     _JAX_VMAP_OK = False
 
+try:
+    from pypardiso import PyPardisoSolver
+    _PARDISO_OK = True
+    
+    _GLOBAL_PARDISO_SOLVERS = {}
+    def get_global_pardiso_solver(mtype=11):
+        global _GLOBAL_PARDISO_SOLVERS
+        if mtype not in _GLOBAL_PARDISO_SOLVERS:
+            _GLOBAL_PARDISO_SOLVERS[mtype] = PyPardisoSolver(mtype=mtype)
+        return _GLOBAL_PARDISO_SOLVERS[mtype]
+except ImportError:
+    _PARDISO_OK = False
+    get_global_pardiso_solver = None
+
 
 def _arpack_subprocess_worker(K, M_diag, k, sigma, maxiter, result_queue, tol=1e-5):
     """Isolated worker to run ARPACK and report results or errors back to parent.
@@ -54,6 +68,63 @@ def _arpack_subprocess_worker(K, M_diag, k, sigma, maxiter, result_queue, tol=1e
         M_op = diags([M_diag], [0], format='csc')
         
         vals, vecs = eigsh(K, k=k, M=M_op, which="LM", sigma=sigma, tol=tol, maxiter=maxiter)
+        result_queue.put((vals, vecs))
+    except Exception as ex:
+        result_queue.put(ex)
+
+
+def _pardiso_arpack_subprocess_worker(K, M_diag, k, sigma, maxiter, result_queue, tol=1e-5, mtype=11):
+    """Isolated worker to run PARDISO + ARPACK on Windows to prevent deadlocks and GIL/OpenMP thread hangs."""
+    import os
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    
+    try:
+        import numpy as np
+        from scipy.sparse import diags
+        from scipy.sparse.linalg import eigsh, LinearOperator
+        from pypardiso import PyPardisoSolver
+        
+        M_op = diags([M_diag], [0], format='csr')
+        A_free = K - sigma * M_op
+        A_free = A_free.tocsr()
+        
+        mtype = 11
+        ps = PyPardisoSolver(mtype=mtype)
+        
+        # 4코어 최적 iparm 적용 (iparm[0]=0 디폴트 유지하여 충돌 방지)
+        ps.set_iparm(2, 3)    # iparm[1] = 3 (Parallel Metis fill-in reducing)
+        ps.set_iparm(3, 0)    # iparm[2] = 0 (reserved)
+        ps.set_iparm(4, 4)    # iparm[3] = 4 (CGS preconditioner for CRC)
+        ps.set_iparm(8, 2)    # iparm[7] = 2 (iterative refinement steps)
+        ps.set_iparm(10, 13)  # iparm[9] = 13 (pivot perturbation)
+        ps.set_iparm(11, 1)   # iparm[10] = 1 (scaling on)
+        ps.set_iparm(13, 1)   # iparm[12] = 1 (matching on for unsymmetric)
+        ps.set_iparm(24, 1)   # iparm[23] = 1 (parallel factorization ON)
+        ps.set_iparm(60, 0)   # iparm[59] = 0 (in-core)
+        ps.set_iparm(61, 0)   # iparm[60] = 0
+        ps.set_iparm(62, 0)   # iparm[61] = 0
+        
+        ps.factorize(A_free)
+        ps.set_phase(33)
+        
+        def op_inv_fn(x):
+            if not x.flags.f_contiguous:
+                x = np.asfortranarray(x)
+            if x.dtype != np.float64:
+                x = x.astype(np.float64)
+            return ps._call_pardiso(A_free, x)
+            
+        OPinv = LinearOperator(A_free.shape, matvec=op_inv_fn, dtype=A_free.dtype)
+        
+        vals, vecs = eigsh(K, k=k, M=M_op, which="LM", sigma=sigma, OPinv=OPinv, tol=tol, maxiter=maxiter)
+        
+        try:
+            ps.free_memory(everything=True)
+        except:
+            pass
+            
         result_queue.put((vals, vecs))
     except Exception as ex:
         result_queue.put(ex)
@@ -138,7 +209,7 @@ class WHTSolver:
         unknown_id = np.array(jm.unknown_id, dtype=np.int64)
         actual_modes = min(num_modes, len(unknown_id) - 1)
         
-        K_free = K_scipy[unknown_id, :][:, unknown_id].tocsc()
+        K_free = K_scipy[unknown_id, :][:, unknown_id].tocsr()
         M_free = M_all[unknown_id]
         ndof_free = len(unknown_id)
         
@@ -151,7 +222,7 @@ class WHTSolver:
         r_start = time.time()
         perm = reverse_cuthill_mckee(K_free, symmetric_mode=True)
         rev_perm = np.argsort(perm)
-        K_free_rcm = K_free[perm, :][:, perm].tocsc()
+        K_free_rcm = K_free[perm, :][:, perm].tocsr()
         M_free_rcm = M_free[perm]
         print(f" Done ({time.time()-r_start:.2f}s)", flush=True)
 
@@ -163,6 +234,60 @@ class WHTSolver:
             print(f"    - Applying Frequency Shift: {shift_hz} Hz (sigma: {sigma_val:.2f})")
 
         # [WHT] Multi-Stage Hybrid Solver Chain (Optimized for JAX & Stability)
+        if method in ('pardiso', 'pardiso_unsym') or (method == 'auto' and _PARDISO_OK):
+            if not _PARDISO_OK:
+                raise ImportError("pypardiso is not installed in the environment.")
+            
+            # Windows stability: crash 예방을 위해 mtype=11 (비대칭) 고정 사용
+            mtype = 11
+                
+            from scipy.sparse import diags
+            from scipy.sparse.linalg import eigsh, LinearOperator
+            print(f"    - [Stage PARDISO] mtype={mtype} with shift {sigma_val} (Direct)...", flush=True)
+            try:
+                M_op = diags([M_free_rcm], [0], format='csr')
+                A_free = K_free_rcm - sigma_val * M_op
+                A_free = A_free.tocsr()
+                
+                ps = PyPardisoSolver(mtype=mtype)
+                
+                # 4코어 최적 iparm 적용 (iparm[0]=0 디폴트 유지하여 충돌 방지)
+                ps.set_iparm(2, 3)    # iparm[1] = 3 (Parallel Metis fill-in reducing)
+                ps.set_iparm(3, 0)    # iparm[2] = 0 (reserved)
+                ps.set_iparm(4, 4)    # iparm[3] = 4 (CGS preconditioner for CRC)
+                ps.set_iparm(8, 2)    # iparm[7] = 2 (iterative refinement steps)
+                ps.set_iparm(10, 13)  # iparm[9] = 13 (pivot perturbation)
+                ps.set_iparm(11, 1)   # iparm[10] = 1 (scaling on)
+                ps.set_iparm(13, 1)   # iparm[12] = 1 (matching on for unsymmetric)
+                ps.set_iparm(24, 1)   # iparm[23] = 1 (parallel factorization ON)
+                ps.set_iparm(60, 0)   # iparm[59] = 0 (in-core)
+                ps.set_iparm(61, 0)   # iparm[60] = 0
+                ps.set_iparm(62, 0)   # iparm[61] = 0
+                
+                ps.factorize(A_free)
+                ps.set_phase(33)
+                
+                def op_inv_fn(x):
+                    if not x.flags.f_contiguous:
+                        x = np.asfortranarray(x)
+                    if x.dtype != np.float64:
+                        x = x.astype(np.float64)
+                    return ps._call_pardiso(A_free, x)
+                    
+                OPinv = LinearOperator(A_free.shape, matvec=op_inv_fn, dtype=A_free.dtype)
+                
+                vals, vecs_rcm = eigsh(K_free_rcm, k=actual_modes, M=M_op, which="LM", sigma=sigma_val, OPinv=OPinv, tol=tol, maxiter=ndof_free*20)
+                try:
+                    ps.free_memory(everything=True)
+                except:
+                    pass
+                print("      [Success] PARDISO + eigsh (Direct).", flush=True)
+                method = 'completed'
+            except Exception as e:
+                print(f"      [Failed] PARDISO direct solver logic error: {e}", flush=True)
+                if method != 'auto':
+                    raise e
+
         if method == 'auto':
             # Stage 1: ARPACK (Isolated Subprocess for stability)
             # On Windows, eigsh with shift-invert (sigma) is known to deadlock for
@@ -251,15 +376,19 @@ class WHTSolver:
         print("    - Eigensolve completed successfully.", flush=True)
         
         # Restore original DOF ordering
+        print("    - Restoring DOF ordering...", flush=True)
         vecs_free = vecs_rcm[rev_perm, :]
 
+        print("    - Calculating frequencies...", flush=True)
         freqs = np.sqrt(np.maximum(vals, 0)) / (2 * np.pi)
 
         # Expand to full DOF space (matching sorted_nids * 6)
+        print("    - Expanding vecs to full DOF...", flush=True)
         vecs_full = np.zeros((ndof_total, actual_modes))
         vecs_full[unknown_id, :] = vecs_free
         
         # Reshape to (n_modes, N, 6) — DOF layout: node_idx * 6
+        print("    - Reshaping mode shapes...", flush=True)
         n_nodes   = len(sorted_nids)
         mode_shapes = np.zeros((actual_modes, n_nodes, 6))
         for i, nid in enumerate(sorted_nids):
@@ -273,6 +402,7 @@ class WHTSolver:
         res.solver_info = {'method': method, 'ndof': jm_ndof, 'ndof_free': ndof_free}
         
         # --- [WHT] Element Stress & Strain Recovery (v2: dict-based API) ---
+        print("    - Initiating modal stress recovery...", flush=True)
         n_cells = len(self.model.elements)
         # Modal analysis: Upper surface 기본 (단일 레이어)
         stresses = np.zeros((actual_modes, n_cells, 6))
@@ -280,6 +410,7 @@ class WHTSolver:
         seds     = np.zeros((actual_modes, n_cells, 1))
         
         for m in range(actual_modes):
+            print(f"      [Modal Stress] recovering mode {m+1}/{actual_modes}...", flush=True)
             rd_q = ElementStressRecovery.recover_quad4(self.model, mode_shapes[m], sorted_nids)
             rd_t = ElementStressRecovery.recover_tria3(self.model, mode_shapes[m], sorted_nids)
             stresses[m] = rd_q["Stress"] + rd_t["Stress"]
@@ -300,7 +431,7 @@ class WHTSolver:
             
         return res
 
-    def solve_static(self, load_case: WHTLoadCase) -> WHTSolverResult:
+    def solve_static(self, load_case: WHTLoadCase, solver_method: str = 'auto') -> WHTSolverResult:
         """
         Static analysis with augmented K (Lagrange multiplier BC).
 
@@ -322,9 +453,27 @@ class WHTSolver:
         K_aug, f_aug = self._augment_K_scipy(K_base, jm)
 
         # Solve: u_aug = [u_free (ndof,), lambda (n_bc,)]
-        from scipy.sparse.linalg import spsolve
-        u_aug = spsolve(K_aug.tocsc(), f_aug)
-        u_aug_np = np.array(u_aug)
+        if solver_method in ('pardiso', 'pardiso_unsym') or (solver_method == 'auto' and _PARDISO_OK):
+            if not _PARDISO_OK:
+                raise ImportError("pypardiso is not installed in the environment.")
+            # mtype=11 (Real Unsymmetric): mtype=-2(Symmetric Indefinite)는
+            # Windows에서 access violation 발생 이력 있음 → 안전하게 11 유지.
+            # 솔버 객체를 전역 캐시에서 재사용 → MKL 초기화 오버헤드 제거.
+            ps = get_global_pardiso_solver(mtype=11)
+            ps.set_iparm(2,  3)   # Parallel Metis reordering
+            ps.set_iparm(4,  0)   # CGS preconditioner OFF (direct solve에서 불필요)
+            ps.set_iparm(8,  0)   # Iterative refinement 0회 (FEM 행렬 조건수 양호)
+            ps.set_iparm(10, 13)  # Pivot perturbation
+            ps.set_iparm(11, 1)   # Scaling ON
+            ps.set_iparm(13, 1)   # Matching ON
+            ps.set_iparm(24, 1)   # Parallel numerical factorization ON
+
+            u_aug = ps.solve(K_aug.tocsc(), f_aug)
+            u_aug_np = np.array(u_aug)
+        else:
+            from scipy.sparse.linalg import spsolve
+            u_aug = spsolve(K_aug.tocsr(), f_aug)
+            u_aug_np = np.array(u_aug)
 
         # Displacement (N, 6)
         n_nodes = len(sorted_nids)

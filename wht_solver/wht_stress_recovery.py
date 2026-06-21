@@ -133,7 +133,7 @@ class ElementStressRecovery:
 
         cache_key_geom = (id(wht_model), id(c_all)) if c_all is not None else None
         if cache_key_geom and cache_key_geom in _cache_quad4_geom:
-            T, dN_dx, dN_dy = _cache_quad4_geom[cache_key_geom]
+            T, dN_dx, dN_dy, C_loc, D_loc = _cache_quad4_geom[cache_key_geom]
         else:
             V1 = C[:, 1, :] - C[:, 0, :]
             V2 = C[:, 3, :] - C[:, 0, :]
@@ -177,7 +177,7 @@ class ElementStressRecovery:
             dN_dy = np.outer(invJ21, dNxi) + np.outer(invJ22, dNeta)
 
             if cache_key_geom:
-                _cache_quad4_geom[cache_key_geom] = (T, dN_dx, dN_dy)
+                _cache_quad4_geom[cache_key_geom] = (T, dN_dx, dN_dy, C_loc, D_loc)
 
         # 변위/회전 → 로컬 변환
         U_disp_loc = np.einsum('mij, mkj -> mki', T, U[:, :, :3])
@@ -189,7 +189,64 @@ class ElementStressRecovery:
         # Membrane 변형률 (z-independent)
         eps_xx_m = np.sum(dN_dx * u_x, axis=1)
         eps_yy_m = np.sum(dN_dy * u_y, axis=1)
-        gamma_xy_m = np.sum(dN_dy * u_x + dN_dx * u_y, axis=1)
+
+        # MITC4+ gamma_xy: Ko-Lee-Bathe 2016 Eqn 27c
+        # 특성 기하 벡터 (요소별 스칼라, (M,))
+        XR0 = 0.25*(-C_loc[:,0]+C_loc[:,1]+C_loc[:,2]-C_loc[:,3])
+        XR1 = 0.25*(-D_loc[:,0]+D_loc[:,1]+D_loc[:,2]-D_loc[:,3])
+        XS0 = 0.25*(-C_loc[:,0]-C_loc[:,1]+C_loc[:,2]+C_loc[:,3])
+        XS1 = 0.25*(-D_loc[:,0]-D_loc[:,1]+D_loc[:,2]+D_loc[:,3])
+        XD0 = 0.25*(+C_loc[:,0]-C_loc[:,1]+C_loc[:,2]-C_loc[:,3])
+        XD1 = 0.25*(+D_loc[:,0]-D_loc[:,1]+D_loc[:,2]-D_loc[:,3])
+        det_RS = XR0*XS1 - XR1*XS0
+        det_RS_safe = np.where(np.abs(det_RS)>1e-12, det_RS, 1e-12)
+        c_r = (XD0*XS1 - XD1*XS0) / det_RS_safe
+        c_s = (XD1*XR0 - XD0*XR1) / det_RS_safe
+        d_val = c_r**2 + c_s**2 - 1.0
+        use_mitc = np.abs(d_val) > 1e-10
+        d_safe = np.where(use_mitc, d_val, 1.0)
+        a_A = c_r*(c_r-1.0)/(2.0*d_safe)
+        a_B = c_r*(c_r+1.0)/(2.0*d_safe)
+        a_C = c_s*(c_s-1.0)/(2.0*d_safe)
+        a_D = c_s*(c_s+1.0)/(2.0*d_safe)
+        a_E = 2.0*c_r*c_s/d_safe
+
+        def _dN_loc(xi, eta):
+            dxi = np.array([-(1-eta),(1-eta),(1+eta),-(1+eta)])*0.25
+            det = np.array([-(1-xi),-(1+xi),(1+xi),(1-xi)])*0.25
+            j11 = C_loc@dxi; j12 = D_loc@dxi
+            j21 = C_loc@det; j22 = D_loc@det
+            dj = j11*j22-j12*j21
+            dj_s = np.where(np.abs(dj)>1e-12, dj, 1e-12)
+            i11=j22/dj_s; i12=-j12/dj_s; i21=-j21/dj_s; i22=j11/dj_s
+            return np.outer(i11,dxi)+np.outer(i12,det), np.outer(i21,dxi)+np.outer(i22,det)
+
+        dx_A, dy_A = _dN_loc(0.0,  1.0)   # A
+        dx_B, dy_B = _dN_loc(0.0, -1.0)   # B
+        dx_C, dy_C = _dN_loc(1.0,  0.0)   # C
+        dx_D, dy_D = _dN_loc(-1.0, 0.0)   # D
+        dx_E, dy_E = _dN_loc(0.0,  0.0)   # E = centroid
+
+        # Eqn 27c 타잉점 기여: A,B → exx 행, C,D → eyy 행, E → exy 행
+        exx_A = np.sum(dx_A*u_x, axis=1)
+        exx_B = np.sum(dx_B*u_x, axis=1)
+        eyy_C = np.sum(dy_C*u_y, axis=1)
+        eyy_D = np.sum(dy_D*u_y, axis=1)
+        gxy_E = np.sum(dy_E*u_x + dx_E*u_y, axis=1)
+
+        gp = 1.0/np.sqrt(3.0)
+        gamma_xy_m_mitc = np.zeros(len(E_arr))
+        for R, S in ((-gp,-gp),(gp,-gp),(gp,gp),(-gp,gp)):
+            wA = 0.25*(R + 4.0*a_A*R*S)
+            wB = 0.25*(-R + 4.0*a_B*R*S)
+            wC = 0.25*(S + 4.0*a_C*R*S)
+            wD = 0.25*(-S + 4.0*a_D*R*S)
+            wE = 1.0 + a_E*R*S
+            gamma_xy_m_mitc += wA*exx_A + wB*exx_B + wC*eyy_C + wD*eyy_D + wE*gxy_E
+        gamma_xy_m_mitc /= 4.0
+
+        gamma_xy_m_std = np.sum(dN_dy*u_x + dN_dx*u_y, axis=1)
+        gamma_xy_m = np.where(use_mitc, gamma_xy_m_mitc, gamma_xy_m_std)
 
         # Curvature (bending gradients, z-independent)
         kappa_xx = np.sum(dN_dx * th_y, axis=1)          # ∂θ_y/∂x
