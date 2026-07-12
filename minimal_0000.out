@@ -24,10 +24,10 @@
  COMPUTATION HARDWARE DESCRIPTION
   
  HOSTNAME     CPU TYPE, FREQUENCY AND MEMORY
- DESKTOP-WHL   11th Gen Intel(R) Core(TM) i7-11700 @ 2.50GHz (x86_64), 2500 MHz,  18661 MB RAM,  59838 MB swap
+ DESKTOP-WHL   11th Gen Intel(R) Core(TM) i7-11700 @ 2.50GHz (x86_64), 2500 MHz,  12873 MB RAM,  42599 MB swap
   
  STACKSIZE  . . . . . . . . . . . . . . . . . . . . 1430 MB
- THREAD STACKSIZE . . . . . . . . . . . . . . . . . 250 MB
+ THREAD STACKSIZE . . . . . . . . . . . . . . . . . 400 MB
  
 ************************************************************************
 

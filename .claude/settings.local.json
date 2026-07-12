@@ -38,7 +38,22 @@
       "Bash(ruby --version)",
       "Bash(node *)",
       "Bash(command -v omc)",
-      "Bash(omc --version)"
+      "Bash(omc --version)",
+      "Bash(mkdir -p \"D:/PythonCodeStudy/WHT_LightChassisModel/test_jaxSSO/tmp_mystran_test\")",
+      "Bash(cat)",
+      "Bash(\"D:/SOFTWARE/MYSTRAN/mystran-18.0.0-windows-x86_64.exe\" \"D:/PythonCodeStudy/WHT_LightChassisModel/test_jaxSSO/tmp_mystran_test/test_modal.dat\")",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('Modal freqs:', d['results']['Modal'].get\\('freqs',[]\\)\\); print\\('bending disp:', d['results']['Static'].get\\('bending',{}\\).get\\('max_disp','N/A'\\)\\); print\\('bending stress:', d['results']['Static'].get\\('bending',{}\\).get\\('max_stress','N/A'\\)\\)\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, 'D:/PythonCodeStudy/AutoCalculix/src'\\); from autocalculix_api import run_calculix_analysis; import inspect; print\\(inspect.getfile\\(run_calculix_analysis\\)\\)\")",
+      "Bash(python -c \"import sys; [print\\(l.rstrip\\(\\)\\) for l in sys.stdin if not any\\(x in l for x in ['Info', 'Meshing', 'Done mesh', 'curve', 'surface', '%']\\)]\")",
+      "Bash(python -c \"import sys; [print\\(l.rstrip\\(\\)\\) for l in sys.stdin if any\\(x in l for x in ['CalculiX', 'Solver', 'Parsed', 'AutoCalculix', '실패', 'Error', 'completed']\\)]\")",
+      "Bash(python -c \"import sys; [print\\(l.rstrip\\(\\)\\) for l in sys.stdin if any\\(x in l for x in ['CalculiX', 'Solver', 'Parsed', 'AutoCalculix', '실패', 'Error', 'completed', '완료']\\)]\")",
+      "Bash(\"D:/SOFTWARE/calculix_2.23_4win/ccx_static.exe\" bc_outside)",
+      "Bash(sed -i 's/\\\\*NODE PRINT, NSET=NALL\\\\nU/\\\\*NODE FILE\\\\nU/' plate_test.inp)",
+      "Bash(\"D:/SOFTWARE/calculix_2.23_4win/ccx_static.exe\" plate_test)",
+      "Bash(\"D:/SOFTWARE/MYSTRAN/mystran-18.0.0-windows-x86_64.exe\" --help)",
+      "Read(//d//**)",
+      "Read(//c//**)",
+      "WebSearch"
     ]
   }
 }

@@ -653,6 +653,241 @@ class _CalculixReAnalysisWorker(QThread):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# MYSTRAN Re-analysis worker (QThread)
+# ────────────────────────────────────────────────────────────────────────────
+
+class _MystranReAnalysisWorker(QThread):
+    finished = Signal(dict)
+    error    = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, snap_dir: str, iter_num: int, case_name: str,
+                 num_modal_modes: int = 20, parent=None):
+        super().__init__(parent)
+        self.snap_dir         = snap_dir
+        self.iter_num         = iter_num
+        self.case_name        = case_name
+        self.num_modal_modes  = num_modal_modes
+
+    def run(self):
+        try:
+            import numpy as np
+            import pickle
+            from pathlib import Path
+            from wht_solver.mystran_api import MystranAPI
+            from wht_converter.wht_models import WHTResultData, WHTMetadata
+            
+            snap_dir = Path(self.snap_dir)
+            self.progress.emit("Snapshots 정보 로드 및 변형 메시 생성 중...")
+            with open(snap_dir / "init.pkl", "rb") as f:
+                init = pickle.load(f)
+
+            model       = init["model"]
+            bead_dir    = init["bead_dir"]
+            bead_mode   = init.get("bead_mode", "node")
+            design_nids = init["design_nids"]
+            aggr_src    = init["aggr_src"]
+            aggr_dst    = init["aggr_dst"]
+            orig_coords = init["orig_coords"]
+
+            if self.iter_num == -1:
+                h_elem = np.zeros(len(init["design_elems"]))
+                load_cases_raw = init.get("static_load_cases", [])
+                load_cases = [(lc.name, w, lc) for lc, w in load_cases_raw]
+            else:
+                for nid, (x, y, z) in orig_coords.items():
+                    nd = model.nodes[nid]
+                    nd.x, nd.y, nd.z = x, y, z
+
+                if self.iter_num == 0:
+                    h_elem = np.zeros(len(init["design_elems"]))
+                    load_cases_raw = init.get("static_load_cases", [])
+                    load_cases     = [(lc.name, w, lc) for lc, w in load_cases_raw]
+                else:
+                    iter_file = snap_dir / f"iter_{self.iter_num:03d}.pkl"
+                    self.progress.emit(f"iter_{self.iter_num:03d}.pkl 로드 중...")
+                    with open(iter_file, "rb") as f:
+                        snap = pickle.load(f)
+                    h_elem = snap["h_elem"]
+                    load_cases = snap.get("load_cases", [])
+
+            if self.iter_num != -1:
+                n_int      = len(design_nids)
+                h_node_sum = np.zeros(n_int)
+                if bead_mode == "elem_centroid":
+                    np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+                    node_adj = np.bincount(aggr_src, minlength=n_int)
+                    h_node   = h_node_sum / (node_adj + 1e-12)
+                else:
+                    np.maximum.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+                    h_node = h_node_sum
+                for i, nid in enumerate(design_nids):
+                    ox, oy, oz = orig_coords[nid]
+                    nd = model.nodes[nid]
+                    dh = float(h_node[i])
+                    nd.x = ox + dh * bead_dir[0]
+                    nd.y = oy + dh * bead_dir[1]
+                    nd.z = oz + dh * bead_dir[2]
+
+            self.progress.emit("MYSTRAN 솔버 구동 중...")
+            api = MystranAPI(model)
+            analysis_type = "modal" if self.case_name == "Modal Analysis" else "static"
+            
+            lc_obj = None
+            if analysis_type == "static":
+                for entry in load_cases:
+                    if entry[0] == self.case_name:
+                        lc_obj = entry[2]
+                        break
+
+            res = api.run_analysis(analysis_type, self.num_modal_modes, lc_obj)
+            
+            self.progress.emit("MYSTRAN 결과 변환 중...")
+            meta = WHTMetadata(
+                solver_name="MYSTRAN", solver_version="18.0.0",
+                analysis_type=analysis_type, coordinate_system="cartesian",
+                unit_length="mm", unit_force="N",
+            )
+            rd = model.to_wht_result_data(meta)
+            
+            if analysis_type == "modal":
+                rd.time_values = list(res['frequencies'])
+                rd.point_data["Mode Shape"] = []
+                for m in range(len(res['frequencies'])):
+                    shape_data = np.zeros((len(rd.nodes), 3))
+                    ms = res['mode_shapes'].get(m, {})
+                    for i, nid in enumerate(model.sorted_node_ids()):
+                        if nid in ms:
+                            shape_data[i] = ms[nid]
+                    rd.point_data["Mode Shape"].append(shape_data)
+                
+                self.finished.emit({
+                    "type": "modal",
+                    "wht_result_data": rd,
+                    "is_ccx": False
+                })
+            else:
+                disps = res.get('displacements', {})
+                disp_data = np.zeros((len(rd.nodes), 6))
+                for i, nid in enumerate(model.sorted_node_ids()):
+                    if nid in disps:
+                        disp_data[i, :3] = disps[nid]
+                rd.point_data["Displacement"] = [disp_data]
+                
+                self.finished.emit({
+                    "type": "static",
+                    "wht_result_data": rd,
+                    "lc_name": self.case_name,
+                    "is_ccx": False
+                })
+
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+# ────────────────────────────────────────────────────────────────────────────
+# OpenRadioss Re-analysis worker (QThread)
+# ────────────────────────────────────────────────────────────────────────────
+
+class _OpenRadiossReAnalysisWorker(QThread):
+    finished = Signal(dict)
+    error    = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, snap_dir: str, iter_num: int, case_name: str,
+                 num_modal_modes: int = 20, parent=None):
+        super().__init__(parent)
+        self.snap_dir         = snap_dir
+        self.iter_num         = iter_num
+        self.case_name        = case_name
+        self.num_modal_modes  = num_modal_modes
+
+    def run(self):
+        try:
+            import numpy as np
+            import pickle
+            from pathlib import Path
+            from wht_solver.openradioss_api import OpenRadiossAPI
+            from wht_converter.wht_models import WHTResultData, WHTMetadata
+            
+            snap_dir = Path(self.snap_dir)
+            self.progress.emit("Snapshots 정보 로드 및 변형 메시 생성 중...")
+            with open(snap_dir / "init.pkl", "rb") as f:
+                init = pickle.load(f)
+
+            model       = init["model"]
+            bead_dir    = init["bead_dir"]
+            bead_mode   = init.get("bead_mode", "node")
+            design_nids = init["design_nids"]
+            aggr_src    = init["aggr_src"]
+            aggr_dst    = init["aggr_dst"]
+            orig_coords = init["orig_coords"]
+
+            if self.iter_num == -1:
+                h_elem = np.zeros(len(init["design_elems"]))
+            else:
+                for nid, (x, y, z) in orig_coords.items():
+                    nd = model.nodes[nid]
+                    nd.x, nd.y, nd.z = x, y, z
+
+                if self.iter_num == 0:
+                    h_elem = np.zeros(len(init["design_elems"]))
+                else:
+                    iter_file = snap_dir / f"iter_{self.iter_num:03d}.pkl"
+                    self.progress.emit(f"iter_{self.iter_num:03d}.pkl 로드 중...")
+                    with open(iter_file, "rb") as f:
+                        snap = pickle.load(f)
+                    h_elem = snap["h_elem"]
+
+            if self.iter_num != -1:
+                n_int      = len(design_nids)
+                h_node_sum = np.zeros(n_int)
+                if bead_mode == "elem_centroid":
+                    np.add.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+                    node_adj = np.bincount(aggr_src, minlength=n_int)
+                    h_node   = h_node_sum / (node_adj + 1e-12)
+                else:
+                    np.maximum.at(h_node_sum, aggr_src, h_elem[aggr_dst])
+                    h_node = h_node_sum
+                for i, nid in enumerate(design_nids):
+                    ox, oy, oz = orig_coords[nid]
+                    nd = model.nodes[nid]
+                    dh = float(h_node[i])
+                    nd.x = ox + dh * bead_dir[0]
+                    nd.y = oy + dh * bead_dir[1]
+                    nd.z = oz + dh * bead_dir[2]
+
+            self.progress.emit("OpenRadioss 솔버 구동 중...")
+            api = OpenRadiossAPI(model)
+            res = api.run_modal(self.num_modal_modes)
+            
+            self.progress.emit("OpenRadioss 결과 변환 중...")
+            meta = WHTMetadata(
+                solver_name="OpenRadioss", solver_version="Implicit",
+                analysis_type="modal", coordinate_system="cartesian",
+                unit_length="mm", unit_force="N",
+            )
+            rd = model.to_wht_result_data(meta)
+            rd.time_values = list(res['frequencies'])
+            
+            # OpenRadioss API currently doesn't parse mode shapes in our impl, just frequencies.
+            # Provide zero mode shapes so UI doesn't crash
+            rd.point_data["Mode Shape"] = []
+            for m in range(len(res['frequencies'])):
+                rd.point_data["Mode Shape"].append(np.zeros((len(rd.nodes), 3)))
+                
+            self.finished.emit({
+                "type": "modal",
+                "wht_result_data": rd,
+                "is_ccx": False
+            })
+
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # OptiStruct .fem 내보내기
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1803,7 +2038,7 @@ class WHTMonitorWindow(QMainWindow):
 
         ctrl_action.addWidget(QLabel("  Solver:"))
         self.iter_solver_combo = QComboBox()
-        self.iter_solver_combo.addItems(["WHT Solver", "CalculiX"])
+        self.iter_solver_combo.addItems(["WHT Solver", "CalculiX", "MYSTRAN", "OpenRadioss"])
         self.iter_solver_combo.setFixedWidth(100)
         ctrl_action.addWidget(self.iter_solver_combo)
 
@@ -2813,12 +3048,59 @@ class WHTMonitorWindow(QMainWindow):
         QMessageBox.critical(self, "CalculiX 해석 오류", msg[:400])
 
     def _on_run_analysis_dispatch(self):
-        """Solver 콤보 선택에 따라 WHT Solver 또는 CalculiX로 분기."""
+        """Solver 콤보 선택에 따라 WHT Solver, CalculiX, MYSTRAN, OpenRadioss로 분기."""
         solver = self.iter_solver_combo.currentText() if self.iter_solver_combo else "WHT Solver"
         if solver == "CalculiX":
             self._on_run_calculix()
+        elif solver == "MYSTRAN":
+            self._on_run_mystran()
+        elif solver == "OpenRadioss":
+            self._on_run_openradioss()
         else:
             self._on_run_analysis()
+
+
+    def _on_run_mystran(self):
+        if not self.snap_dir:
+            QMessageBox.warning(self, "경고", "스냅샷 디렉토리가 아직 수신되지 않았습니다.")
+            return
+        if self._re_worker and self._re_worker.isRunning():
+            QMessageBox.information(self, "실행 중", "이전 해석이 아직 실행 중입니다.")
+            return
+
+        iter_num  = self._get_selected_iter_num()
+        case_name = self.iter_case_combo.currentText() if self.iter_case_combo else "Modal Analysis"
+        self._set_iter_status(f"MYSTRAN [Iter {iter_num} / {case_name}] 실행 중...", "blue")
+        if self.iter_run_btn: self.iter_run_btn.setEnabled(False)
+
+        self._re_worker = _MystranReAnalysisWorker(self.snap_dir, iter_num, case_name, num_modal_modes=self.num_modal_modes)
+        self._re_worker.progress.connect(self._update_iter_status_white)
+        self._re_worker.finished.connect(self._on_calculix_analysis_finished) # Reuse CCX finish handler as it processes dict with wht_result_data
+        self._re_worker.error.connect(self._on_calculix_analysis_error)
+        self._re_worker.start()
+
+    def _on_run_openradioss(self):
+        if not self.snap_dir:
+            QMessageBox.warning(self, "경고", "스냅샷 디렉토리가 아직 수신되지 않았습니다.")
+            return
+        if self._re_worker and self._re_worker.isRunning():
+            QMessageBox.information(self, "실행 중", "이전 해석이 아직 실행 중입니다.")
+            return
+
+        iter_num  = self._get_selected_iter_num()
+        case_name = self.iter_case_combo.currentText() if self.iter_case_combo else "Modal Analysis"
+        if case_name != "Modal Analysis":
+            QMessageBox.warning(self, "지원 안함", "OpenRadioss는 현재 Modal Analysis만 지원합니다.")
+            return
+            
+        self._set_iter_status(f"OpenRadioss [Iter {iter_num} / {case_name}] 실행 중...", "blue")
+        if self.iter_run_btn: self.iter_run_btn.setEnabled(False)
+
+        self._re_worker = _OpenRadiossReAnalysisWorker(self.snap_dir, iter_num, case_name, num_modal_modes=self.num_modal_modes)
+        self._re_worker.progress.connect(self._update_iter_status_white)
+        self._re_worker.finished.connect(self._on_calculix_analysis_finished)
+        self._re_worker.error.connect(self._on_calculix_analysis_error)
+        self._re_worker.start()
 
     def _on_concept_tool(self):
         if not self.height_snapshots:

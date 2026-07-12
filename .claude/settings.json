@@ -6,7 +6,19 @@
       "Bash(C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe -c \"*)",
       "Bash(C:/Users/GOODMAN/miniconda3/envs/vdmc/python.exe -m py_compile *)",
       "Bash(git diff --stat *)",
-      "Bash(git show *)"
+      "Bash(git show *)",
+      "Bash(git commit -m ' *)",
+      "Bash(Get-ChildItem -Recurse -Filter \"*.png\")",
+      "Bash(Select-Object FullName)",
+      "Bash(git check-ignore *)",
+      "Bash(grep -r \"mutually_exclusive\\\\|radio\\\\|store_const\\\\|default\" \"C:/Users/GOODMAN/miniconda3/envs/vdmc/Lib/site-packages/gooey/gui/components/widgets/\" --include=\"*.py\" -l)",
+      "Read(//c/Users/GOODMAN/miniconda3/envs/vdmc/Lib/site-packages/gooey/gui/components/widgets/**)",
+      "Bash(grep -n \"initial_selection\\\\|default\\\\|const\" \"C:/Users/GOODMAN/miniconda3/envs/vdmc/Lib/site-packages/gooey/python_bindings/argparse_to_json.py\" | head -40)",
+      "Read(//c/Users/GOODMAN/miniconda3/envs/vdmc/Lib/site-packages/gooey/python_bindings/**)",
+      "Bash(mkdir -p \"d:/PythonCodeStudy/WHT_LightChassisModel/.omc/plans\" 2>/dev/null; echo \"ok\")"
+    ],
+    "additionalDirectories": [
+      "d:\\PythonCodeStudy\\WHT_LightChassisModel\\.omc"
     ]
   }
 }
